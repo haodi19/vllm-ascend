@@ -123,7 +123,7 @@ def main():
         default=Path(__file__).resolve().parent
         / "vllm_ascend/expert_offload/lrc_policy.py",
     )
-    parser.add_argument("--test-script", type=Path, default=repo / "script/test_graph.sh")
+    parser.add_argument("--test-script", type=Path, default=repo / "script/test_graph2.sh")
     parser.add_argument("--config-source", type=Path, default=repo / "vllm_ascend/ascend_config.py")
     parser.add_argument("--model-config", type=Path)
     parser.add_argument("--experts", type=int, help="Override model expert count")
