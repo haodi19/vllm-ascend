@@ -40,6 +40,11 @@ def project_settings(script_path, config_path):
     if not settings:
         raise ValueError("Cannot read ExpertOffloadConfig._defaults")
     source = script_path.read_text(encoding="utf-8")
+    # A shell script may end with a continuation backslash and no newline.
+    # Supply the line terminator so shlex does not see an unfinished escape.
+    # This leaves quote validation intact and does not modify the shell file.
+    if not source.endswith("\n"):
+        source += "\n"
     # Preserve comment newlines: joining a commented trailing backslash can
     # accidentally comment out the following active command.
     words = [word for word in shlex.split(source, comments=True) if word.strip()]

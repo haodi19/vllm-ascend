@@ -44,6 +44,31 @@ class TestBenchmarkInputs(unittest.TestCase):
             }}), encoding="utf-8")
             self.assertEqual(self.bench["model_dimensions"](path), (128, 4))
 
+    def test_trailing_continuation_without_newline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.py"
+            config.write_text(
+                "class ExpertOffloadConfig:\n"
+                "    _defaults = {'num_device_experts': 32}\n",
+                encoding="utf-8",
+            )
+            script = root / "test.sh"
+            command = (
+                "vllm serve model --additional-config "
+                "'{\"expert_offload_config\": {\"num_device_experts\": 24}}' "
+            )
+            for ending in ("\\", "\\\n", "\\\r\n", ""):
+                with self.subTest(ending=repr(ending)):
+                    content = (command + ending).encode("utf-8")
+                    script.write_bytes(content)
+                    settings = self.bench["project_settings"](script, config)
+                    self.assertEqual(settings["num_device_experts"], 24)
+                    self.assertEqual(script.read_bytes(), content)
+            script.write_text(command + "'unterminated", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "No closing quotation"):
+                self.bench["project_settings"](script, config)
+
     def test_plural_selection_and_protection(self):
         path = Path(__file__).resolve().parents[3] / "vllm_ascend/expert_offload/lrc_policy.py"
         policy_class, _ = self.bench["load_policy"](path)
