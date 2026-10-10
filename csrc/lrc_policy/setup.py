@@ -7,7 +7,7 @@ from setuptools import setup
 
 setup(
     name="vllm-ascend-lrc",
-    version="0.1.0",
+    version="0.2.0",
     py_modules=[],
     ext_modules=[
         Pybind11Extension(

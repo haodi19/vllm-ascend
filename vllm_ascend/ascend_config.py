@@ -1167,8 +1167,10 @@ class ExpertOffloadConfig:
             raise TypeError("expert_offload must be a boolean")
         if not isinstance(self.config["cache_policy_enabled"], bool):
             raise TypeError("cache_policy_enabled must be a boolean")
-        if self.config["cache_policy_backend"] not in ("python", "cpp"):
-            raise ValueError("cache_policy_backend must be 'python' or 'cpp'")
+        if self.config["cache_policy_backend"] not in ("python", "cpp", "cpp_fused"):
+            raise ValueError("cache_policy_backend must be 'python', 'cpp' or 'cpp_fused'")
+        if self.config["cache_policy_backend"] == "cpp_fused" and self.config["enable_multi_card"]:
+            raise ValueError("cpp_fused currently supports single-card expert offload only")
         if not isinstance(self.config["cache_recent_window"], int):
             raise TypeError("cache_recent_window must be an integer")
         if self.config["cache_recent_window"] < 1:

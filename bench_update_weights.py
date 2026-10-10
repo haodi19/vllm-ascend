@@ -85,9 +85,11 @@ class Timings:
         fn(args)
         total = self.clock() - start
         result = {
-            name: self.values.get(name, 0) for name in ("observe", "choose_victims", "synchronize", "load_submit")
+            name: self.values.get(name, 0)
+            for name in ("observe", "choose_victims", "synchronize", "load_submit", "fused_plan")
         }
         result["total"] = total
+        result["host_without_sync"] = total - result["synchronize"]
         result["outer"] = total - sum(result[name] for name in ("observe", "choose_victims", "synchronize"))
         return result
 
@@ -199,6 +201,16 @@ def build_harness(args, settings, repo):
         setattr(manager.cache_policy, name, timings.wrap(name, getattr(manager.cache_policy, name)))
     manager._synchronize_h2d = timings.wrap("synchronize", manager._synchronize_h2d)
     manager._load_expert_weights_into_slots = timings.wrap("load_submit", manager._load_expert_weights_into_slots)
+    if getattr(manager.cache_policy, "fused_planner", False):
+        original_plan = manager.cache_policy.plan_update
+
+        def measured_plan(*plan_args):
+            result = original_plan(*plan_args, measure=True)
+            timings.values["observe"] = result["observe_ns"]
+            timings.values["choose_victims"] = result["choose_ns"]
+            return result
+
+        manager.cache_policy.plan_update = timings.wrap("fused_plan", measured_plan)
     return manager, layer, timings, loaded, digest, policy_digest
 
 
@@ -206,7 +218,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     repo = Path(__file__).resolve().parent
     parser.add_argument("--mode", choices=("planning", "npu"), default="planning")
-    parser.add_argument("--backend", choices=("python", "cpp"), default="python")
+    parser.add_argument("--backend", choices=("python", "cpp", "cpp_fused"), default="python")
     parser.add_argument("--test-script", type=Path, default=repo / "script/test_graph2.sh")
     parser.add_argument("--config-source", type=Path, default=repo / "vllm_ascend/ascend_config.py")
     parser.add_argument("--model-config", type=Path)
@@ -272,7 +284,19 @@ def main():
     mapping = np.full(args.experts, -1, dtype=np.int64)
     initial = mapping.copy()
     initial[: args.cache_size] = np.arange(args.cache_size)
-    samples = {name: [] for name in ("total", "observe", "choose_victims", "synchronize", "outer", "load_submit")}
+    samples = {
+        name: []
+        for name in (
+            "total",
+            "observe",
+            "choose_victims",
+            "synchronize",
+            "outer",
+            "host_without_sync",
+            "load_submit",
+            "fused_plan",
+        )
+    }
     counts = []
     warmup = max(args.warmup, math.ceil(args.recent_window / args.tokens) + 1)
     for index in range(warmup + args.iterations):
@@ -311,6 +335,10 @@ def main():
     for name, values in samples.items():
         report(name, values)
     print("load_submit is INCLUDED in outer; do not add it again.")
+    print("Compare host_without_sync (= total - synchronize) across all backends.")
+    if args.backend == "cpp_fused":
+        print("Fused observe/choose are internal C++ timings; conversion/planning stays in outer.")
+        print("fused_plan INCLUDES LRC and planning; do not add it to outer or total.")
     print("NPU mode retains synchronization for safety, subtracting its measured duration.")
     print("Outer includes instrumentation overhead; no graph callback/GIL scheduling measurement.")
     print("Synthetic routes; fixed residency reset, evolving LRC history; no model weights loaded.")

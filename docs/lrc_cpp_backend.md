@@ -1,5 +1,8 @@
 # Optional C++ LRC backend (phase 1)
 
+Phase 2 adds the separate `cpp_fused` mode; see [the fused planner guide](lrc_cpp_planner.md).
+The phase-1 `cpp` and default `python` modes remain available.
+
 The Python backend remains the default and its implementation is unchanged.
 This phase moves LRC observation, scoring, eviction and state into a CPU C++
 extension. It does not change transfer submission, stream synchronization,
@@ -51,7 +54,8 @@ The configuration key is:
 ```
 
 Merge that key into the existing additional configuration, keeping all other
-options. Values are `python` (default) and `cpp`. Missing native binaries produce
+options. This phase uses `python` (default) and `cpp`; phase 2 also supports
+`cpp_fused` for single-card planning. Missing native binaries produce
 an actionable error when `cpp` is explicitly selected; no silent fallback.
 
 To run the existing `script/test_graph2.sh` configuration without editing it:

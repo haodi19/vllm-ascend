@@ -85,9 +85,11 @@ def load_policy(path, backend="python"):
     module.__file__ = str(path)
     sys.modules[MODULE_NAME] = module
     exec(compile(source, str(path), "exec"), module.__dict__)
-    if backend not in ("python", "cpp"):
-        raise ValueError("backend must be python or cpp")
-    policy = module.LRCExpertCachePolicy if backend == "python" else module.CppLRCExpertCachePolicy
+    policies = {"python": "LRCExpertCachePolicy", "cpp": "CppLRCExpertCachePolicy",
+                "cpp_fused": "FusedCppLRCExpertCachePolicy"}
+    if backend not in policies:
+        raise ValueError("backend must be python, cpp or cpp_fused")
+    policy = getattr(module, policies[backend])
     return policy, hashlib.sha256(source).hexdigest()
 
 
@@ -138,7 +140,7 @@ def main():
     parser.add_argument("--cache-size", type=int, help="Override launch-script slot count")
     parser.add_argument("--topk", type=int, help="Override model top-k")
     parser.add_argument("--tokens", type=int, default=1)
-    parser.add_argument("--backend", choices=("python", "cpp"), default="python")
+    parser.add_argument("--backend", choices=("python", "cpp", "cpp_fused"), default="python")
     parser.add_argument("--recent-window", type=int)
     parser.add_argument("--router-scores", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--warmup", type=int, default=1000)

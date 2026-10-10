@@ -322,7 +322,7 @@ class CppLRCExpertCachePolicy:
                 "python -m pip install ./csrc/lrc_policy --no-build-isolation --no-deps; "
                 "or select cache_policy_backend=python"
             ) from exc
-        if native.api_version != 1:
+        if native.api_version not in (1, 2):
             raise RuntimeError("C++ LRC API mismatch; rebuild ./csrc/lrc_policy")
         reference = LRCExpertCachePolicy(**kwargs)
         self.__dict__.update({key: value for key, value in vars(reference).items() if key != "layer_states"})
@@ -390,10 +390,31 @@ class CppLRCExpertCachePolicy:
         return self._native.step(layer_idx)
 
 
+class FusedCppLRCExpertCachePolicy(CppLRCExpertCachePolicy):
+    """Opt-in single-card planner; transfer and synchronization stay in Python."""
+
+    fused_planner = True
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        if not hasattr(self._native, "plan"):
+            raise RuntimeError("Fused LRC requires rebuilding csrc/lrc_policy (API 2)")
+
+    def plan_update(self, layer_idx, ids, scores, mapping, is_prefetch, prefetch_cap, *, measure=False):
+        # These are already CPU tensors staged by the caller, not device tensors.
+        # numpy() shares their storage; no .cpu(), D2H, or Python scalar lists.
+        ids_array = ids.numpy() if hasattr(ids, "numpy") else ids
+        scores_array = scores.numpy() if scores is not None and hasattr(scores, "numpy") else scores
+        return self._native.plan(layer_idx, ids_array, scores_array, mapping,
+                                 is_prefetch, prefetch_cap, measure)
+
+
 def create_lrc_policy(*, backend="python", **kwargs):
     """Explicit backend selection; never silently fall back after requesting C++."""
     if backend == "python":
         return LRCExpertCachePolicy(**kwargs)
     if backend == "cpp":
         return CppLRCExpertCachePolicy(**kwargs)
-    raise ValueError("cache_policy_backend must be 'python' or 'cpp'")
+    if backend == "cpp_fused":
+        return FusedCppLRCExpertCachePolicy(**kwargs)
+    raise ValueError("cache_policy_backend must be 'python', 'cpp' or 'cpp_fused'")

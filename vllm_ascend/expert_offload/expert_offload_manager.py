@@ -3127,54 +3127,64 @@ class ExpertOffloadManager:
                 return [e for e in ids_t.reshape(-1).tolist()
                         if 0 <= e < self.num_total_experts]
 
-            if not is_prefetch and self.cache_policy is not None:
-                id_rows = topk_ids_h.tolist()
-                router_scores = topk_weights_h.tolist() if topk_weights_h is not None else None
-
-                needed = self.cache_policy.observe(
-                    layer_idx,
-                    id_rows,
-                    router_scores=router_scores,
-                )
+            fused_plan = None
+            if getattr(self.cache_policy, "fused_planner", False):
+                fused_plan = self.cache_policy.plan_update(
+                    layer_idx, topk_ids_h, topk_weights_h, log2phy_np,
+                    is_prefetch, self.prefetch_topk)
+                needed = fused_plan["needed"]
+                on_device = fused_plan["on_device"]
+                need_to_load = fused_plan["need_to_load"]
+                already_there = fused_plan["already_there"]
             else:
-                needed = set(_valid_eids(topk_ids_h))
+                if not is_prefetch and self.cache_policy is not None:
+                    id_rows = topk_ids_h.tolist()
+                    router_scores = topk_weights_h.tolist() if topk_weights_h is not None else None
 
-            l2p_list = log2phy_np.tolist()
-            slot_owner = {s: e for e, s in enumerate(l2p_list) if s >= 0}
-            on_device = set(slot_owner.values())
+                    needed = self.cache_policy.observe(
+                        layer_idx,
+                        id_rows,
+                        router_scores=router_scores,
+                    )
+                else:
+                    needed = set(_valid_eids(topk_ids_h))
 
-            if is_prefetch:
-                # Prefetch: load at most prefetch_topk experts for the layer — a
-                # GLOBAL cap across all predicted token rows, not one per token —
-                # chosen as the highest-scoring predictions not already resident.
-                # An expert predicted by several tokens is one transfer and takes
-                # its best score across them.
-                rows_ids = topk_ids_h.tolist()
-                rows_w = topk_weights_h.tolist() if topk_weights_h is not None else None
-                n_rows = len(rows_ids)
-                best_score: dict[int, float] = {}
-                for r, row in enumerate(rows_ids):
-                    for c, eid in enumerate(row):
-                        if eid in on_device:
-                            continue          # resident: nothing to transfer
-                        if rows_w is not None:
-                            score = rows_w[r][c]
-                        else:
-                            # No scores available: interleave rows by rank so
-                            # every row's rank-0 outranks every row's rank-1,
-                            # rather than concatenating rows — the bias this
-                            # block exists to remove. At one row this is plain
-                            # column order.
-                            score = -float(c * n_rows + r)
-                        if score > best_score.get(eid, float("-inf")):
-                            best_score[eid] = score
-                need_to_load = set(
-                    sorted(best_score, key=best_score.get, reverse=True)
-                    [:self.prefetch_topk])
-            else:
-                need_to_load = needed - on_device
+                l2p_list = log2phy_np.tolist()
+                slot_owner = {s: e for e, s in enumerate(l2p_list) if s >= 0}
+                on_device = set(slot_owner.values())
 
-            already_there = needed & on_device              # for cache_stats / debug
+                if is_prefetch:
+                    # Prefetch: load at most prefetch_topk experts for the layer — a
+                    # GLOBAL cap across all predicted token rows, not one per token —
+                    # chosen as the highest-scoring predictions not already resident.
+                    # An expert predicted by several tokens is one transfer and takes
+                    # its best score across them.
+                    rows_ids = topk_ids_h.tolist()
+                    rows_w = topk_weights_h.tolist() if topk_weights_h is not None else None
+                    n_rows = len(rows_ids)
+                    best_score: dict[int, float] = {}
+                    for r, row in enumerate(rows_ids):
+                        for c, eid in enumerate(row):
+                            if eid in on_device:
+                                continue          # resident: nothing to transfer
+                            if rows_w is not None:
+                                score = rows_w[r][c]
+                            else:
+                                # No scores available: interleave rows by rank so
+                                # every row's rank-0 outranks every row's rank-1,
+                                # rather than concatenating rows — the bias this
+                                # block exists to remove. At one row this is plain
+                                # column order.
+                                score = -float(c * n_rows + r)
+                            if score > best_score.get(eid, float("-inf")):
+                                best_score[eid] = score
+                    need_to_load = set(
+                        sorted(best_score, key=best_score.get, reverse=True)
+                        [:self.prefetch_topk])
+                else:
+                    need_to_load = needed - on_device
+
+                already_there = needed & on_device              # for cache_stats / debug
 
             # both hit-rate numerators must be taken HERE — the load loop
             # below mutates on_device. `needed` is the post-substitution routed
@@ -3195,8 +3205,8 @@ class ExpertOffloadManager:
             # actual routing and their hit rate moved when prefetch was toggled.
             if self.cache_policy is not None and not is_prefetch:
                 self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device)
-            reusable_slots = [s for s, e in slot_owner.items()
-                            if e not in needed]          # slots to recycle
+            reusable_slots = (range(fused_plan["reusable_count"]) if fused_plan is not None else
+                              [s for s, e in slot_owner.items() if e not in needed])
 
             if self._debug:
                 flag = '[PREFETCH-W]' if is_prefetch else '[UPDATE-W]'
@@ -3215,53 +3225,63 @@ class ExpertOffloadManager:
             # (merge): rank all resident candidates once with
             # choose_victims(count=len(need_to_load)) instead of calling
             # choose_victim() per miss.
-            n_copies = 0
-            planned_loads = []
-            victims = None
-            if self.cache_policy is not None:
-                victims = iter(self.cache_policy.choose_victims(
-                    layer_idx,
-                    slot_owner,
-                    protected=needed,
-                    count=len(need_to_load),
-                ))
-            for eid in need_to_load:
-                if self.cache_policy is not None:
-                    victim = next(victims, None)
-                    slot = int(log2phy_np[victim]) if victim is not None else -1
-                elif reusable_slots:
-                    slot = reusable_slots.pop()
-                    victim = slot_owner[slot]
-                else:
-                    slot = -1
-                    victim = None
-
-                if slot < 0:
-                    # count the shortfall
+            if fused_plan is not None:
+                planned_loads = fused_plan["planned_loads"]
+                n_copies = len(planned_loads)
+                if n_copies < len(need_to_load):
                     if stats is not None and not is_prefetch:
                         stats.note_shortfall()
                     if self._debug:
-                        logger.info(
-                            "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded, "
-                            "missed=%s",
-                            layer_idx, len(need_to_load) - n_copies,
-                            sorted(list(need_to_load))[n_copies:][:20])
-                    break  # no free slots — should not happen in normal usage
+                        logger.info("[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded",
+                                    layer_idx, len(need_to_load) - n_copies)
+            else:
+                n_copies = 0
+                planned_loads = []
+                victims = None
+                if self.cache_policy is not None:
+                    victims = iter(self.cache_policy.choose_victims(
+                        layer_idx,
+                        slot_owner,
+                        protected=needed,
+                        count=len(need_to_load),
+                    ))
+                for eid in need_to_load:
+                    if self.cache_policy is not None:
+                        victim = next(victims, None)
+                        slot = int(log2phy_np[victim]) if victim is not None else -1
+                    elif reusable_slots:
+                        slot = reusable_slots.pop()
+                        victim = slot_owner[slot]
+                    else:
+                        slot = -1
+                        victim = None
 
-                # (merge): defer the copy. The H2D is submitted as one
-                # transport batch after the loop so MemFabric sparse_copy sees a single descriptor list
-                planned_loads.append((slot, eid))
-                # Update mapping
-                if victim is None:
-                    victim = slot_owner[slot]
-                log2phy_np[victim] = -1             # evict old occupant
-                on_device.discard(victim)
-                log2phy_np[eid] = slot               # assign slot to new expert
-                slot_owner[slot] = eid
-                on_device.add(eid)
-                if slot in reusable_slots:
-                    reusable_slots.remove(slot)
-                n_copies += 1
+                    if slot < 0:
+                        # count the shortfall
+                        if stats is not None and not is_prefetch:
+                            stats.note_shortfall()
+                        if self._debug:
+                            logger.info(
+                                "[UPDATE-W] l=%d NO SLOTS: %d experts could not be loaded, "
+                                "missed=%s",
+                                layer_idx, len(need_to_load) - n_copies,
+                                sorted(list(need_to_load))[n_copies:][:20])
+                        break  # no free slots — should not happen in normal usage
+
+                    # (merge): defer the copy. The H2D is submitted as one
+                    # transport batch after the loop so MemFabric sparse_copy sees a single descriptor list
+                    planned_loads.append((slot, eid))
+                    # Update mapping
+                    if victim is None:
+                        victim = slot_owner[slot]
+                    log2phy_np[victim] = -1             # evict old occupant
+                    on_device.discard(victim)
+                    log2phy_np[eid] = slot               # assign slot to new expert
+                    slot_owner[slot] = eid
+                    on_device.add(eid)
+                    if slot in reusable_slots:
+                        reusable_slots.remove(slot)
+                    n_copies += 1
 
             # (merge): submit the batch first so the CPU-only stats
             # bookkeeping below overlaps the transfer, then synchronize

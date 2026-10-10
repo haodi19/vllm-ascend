@@ -522,6 +522,9 @@ class TestExpertOffloadConfig(TestBase):
     def test_lrc_backend_is_opt_in(self):
         self.assertEqual(ExpertOffloadConfig({}).cache_policy_backend, "python")
         self.assertEqual(ExpertOffloadConfig({"cache_policy_backend": "cpp"}).cache_policy_backend, "cpp")
+        self.assertEqual(ExpertOffloadConfig({"cache_policy_backend": "cpp_fused"}).cache_policy_backend, "cpp_fused")
+        with self.assertRaisesRegex(ValueError, "single-card"):
+            ExpertOffloadConfig({"cache_policy_backend": "cpp_fused", "enable_multi_card": True})
         for invalid in ("auto", "cuda", None):
             with self.assertRaises(ValueError):
                 ExpertOffloadConfig({"cache_policy_backend": invalid})

@@ -10,8 +10,8 @@ from pathlib import Path
 
 
 def select_backend(source, backend):
-    if backend not in ("python", "cpp"):
-        raise ValueError("backend must be python or cpp")
+    if backend not in ("python", "cpp", "cpp_fused"):
+        raise ValueError("backend must be python, cpp or cpp_fused")
 
     def replace(match):
         config = json.loads(match.group(2))
@@ -30,7 +30,7 @@ def select_backend(source, backend):
 def main():
     repo = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("python", "cpp"), default="python")
+    parser.add_argument("--backend", choices=("python", "cpp", "cpp_fused"), default="python")
     parser.add_argument("--test-script", type=Path, default=repo / "script/test_graph2.sh")
     args = parser.parse_args()
     try:
