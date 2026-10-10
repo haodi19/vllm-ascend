@@ -802,6 +802,10 @@ class ExpertOffloadManager:
             "hot_preload=%.1fs prefill_pool=%.1fs gate=%.1fs | total=%.1fs",
             t2 - t1, t3 - t2, t4 - t3, t5 - t4, t_hot - t5, t6 - t_hot,
             t7 - t6, t7 - t0)
+        if self.offload_config.callback_timing_port:
+            # Diagnostic-only lazy import; disabled production has no wrappers.
+            from vllm_ascend.expert_offload.callback_timing import install_callback_timing
+            install_callback_timing(self, self.offload_config.callback_timing_port)
 
     def process_weights_after_loading(self):
         """Convert resident CPU expert buffers to the on-device weight format.
@@ -2824,6 +2828,9 @@ class ExpertOffloadManager:
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
+        timing = getattr(self, '_callback_timing', None)
+        if timing is not None:
+            timing.close()
         transport = getattr(self, 'h2d_transport', None)
         if transport is not None:
             transport.synchronize(self.load_stream)

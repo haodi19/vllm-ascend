@@ -1003,6 +1003,9 @@ class ExpertOffloadConfig:
         "cache_policy_enabled": False,
         # CPU LRC implementation; cpp requires the optional csrc/lrc_policy build.
         "cache_policy_backend": "python",
+        # Opt-in localhost callback timer control port. 0 disables all hooks;
+        # 1024..65535 enables diagnostics for a single-worker LRC comparison.
+        "callback_timing_port": 0,
         "cache_recent_window": 32,
         "cache_ema_beta": 0.9,
         "cache_recent_weight": 1.0,
@@ -1171,6 +1174,14 @@ class ExpertOffloadConfig:
             raise ValueError("cache_policy_backend must be 'python', 'cpp' or 'cpp_fused'")
         if self.config["cache_policy_backend"] == "cpp_fused" and self.config["enable_multi_card"]:
             raise ValueError("cpp_fused currently supports single-card expert offload only")
+        port = self.config["callback_timing_port"]
+        if isinstance(port, bool) or not isinstance(port, int) or (port != 0 and not 1024 <= port <= 65535):
+            raise ValueError("callback_timing_port must be 0 or an integer in 1024..65535")
+        if port and (
+            self.config["enable_multi_card"] or not self.config["cache_policy_enabled"]
+            or self.config["cache_policy_backend"] == "cpp_fused" or self.config["h2d_backend"] != "torch"
+        ):
+            raise ValueError("callback_timing_port requires single-card python/cpp LRC with torch transport")
         if not isinstance(self.config["cache_recent_window"], int):
             raise TypeError("cache_recent_window must be an integer")
         if self.config["cache_recent_window"] < 1:

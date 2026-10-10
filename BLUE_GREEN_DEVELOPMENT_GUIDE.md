@@ -72,10 +72,14 @@ AI 必须区分以下状态：
 ### 测试交付约定
 
 后续每轮测试都提供一个可一次执行的脚本，用户运行后返回经过检查的控制台输出。
-脚本不包含 Git 操作，不把测试结果或日志写入文件；构建所需的正常产物不在此限制内。
+脚本不包含 Git 操作，不把测试统计或控制台日志写入文件；构建所需的正常产物不在此限制内。
+用户要求保存 profile 时，允许将 profiler 产物保存在绿区，用于 MindStudio 可视化，
+但不向蓝区传输这些文件。
 需要构建、校验和多轮性能对比时，由脚本按顺序执行，并在任一步失败时停止。
 
-当前迁移测试入口：`python -B script/run_load_migration_tests.py`。
+当前已验证 C++ LRC 对照入口：`python -B script/run_verified_cpp_tests.py`。
+详见 [单测与推理对照说明](docs/verified_cpp_comparison.md)。
+历史 load_submit 迁移实验仍保留：`python -B script/run_load_migration_tests.py`。
 
 ## 三、远端仓库关系
 

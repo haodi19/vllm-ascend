@@ -536,6 +536,20 @@ class TestExpertOffloadConfig(TestBase):
         self.assertEqual(config.memfabric_pool_size_gib, 0)
         self.assertEqual(config.memfabric_log_level, 3)
 
+    def test_callback_timing_is_opt_in_and_single_card(self):
+        self.assertEqual(ExpertOffloadConfig({}).callback_timing_port, 0)
+        valid = {"cache_policy_enabled": True, "callback_timing_port": 18155}
+        self.assertEqual(ExpertOffloadConfig(valid).callback_timing_port, 18155)
+        for port in (True, -1, 80, 65536, "18155"):
+            with self.assertRaisesRegex(ValueError, "callback_timing_port"):
+                ExpertOffloadConfig({**valid, "callback_timing_port": port})
+        for extra in (
+            {"enable_multi_card": True}, {"cache_policy_enabled": False},
+            {"cache_policy_backend": "cpp_fused"}, {"h2d_backend": "memfabric"},
+        ):
+            with self.assertRaisesRegex(ValueError, "callback_timing_port"):
+                ExpertOffloadConfig({**valid, **extra})
+
     def test_memfabric_h2d_accepts_local_and_shared_configs(self):
         local = ExpertOffloadConfig({
             "h2d_backend": "memfabric",

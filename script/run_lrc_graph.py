@@ -30,7 +30,7 @@ def select_backend(source, backend):
 def main():
     repo = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=("python", "cpp", "cpp_fused"), default="python")
+    parser.add_argument("--backend", choices=("python", "cpp", "cpp_fused"), default="cpp")
     parser.add_argument("--test-script", type=Path, default=repo / "script/test_graph2.sh")
     args = parser.parse_args()
     try:
