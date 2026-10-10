@@ -3,6 +3,10 @@
 Run from the repository in the green container. Output goes to the console;
 the script writes no result files. Use `python -B` to suppress bytecode files.
 
+For opt-in native submission and a breakdown of `load_submit`, see the
+[phase-3 H2D experiment](lrc_cpp_h2d_experiment.md). These options are confined
+to the standalone benchmark; the default remains TorchCopy.
+
 ```bash
 python -B bench_update_weights.py
 ASCEND_RT_VISIBLE_DEVICES=3 python -B bench_update_weights.py --mode npu

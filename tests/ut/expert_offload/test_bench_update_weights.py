@@ -46,6 +46,40 @@ class TestUpdateWeightsBenchmark(unittest.TestCase):
         self.assertEqual(result["observe"], 0)
         self.assertEqual(result["outer"], result["total"])
 
+    def test_detail_nested_timers_are_not_double_counted(self):
+        timer = self.bench["Timings"](detail_load=True)
+
+        def call(_):
+            timer.values.update(
+                load_submit=100, load_prepare=30, copy_submit=50, scale_refresh=5, acl_descriptors=10, acl_native=25
+            )
+
+        result = timer.run(call, None)
+        self.assertEqual(result["load_other"], 15)
+        self.assertEqual(result["copy_submit"], 50)
+        self.assertEqual(result["acl_native"], 25)
+
+    def test_content_check_distinguishes_weight_buffers(self):
+        layer = types.SimpleNamespace(
+            w13_weight=torch.full((1, 16), 3, dtype=torch.uint8),
+            w2_weight=torch.full((1, 16), 100, dtype=torch.uint8),
+        )
+        check = self.bench["check_copied_bytes"]
+        check(layer, [(0, 3)])
+        layer.w2_weight.fill_(3)
+        with self.assertRaisesRegex(RuntimeError, "w2_weight"):
+            check(layer, [(0, 3)])
+
+    def test_npu_only_flags_rejected_in_planning_mode(self):
+        for flags in (["--h2d-backend", "acl"], ["--detail-load"], ["--check-every", "1"], ["--check-every", "-1"]):
+            with (
+                self.subTest(flags=flags),
+                patch.object(sys, "argv", ["bench", *flags]),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                self.bench["main"]()
+
     def test_planning_scenarios_and_input_validation(self):
         for flags in (
             [],

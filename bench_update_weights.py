@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Standalone single-card _update_weights benchmark; console output only.
 
-Planning mode skips H2D; NPU mode uses synthetic unquantized byte buffers and
-the real TorchCopy transport. Neither mode runs a model or a graph callback.
+Planning mode skips H2D; NPU mode uses synthetic unquantized byte buffers with
+TorchCopy or opt-in native ACL submission. Neither runs a model/graph callback.
 """
 
 import argparse
@@ -12,6 +12,7 @@ import hashlib
 import logging
 import math
 import random
+import runpy
 import sys
 import time
 import types
@@ -24,6 +25,9 @@ from bench_lrc_policy import load_policy, model_dimensions, project_settings, re
 
 INPUT_CASES = 256
 MIB = 1024 * 1024
+PATTERN_MODULUS = 251
+W2_PATTERN_OFFSET = 97
+DETAIL_METRICS = ("load_prepare", "copy_submit", "scale_refresh", "load_other", "acl_descriptors", "acl_native")
 METHODS = (
     "_update_weights",
     "_record_cache_stats",
@@ -64,9 +68,10 @@ def load_manager(path, npu_module, transport, logger):
 
 
 class Timings:
-    def __init__(self, clock=time.perf_counter_ns):
+    def __init__(self, clock=time.perf_counter_ns, detail_load=False):
         self.clock = clock
         self.values = {}
+        self.detail_load = detail_load
 
     def wrap(self, name, fn):
         def timed(*args, **kwargs):
@@ -91,6 +96,11 @@ class Timings:
         result["total"] = total
         result["host_without_sync"] = total - result["synchronize"]
         result["outer"] = total - sum(result[name] for name in ("observe", "choose_victims", "synchronize"))
+        if self.detail_load:
+            result.update({name: self.values.get(name, 0) for name in DETAIL_METRICS})
+            result["load_other"] = result["load_submit"] - sum(
+                result[name] for name in ("load_prepare", "copy_submit", "scale_refresh")
+            )
         return result
 
 
@@ -176,14 +186,19 @@ def build_harness(args, settings, repo):
         for name in ("w13", "w2"):
             host = torch.empty((args.experts, nbytes), dtype=torch.uint8, pin_memory=True)
             for eid in range(args.experts):
-                host[eid].fill_(eid % 251)
+                host[eid].fill_((eid + (W2_PATTERN_OFFSET if name == "w2" else 0)) % PATTERN_MODULUS)
             sources[name] = host
             setattr(layer, name + "_weight", torch.zeros((args.cache_size, nbytes), dtype=torch.uint8, device=device))
         manager._expert_src_storage = lambda layer_idx, eid, name: (
             sources[name].untyped_storage()[eid * nbytes : (eid + 1) * nbytes]
         )
         manager._build_quant_attr_h2d_tasks = lambda *unused: []
-        transport = transport_module.TorchCopyH2DTransport()
+        if args.h2d_backend == "acl":
+            # Standalone loading avoids executing the plugin's general patches.
+            native = runpy.run_path(str(base / "experimental_acl_h2d.py"))
+            transport = native["ExperimentalAclStorageTransport"](stream, args.device)
+        else:
+            transport = transport_module.TorchCopyH2DTransport()
         manager._get_h2d_transport = lambda: transport
         torch_npu.npu.synchronize()
         original_load = manager._load_expert_weights_into_slots
@@ -196,7 +211,14 @@ def build_harness(args, settings, repo):
         return original_load(layer, layer_idx, plans)
 
     manager._load_expert_weights_into_slots = load
-    timings = Timings()
+    timings = Timings(detail_load=args.detail_load)
+    if args.detail_load:
+        manager._build_expert_h2d_tasks = timings.wrap("load_prepare", manager._build_expert_h2d_tasks)
+        manager._refresh_expert_fp32_scale = timings.wrap("scale_refresh", manager._refresh_expert_fp32_scale)
+        transport.copy_batch = timings.wrap("copy_submit", transport.copy_batch)
+        if args.h2d_backend == "acl":
+            transport._build_descriptors = timings.wrap("acl_descriptors", transport._build_descriptors)
+            transport._submit = timings.wrap("acl_native", transport._submit)
     for name in ("observe", "choose_victims"):
         setattr(manager.cache_policy, name, timings.wrap(name, getattr(manager.cache_policy, name)))
     manager._synchronize_h2d = timings.wrap("synchronize", manager._synchronize_h2d)
@@ -214,11 +236,23 @@ def build_harness(args, settings, repo):
     return manager, layer, timings, loaded, digest, policy_digest
 
 
+def check_copied_bytes(layer, loaded):
+    """Outside-timing correctness check, with distinct w13/w2 byte patterns."""
+    for slot, eid in loaded:
+        for name, offset in (("w13_weight", 0), ("w2_weight", W2_PATTERN_OFFSET)):
+            expected = (eid + offset) % PATTERN_MODULUS
+            if not bool((getattr(layer, name)[slot].cpu() == expected).all()):
+                raise RuntimeError(f"Synthetic H2D content check failed: {name}, slot={slot}, expert={eid}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     repo = Path(__file__).resolve().parent
     parser.add_argument("--mode", choices=("planning", "npu"), default="planning")
     parser.add_argument("--backend", choices=("python", "cpp", "cpp_fused"), default="python")
+    parser.add_argument("--h2d-backend", choices=("torch", "acl"), default="torch", help="NPU benchmark only")
+    parser.add_argument("--detail-load", action="store_true", help="NPU only: extra nested timers (adds overhead)")
+    parser.add_argument("--check-every", type=int, default=0, help="NPU byte checks every N calls; 0=last call only")
     parser.add_argument("--test-script", type=Path, default=repo / "script/test_graph2.sh")
     parser.add_argument("--config-source", type=Path, default=repo / "vllm_ascend/ascend_config.py")
     parser.add_argument("--model-config", type=Path)
@@ -240,6 +274,10 @@ def main():
     parser.add_argument("--seed", type=int, default=20261009)
     args = parser.parse_args()
     try:
+        if args.check_every < 0:
+            raise ValueError("check-every must be >= 0")
+        if args.mode != "npu" and (args.h2d_backend != "torch" or args.detail_load or args.check_every):
+            raise ValueError("h2d-backend=acl, detail-load and check-every require --mode npu")
         settings = project_settings(args.test_script, args.config_source)
         if settings["enable_multi_card"] or not settings["cache_policy_enabled"]:
             raise ValueError("This benchmark requires single-card LRC enabled")
@@ -271,7 +309,12 @@ def main():
     print("Model dimensions: " + ("config + CLI overrides" if args.model_config else "fallback 256/6 + CLI overrides"))
     print(f"torch={torch.__version__} numpy={np.__version__}")
     if args.mode == "npu":
-        print(f"TorchCopy only; synthetic bytes, no quantization; weight_mib={args.weight_mib} per buffer")
+        print(
+            f"h2d_backend={args.h2d_backend}; synthetic bytes, no quantization; weight_mib={args.weight_mib} per buffer"
+        )
+        print(f"detail_load={args.detail_load} check_every={args.check_every} logical_device={args.device}")
+        if args.h2d_backend == "acl":
+            print("EXPERIMENT: existing C++ swap_blocks_batch; batch API vs loop depends on installed binary.")
         print(
             f"Approx buffers: host={2 * args.experts * args.weight_mib:.1f} MiB; "
             f"device={2 * args.cache_size * args.weight_mib:.1f} MiB",
@@ -281,6 +324,12 @@ def main():
         print("PLANNING ONLY: load_submit/synchronize are no-ops; excludes transfer preparation/submission.")
     manager, layer, timings, loaded, digest, policy_digest = build_harness(args, settings, repo)
     print(f"manager_sha256={digest}\npolicy_sha256={policy_digest}")
+    transport_path = (
+        repo
+        / "vllm_ascend/expert_offload"
+        / ("experimental_acl_h2d.py" if args.h2d_backend == "acl" else "h2d_transfer.py")
+    )
+    print(f"transport_sha256={hashlib.sha256(transport_path.read_bytes()).hexdigest()}")
     mapping = np.full(args.experts, -1, dtype=np.int64)
     initial = mapping.copy()
     initial[: args.cache_size] = np.arange(args.cache_size)
@@ -297,32 +346,40 @@ def main():
             "fused_plan",
         )
     }
+    if args.detail_load:
+        samples.update({name: [] for name in DETAIL_METRICS})
     counts = []
     warmup = max(args.warmup, math.ceil(args.recent_window / args.tokens) + 1)
-    for index in range(warmup + args.iterations):
-        ids, scores = cases[index % len(cases)]
-        mapping[:] = initial  # Restore residency outside timing; avoids becoming all-hit.
-        loaded.clear()
-        call_args = (ids, mapping, layer, 0, scores if args.router_scores else None, args.prefetch)
-        result = timings.run(manager._update_weights, call_args)
-        # Validate state and actual transfer destinations outside timing.
-        expected = set(ids.reshape(-1).tolist()) - set(range(args.cache_size))
-        expected_count = min(len(expected), manager.prefetch_topk) if args.prefetch else len(expected)
-        if len(loaded) != expected_count or any(mapping[eid] != slot for slot, eid in loaded):
-            raise RuntimeError("Invalid load count or updated mapping")
-        resident = mapping[mapping >= 0]
-        if len(resident) != args.cache_size or len(set(resident.tolist())) != args.cache_size:
-            raise RuntimeError("Invalid cache slot ownership")
-        if index >= warmup:
-            for name, value in result.items():
-                samples[name].append(value)
-            counts.append(len(loaded))
-    if args.mode == "npu":
-        # Last iteration's writes must be complete and contain the intended expert bytes.
-        for slot, eid in loaded:
-            for name in ("w13_weight", "w2_weight"):
-                if not bool((getattr(layer, name)[slot].cpu() == eid % 251).all()):
-                    raise RuntimeError("Synthetic H2D content check failed")
+    try:
+        for index in range(warmup + args.iterations):
+            ids, scores = cases[index % len(cases)]
+            mapping[:] = initial  # Restore residency outside timing; avoids becoming all-hit.
+            loaded.clear()
+            call_args = (ids, mapping, layer, 0, scores if args.router_scores else None, args.prefetch)
+            result = timings.run(manager._update_weights, call_args)
+            # Validate state and actual transfer destinations outside timing.
+            expected = set(ids.reshape(-1).tolist()) - set(range(args.cache_size))
+            expected_count = min(len(expected), manager.prefetch_topk) if args.prefetch else len(expected)
+            if len(loaded) != expected_count or any(mapping[eid] != slot for slot, eid in loaded):
+                raise RuntimeError("Invalid load count or updated mapping")
+            resident = mapping[mapping >= 0]
+            if len(resident) != args.cache_size or len(set(resident.tolist())) != args.cache_size:
+                raise RuntimeError("Invalid cache slot ownership")
+            if args.check_every and (index + 1) % args.check_every == 0:
+                check_copied_bytes(layer, loaded)
+            if index >= warmup:
+                for name, value in result.items():
+                    samples[name].append(value)
+                counts.append(len(loaded))
+        if args.mode == "npu":
+            check_copied_bytes(layer, loaded)
+    finally:
+        if args.mode == "npu":
+            # Also drain partially submitted work before owners go out of scope
+            # on an exception; cleanup is outside all measured intervals.
+            transport = manager._get_h2d_transport()
+            transport.synchronize(manager.load_stream)
+            transport.close()
     print(
         f"warmup={warmup} iterations={args.iterations}; loads min/mean/max="
         f"{min(counts)}/{sum(counts) / len(counts):.2f}/{max(counts)}"
@@ -335,6 +392,12 @@ def main():
     for name, values in samples.items():
         report(name, values)
     print("load_submit is INCLUDED in outer; do not add it again.")
+    if args.detail_load:
+        print("load_submit = load_prepare + copy_submit + scale_refresh + load_other.")
+        print("ACL: acl_descriptors and acl_native are nested INSIDE copy_submit, not additional costs.")
+        print("Detailed timers add overhead; compare performance again WITHOUT --detail-load.")
+    if args.check_every:
+        print("Frequent content checks perturb device/CPU state; this is a correctness run, not a performance run.")
     print("Compare host_without_sync (= total - synchronize) across all backends.")
     if args.backend == "cpp_fused":
         print("Fused observe/choose are internal C++ timings; conversion/planning stays in outer.")
