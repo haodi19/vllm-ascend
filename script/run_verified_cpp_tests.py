@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Python vs verified C++ LRC: console timing tables and saved inference profiles."""
+"""Python vs verified C++ LRC: summary.txt, separate logs and inference profiles."""
 
 import argparse
 import contextlib
@@ -14,6 +14,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +36,49 @@ METRICS = (
     "scale_refresh",
     "load_other",
 )
+
+
+class SummaryTee:
+    """Flush each write so completed measurements survive a later stage failure."""
+
+    def __init__(self, console, summary):
+        self.console, self.summary = console, summary
+        self.lock = threading.Lock()
+
+    def write(self, text):
+        with self.lock:
+            self.console.write(text)
+            self.summary.write(text)
+            self.summary.flush()
+        return len(text)
+
+    def flush(self):
+        with self.lock:
+            self.console.flush()
+            self.summary.flush()
+
+
+@contextlib.contextmanager
+def progress(label, interval=15):
+    begin = time.monotonic()
+    done = threading.Event()
+
+    def heartbeat():
+        while not done.wait(interval):
+            print(f"WAIT: {label}; elapsed={time.monotonic() - begin:.0f}s", flush=True)
+
+    print(f"START: {label}", flush=True)
+    thread = threading.Thread(target=heartbeat, daemon=True)
+    thread.start()
+    success = False
+    try:
+        yield
+        success = True
+    finally:
+        done.set()
+        thread.join()
+        state = "DONE" if success else "FAILED"
+        print(f"{state}: {label}; elapsed={time.monotonic() - begin:.1f}s", flush=True)
 
 
 def launch_spec(source, backend, npu, port, timing_port, profile_dir=None):
@@ -97,27 +141,55 @@ def bash_command(prefix, words):
     return ["bash", "-c", prefix + "\nexec " + shlex.join(words)]
 
 
-def run_console(command, env):
-    """Print child output as it arrives; retain only numeric metric means."""
+def run_console(command, env, log_path):
+    """Keep noisy child output in a log and only publish numeric timing rows."""
     means = {}
-    with subprocess.Popen(
-        command,
-        cwd=REPO,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    ) as child:
+    with (
+        log_path.open("w", encoding="utf-8") as log,
+        progress(f"subprocess; log={log_path}"),
+        subprocess.Popen(
+            command,
+            cwd=REPO,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        ) as child,
+    ):
         for line in child.stdout:
-            print(line, end="", flush=True)
+            log.write(line)
+            log.flush()
             parts = line.split()
             if len(parts) == 7 and parts[0] in METRICS:
                 with contextlib.suppress(ValueError):
                     means[parts[0]] = float(parts[1])
+                    print(line, end="", flush=True)
+            elif (
+                parts
+                and parts[0] == "metric"
+                or line.startswith(
+                    (
+                        "Model dimensions:",
+                        "torch=",
+                        "mode=",
+                        "backend=",
+                        "experts=",
+                        "detail_load=",
+                        "load_backend=",
+                        "manager_sha256=",
+                        "policy_sha256=",
+                        "transport_sha256=",
+                        "debug=",
+                        "h2d_backend=",
+                        "warmup=",
+                    )
+                )
+            ):
+                print(line, end="", flush=True)
         if child.wait():
-            raise RuntimeError(f"Stage failed (exit={child.returncode}); remaining tests stopped")
+            raise RuntimeError(f"Stage failed (exit={child.returncode}); details in {log_path}")
     return means
 
 
@@ -137,7 +209,12 @@ def request(opener, port, path, payload=None, timeout=30):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", data=data, headers={"Content-Type": "application/json"}
     )
-    with opener.open(req, timeout=timeout) as response:
+    status = (
+        progress(f"POST {port}{path}; timeout={timeout}s")
+        if payload is not None and path != "/v1/completions"
+        else contextlib.nullcontext()
+    )
+    with status, opener.open(req, timeout=timeout) as response:
         body = response.read()
         return json.loads(body) if body else {}
 
@@ -173,17 +250,71 @@ def stop_owned_service(child):
 def wait_profile(directory, timeout):
     """Wait for exported device timelines before terminating the owned worker."""
     deadline = time.monotonic() + timeout
+    next_update = 0
     while True:
         traces = list(directory.rglob("ASCEND_PROFILER_OUTPUT/trace_view.json"))
         if traces and all(p.stat().st_size and (p.parent / "analyse.done").exists() for p in traces):
             print(f"PROFILE SAVED: {directory}; exported timelines={len(traces)}", flush=True)
             return
         if time.monotonic() >= deadline:
-            raise RuntimeError(f"Profile export not confirmed in {directory}; inspect profiler logs there")
+            raise RuntimeError(
+                f"Profile export not confirmed in {directory}; timelines={len(traces)}; "
+                f"analyse.done={len(list(directory.rglob('analyse.done')))}; inspect profiler logs there"
+            )
+        if time.monotonic() >= next_update:
+            print(
+                f"WAIT: profile export; timelines={len(traces)}; "
+                f"analyse.done={len(list(directory.rglob('analyse.done')))}; "
+                f"remaining={max(0, deadline - time.monotonic()):.0f}s; directory={directory}",
+                flush=True,
+            )
+            next_update = time.monotonic() + 15
         time.sleep(2)
 
 
+def print_inference_report(backend, report, requests):
+    if report["errors"] or report["dropped"] or not report["count"]:
+        raise RuntimeError(
+            f"Incomplete callback timing: count={report['count']} errors={report['errors']} dropped={report['dropped']}"
+        )
+    print(f"INFERENCE {backend}: callbacks={report['count']}; errors=0; dropped=0", flush=True)
+    for group in report["groups"]:
+        print(
+            f"\nkind={group['kind']} token_rows={group['token_rows']} callbacks={group['count']} "
+            f"layers={group['layers']} loads_per_callback={group['loads']}",
+            flush=True,
+        )
+        print(
+            f"{'metric':26} {'mean_us':>10} {'p50_us':>10} {'p95_us':>10} {'p99_us':>10} {'min_us':>10} {'max_us':>10}",
+            flush=True,
+        )
+        for name in METRICS:
+            print(
+                f"{name:26} "
+                + " ".join(
+                    f"{group['metrics'][name][key]:10.3f}" for key in ("mean", "p50", "p95", "p99", "min", "max")
+                ),
+                flush=True,
+            )
+    stats = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))["summarize"]
+    print(f"Request wall time (ms, TIMERS + PROFILER): {stats([r[0] / 1000 for r in requests])}", flush=True)
+    print(f"Request usage: {[r[1] for r in requests]}", flush=True)
+    report["request_us"] = statistics.mean(r[0] for r in requests)
+    report["usage"] = [r[1] for r in requests]
+    report["digests"] = [r[2] for r in requests]
+    return report
+
+
 def inference(args, source, backend, env):
+    output_dir = getattr(args, "output_dir", None)
+    log_path = output_dir / f"inference_{backend}.log" if output_dir else None
+    if log_path:
+        print(f"Service log: {log_path}", flush=True)
+    with log_path.open("w", encoding="utf-8") if log_path else contextlib.nullcontext() as log:
+        return _inference(args, source, backend, env, log)
+
+
+def _inference(args, source, backend, env, log):
     profile_dir = args.profile_run_dir / backend
     prefix, command, model, _ = launch_spec(source, backend, args.npu, args.port, args.timing_port, profile_dir)
     assert_port_free(args.port)
@@ -191,22 +322,25 @@ def inference(args, source, backend, env):
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     print(f"\n=== INFERENCE {backend}: fresh service; profile={profile_dir} ===", flush=True)
     print(f"Effective serve command: {shlex.join(command)}", flush=True)
-    child = subprocess.Popen(bash_command(prefix, command), cwd=REPO, env=env, start_new_session=True)
+    child = subprocess.Popen(
+        bash_command(prefix, command), cwd=REPO, env=env, start_new_session=True, stdout=log, stderr=subprocess.STDOUT
+    )
     try:
-        deadline = time.monotonic() + args.startup_timeout
-        while True:
-            if child.poll() is not None:
-                raise RuntimeError(f"Service exited during startup: {child.returncode}")
-            try:
-                request(opener, args.port, "/health", timeout=2)
-                status = request(opener, args.timing_port, "/status", timeout=2)
-                if status.get("backend") != backend or status.get("load_backend") != "python":
-                    raise RuntimeError(f"Unexpected worker timing identity: {status}")
-                break
-            except (urllib.error.URLError, TimeoutError, ConnectionError):
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("Service readiness timed out") from None
-                time.sleep(2)
+        with progress(f"{backend} service readiness; timeout={args.startup_timeout}s"):
+            deadline = time.monotonic() + args.startup_timeout
+            while True:
+                if child.poll() is not None:
+                    raise RuntimeError(f"Service exited during startup: {child.returncode}")
+                try:
+                    request(opener, args.port, "/health", timeout=2)
+                    status = request(opener, args.timing_port, "/status", timeout=2)
+                    if status.get("backend") != backend or status.get("load_backend") != "python":
+                        raise RuntimeError(f"Unexpected worker timing identity: {status}")
+                    break
+                except (urllib.error.URLError, TimeoutError, ConnectionError):
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Service readiness timed out") from None
+                    time.sleep(2)
         payload = dict(model=model, prompt="The future of AI is", max_tokens=args.max_tokens, temperature=0)
         print(
             f"Service ready. Warmup={args.warmup_requests}; measured requests={args.requests}; "
@@ -223,52 +357,27 @@ def inference(args, source, backend, env):
             text = "".join(item.get("text", "") for item in result["choices"])
             return elapsed, result["usage"], hashlib.sha256(text.encode()).hexdigest()
 
-        for _ in range(args.warmup_requests):
-            completion()
+        with progress(f"{backend} warmup: {args.warmup_requests} requests"):
+            for _ in range(args.warmup_requests):
+                completion()
         request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
+        requests = []
         try:
             request(opener, args.timing_port, "/start", {})
-            requests = [completion() for _ in range(args.requests)]
+            with progress(f"{backend} measured inference: {args.requests} requests"):
+                requests = [completion() for _ in range(args.requests)]
         finally:
             try:
                 report = request(opener, args.timing_port, "/stop", {}, timeout=40)
+                if len(requests) == args.requests:
+                    print_inference_report(backend, report, requests)
             finally:
                 request(opener, args.port, "/stop_profile", {}, timeout=args.profile_timeout)
                 wait_profile(profile_dir, args.profile_timeout)
-        if report["errors"] or report["dropped"] or not report["count"]:
-            raise RuntimeError(
-                f"Incomplete callback timing: count={report['count']} "
-                f"errors={report['errors']} dropped={report['dropped']}"
-            )
-        print(f"INFERENCE {backend}: callbacks={report['count']}; errors=0; dropped=0", flush=True)
-        for group in report["groups"]:
-            print(
-                f"\nkind={group['kind']} token_rows={group['token_rows']} callbacks={group['count']} "
-                f"layers={group['layers']} loads_per_callback={group['loads']}",
-                flush=True,
-            )
-            print(
-                f"{'metric':26} {'mean_us':>10} {'p50_us':>10} {'p95_us':>10} "
-                f"{'p99_us':>10} {'min_us':>10} {'max_us':>10}",
-                flush=True,
-            )
-            for name in METRICS:
-                print(
-                    f"{name:26} "
-                    + " ".join(
-                        f"{group['metrics'][name][key]:10.3f}" for key in ("mean", "p50", "p95", "p99", "min", "max")
-                    ),
-                    flush=True,
-                )
-        stats = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))["summarize"]
-        print(f"Request wall time (ms, TIMERS + PROFILER): {stats([r[0] / 1000 for r in requests])}", flush=True)
-        print(f"Request usage: {[r[1] for r in requests]}", flush=True)
-        report["request_us"] = statistics.mean(r[0] for r in requests)
-        report["usage"] = [r[1] for r in requests]
-        report["digests"] = [r[2] for r in requests]
         return report
     finally:
-        stop_owned_service(child)
+        with progress(f"{backend} service cleanup; up to 40s"):
+            stop_owned_service(child)
 
 
 def main(argv=None):
@@ -285,6 +394,7 @@ def main(argv=None):
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=300)
     parser.add_argument("--profile-timeout", type=int, default=600)
+    parser.add_argument("--output-dir", type=Path, help="New directory for summary.txt and detailed logs")
     args = parser.parse_args(argv)
     if (args.npu is not None and args.npu < 0) or min(
         args.requests,
@@ -297,17 +407,38 @@ def main(argv=None):
         parser.error("NPU must be >=0; counts and timeouts must be positive")
     if os.name != "posix":
         parser.error("Execute in the Linux NPU container")
+    args.output_dir = (
+        args.output_dir
+        or REPO / "bench_results" / (time.strftime("verified_cpp_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8])
+    ).resolve()
+    args.output_dir.mkdir(parents=True, exist_ok=False)
+    with (
+        (args.output_dir / "summary.txt").open("w", encoding="utf-8") as summary,
+        contextlib.redirect_stdout(SummaryTee(sys.stdout, summary)),
+    ):
+        print(f"SUMMARY FILE: {args.output_dir / 'summary.txt'}", flush=True)
+        try:
+            run_tests(args)
+        except KeyboardInterrupt:
+            print("INTERRUPTED: partial results retained; owned service cleanup requested.", flush=True)
+            raise SystemExit(130) from None
+        except Exception as exc:
+            print(f"FAILED: {type(exc).__name__}: {exc}; partial results retained.", flush=True)
+            raise SystemExit(1) from None
+
+
+def run_tests(args):
     source = args.test_script.read_text(encoding="utf-8")
     prefix, words, _, model_config = launch_spec(source, "python", args.npu, args.port, args.timing_port)
     args.port = int(words[words.index("--port") + 1]) if "--port" in words else 8000
     if not 1024 <= args.port <= 65535 or not 1024 <= args.timing_port <= 65535 or args.port == args.timing_port:
-        parser.error("Use distinct ports in 1024..65535")
+        raise ValueError("Use distinct ports in 1024..65535")
     if args.only != "micro":
         if "--profiler-config" not in words:
-            parser.error("test_graph2.sh must contain --profiler-config")
+            raise ValueError("test_graph2.sh must contain --profiler-config")
         profiler = json.loads(words[words.index("--profiler-config") + 1])
         if profiler.get("profiler") != "torch" or not profiler.get("torch_profiler_dir"):
-            parser.error("test_graph2.sh must configure the torch profiler output directory")
+            raise ValueError("test_graph2.sh must configure the torch profiler output directory")
         base = Path(profiler["torch_profiler_dir"])
         if not base.is_absolute():
             base = REPO / base
@@ -317,13 +448,19 @@ def main(argv=None):
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(args.npu)
     py = [sys.executable, "-u", "-B"]
     print("=== VERIFIED CPP COMPARISON: only LRC observe/choose; all load logic stays Python ===", flush=True)
+    print(
+        f"Requested NPU={args.npu if args.npu is not None else 'inherit test_graph2.sh'}; "
+        f"test_script={args.test_script}; source_sha256={hashlib.sha256(source.encode()).hexdigest()}",
+        flush=True,
+    )
     print("Detailed timers add overhead. No fused planner, ACL experiment or C++ load migration.", flush=True)
     print(
         "Inference inherits test_graph2.sh, including model/MTP/prefetch/debug/profiler settings.",
         flush=True,
     )
     print(
-        "Timing summaries: console only. Profiles: separate python/cpp directories. No Git or host sysctl changes.",
+        "Timing summaries: summary.txt and console. Raw logs: output directory. "
+        "Profiles: separate python/cpp directories.",
         flush=True,
     )
     print(
@@ -333,13 +470,17 @@ def main(argv=None):
         assert_port_free(args.port)
         assert_port_free(args.timing_port)
     if not args.skip_build:
-        run_console([*py, "-m", "pip", "install", "-v", "./csrc/lrc_policy", "--no-build-isolation", "--no-deps"], env)
-    run_console([*py, "tests/ut/expert_offload/test_lrc_cpp.py", "--require-cpp"], env)
+        run_console(
+            [*py, "-m", "pip", "install", "-v", "./csrc/lrc_policy", "--no-build-isolation", "--no-deps"],
+            env,
+            args.output_dir / "build.log",
+        )
+    run_console([*py, "tests/ut/expert_offload/test_lrc_cpp.py", "--require-cpp"], env, args.output_dir / "parity.log")
     if args.only != "inference":
         if not model_config.is_file():
             raise RuntimeError(f"Local model config is required to align micro dimensions: {model_config}")
         results = {"python": [], "cpp": []}
-        for backend in ("python", "cpp", "cpp", "python"):
+        for index, backend in enumerate(("python", "cpp", "cpp", "python"), 1):
             print(f"\n=== MICRO {backend}: original Python load_submit, detailed timing ===", flush=True)
             command = [
                 *py,
@@ -358,7 +499,7 @@ def main(argv=None):
                 "--model-config",
                 str(model_config),
             ]
-            means = run_console(bash_command(prefix, command), env)
+            means = run_console(bash_command(prefix, command), env, args.output_dir / f"micro_{index}_{backend}.log")
             if not all(k in means for k in METRICS):
                 raise RuntimeError("Micro timing table is incomplete")
             results[backend].append(means)

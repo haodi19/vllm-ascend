@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import runpy
+import sys
 import tempfile
 import threading
 import types
@@ -163,6 +164,38 @@ class TestVerifiedRunner(unittest.TestCase):
         cls.module = runpy.run_path(str(REPO / "script/run_verified_cpp_tests.py"))
         cls.source = (REPO / "script/test_graph2.sh").read_text(encoding="utf-8")
 
+    def test_subprocess_noise_goes_to_log_and_metrics_to_summary(self):
+        fn = self.module["run_console"]
+        with tempfile.TemporaryDirectory() as root:
+            log = Path(root) / "child.log"
+            console = io.StringIO()
+            with contextlib.redirect_stdout(console):
+                means = fn([sys.executable, "-c", "print('noisy log'); print('total 1 2 3 4 5 6')"], None, log)
+            self.assertEqual(means, {"total": 1})
+            self.assertNotIn("noisy log", console.getvalue())
+            self.assertIn("total 1 2 3 4 5 6", console.getvalue())
+            self.assertIn("noisy log", log.read_text())
+
+    def test_failed_run_retains_summary(self):
+        fn = self.module["main"]
+
+        def fail(args):
+            print("completed timing: total=12")
+            raise RuntimeError("injected export failure")
+
+        with tempfile.TemporaryDirectory() as root:
+            output = Path(root) / "new_run"
+            with (
+                patch.dict(fn.__globals__, {"os": types.SimpleNamespace(name="posix"), "run_tests": fail}),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaises(SystemExit) as raised,
+            ):
+                fn(["--output-dir", str(output)])
+            self.assertEqual(raised.exception.code, 1)
+            summary = (output / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("completed timing: total=12", summary)
+            self.assertIn("FAILED: RuntimeError: injected export failure", summary)
+
     def test_service_configs_differ_only_in_policy(self):
         commands = []
         for backend in ("python", "cpp"):
@@ -246,18 +279,21 @@ class TestVerifiedRunner(unittest.TestCase):
                 return dict(choices=[{"text": "synthetic"}], usage={"completion_tokens": 5})
             if path == "/stop":
                 return dict(count=5, errors=0, dropped=0, groups=[])
+            if path == "/stop_profile":
+                self.assertIn("INFERENCE cpp: callbacks=5", captured.getvalue())
             return {}
 
         process = Mock()
         process.poll.return_value = None
         popen, cleanup = Mock(return_value=process), Mock()
+        captured = io.StringIO()
         with (
             patch.dict(
                 fn.__globals__,
                 {"request": request, "assert_port_free": Mock(), "stop_owned_service": cleanup, "wait_profile": Mock()},
             ),
             patch("subprocess.Popen", popen),
-            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stdout(captured),
         ):
             result = fn(args, self.source, "cpp", {})
         self.assertEqual(
@@ -276,6 +312,7 @@ class TestVerifiedRunner(unittest.TestCase):
         cleanup.assert_called_once_with(process)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertEqual(len(result["digests"]), 3)
+        self.assertIn("INFERENCE cpp: callbacks=5", captured.getvalue())
 
     def test_request_failure_still_cleans_up_owned_service(self):
         fn = self.module["inference"]

@@ -23,6 +23,18 @@
 python -B script/run_verified_cpp_tests.py
 ```
 
+关键数据同时写入 `bench_results/verified_cpp_<时间>_<标识>/summary.txt`，
+终端开始时打印完整路径。也可以指定一个尚不存在的目录：
+
+```bash
+python -B script/run_verified_cpp_tests.py --npu 4 --output-dir bench_results/lrc_compare_01
+cat bench_results/lrc_compare_01/summary.txt
+```
+
+构建、单测原始输出及推理服务日志分别保存在同目录的 `build.log`、`parity.log`、
+`micro_*.log`、`inference_python.log`、`inference_cpp.log`，不混进关键数据汇总。
+每次使用新目录，避免覆盖上次结果。profile 仍按下文路径保存。
+
 脚本自动构建 LRC 扩展、检查 LRC 一致性，执行四轮单测，然后依次启动 Python 和
 C++ 两个推理服务。每组完成后关闭自己启动的服务，再进行下一组。
 不会关闭其他已有服务；运行前应保证脚本指定的 NPU、服务端口和计时端口可用。
@@ -77,6 +89,13 @@ python -B script/run_verified_cpp_tests.py --only inference
 默认导出等待上限 600 秒，可用 `--profile-timeout` 调整。
 profile 留在绿区，可分别导入 MindStudio；无需传回文件。
 
+等待时每约 15 秒输出当前阶段及耗时。`POST .../stop_profile` 表示等待服务的停止采集
+接口返回；`profile export` 表示接口已经返回，正在等时间线和 `analyse.done` 文件。
+两步分别最多等待 `--profile-timeout` 秒。CANN 日志中的 `data parsed` 仅代表相关
+解析阶段结束，不保证整个导出和 HTTP 请求完成。`Running: 0` 表示当时没有在跑的请求，
+不能据此断定 profiler 卡死。超时会在汇总中标记 FAILED，并保留已有数据。
+时延表在 profile 导出前就写入汇总，避免导出失败导致已采集数据不可见。
+
 如果请求或导出失败，脚本停止后续对比并清理自己启动的服务，已有 profile 目录保留。
 导出超时的目录可能不完整，应检查该目录中的 profiler 日志。
 
@@ -120,8 +139,8 @@ total 从进入回调函数开始，不包含 `_launch_host_func` 入队到回�
 
 ## 返回结果与本地验证边界
 
-脚本不执行 Git 操作，不把统计表或控制台日志保存成文件；只保存用户要求的 profile
-及正常构建产物。请检查并脱敏后返回控制台的分组表、COMPARISON、请求均值和一致性结果。
+脚本不执行 Git 操作。请检查并脱敏后复制 `summary.txt` 内容返回；其中包含分组表、
+COMPARISON、请求均值、一致性结果和阶段状态。无需传回文件或完整服务日志。
 
 蓝区只能验证 CPU 逻辑、启动参数保留、计时公式、采样窗口及服务清理等行为。
 模型启动、实际 NPU 回调、profile 导出和性能结论都必须在绿区执行后确认。
