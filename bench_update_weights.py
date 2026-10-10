@@ -8,6 +8,7 @@ TorchCopy or opt-in native ACL submission. Neither runs a model/graph callback.
 import argparse
 import ast
 import contextlib
+import functools
 import hashlib
 import logging
 import math
@@ -123,6 +124,20 @@ def make_cases(experts, capacity, topk, tokens, scenario, seed):
     return result
 
 
+def install_load_migration(manager, transport, task_class):
+    """Swap four functions for literal C++ translations in this harness only."""
+    try:
+        from _vllm_ascend_lrc import LoadSubmitMigration
+    except ImportError as exc:
+        raise RuntimeError("--load-backend cpp requires rebuilding csrc/lrc_policy (API 3)") from exc
+    expert_weight = manager._build_expert_h2d_tasks.__globals__["_expert_weight"]
+    native = LoadSubmitMigration(task_class, expert_weight, torch.float32)
+    manager._build_expert_h2d_tasks = functools.partial(native.build_tasks, manager)
+    manager._refresh_expert_fp32_scale = native.refresh_scale
+    manager._load_expert_weights_into_slots = functools.partial(native.load, manager)
+    transport.copy_batch = native.copy_batch
+
+
 def build_harness(args, settings, repo):
     # Runtime import keeps CPU planning usable without torch_npu installed.
     if args.mode == "npu":
@@ -201,6 +216,8 @@ def build_harness(args, settings, repo):
             transport = transport_module.TorchCopyH2DTransport()
         manager._get_h2d_transport = lambda: transport
         torch_npu.npu.synchronize()
+        if args.load_backend == "cpp":
+            install_load_migration(manager, transport, transport_module.H2DCopyTask)
         original_load = manager._load_expert_weights_into_slots
     else:
         original_load = lambda *unused: None
@@ -251,6 +268,12 @@ def main():
     parser.add_argument("--mode", choices=("planning", "npu"), default="planning")
     parser.add_argument("--backend", choices=("python", "cpp", "cpp_fused"), default="python")
     parser.add_argument("--h2d-backend", choices=("torch", "acl"), default="torch", help="NPU benchmark only")
+    parser.add_argument(
+        "--load-backend",
+        choices=("python", "cpp"),
+        default="python",
+        help="Literal load_submit migration; requires NPU mode and torch transport",
+    )
     parser.add_argument("--detail-load", action="store_true", help="NPU only: extra nested timers (adds overhead)")
     parser.add_argument("--check-every", type=int, default=0, help="NPU byte checks every N calls; 0=last call only")
     parser.add_argument("--test-script", type=Path, default=repo / "script/test_graph2.sh")
@@ -274,6 +297,8 @@ def main():
     parser.add_argument("--seed", type=int, default=20261009)
     args = parser.parse_args()
     try:
+        if args.load_backend == "cpp" and (args.mode != "npu" or args.h2d_backend != "torch"):
+            raise ValueError("load-backend=cpp requires --mode npu --h2d-backend torch")
         if args.check_every < 0:
             raise ValueError("check-every must be >= 0")
         if args.mode != "npu" and (args.h2d_backend != "torch" or args.detail_load or args.check_every):
@@ -313,6 +338,7 @@ def main():
             f"h2d_backend={args.h2d_backend}; synthetic bytes, no quantization; weight_mib={args.weight_mib} per buffer"
         )
         print(f"detail_load={args.detail_load} check_every={args.check_every} logical_device={args.device}")
+        print(f"load_backend={args.load_backend}; cpp translates control flow, retaining Python tensor APIs")
         if args.h2d_backend == "acl":
             print("EXPERIMENT: existing C++ swap_blocks_batch; batch API vs loop depends on installed binary.")
         print(

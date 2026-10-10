@@ -322,7 +322,7 @@ class CppLRCExpertCachePolicy:
                 "python -m pip install ./csrc/lrc_policy --no-build-isolation --no-deps; "
                 "or select cache_policy_backend=python"
             ) from exc
-        if native.api_version not in (1, 2):
+        if native.api_version not in (1, 2, 3):
             raise RuntimeError("C++ LRC API mismatch; rebuild ./csrc/lrc_policy")
         reference = LRCExpertCachePolicy(**kwargs)
         self.__dict__.update({key: value for key, value in vars(reference).items() if key != "layer_states"})

@@ -14,6 +14,7 @@
 #include <tuple>
 #include <unordered_set>
 #include <vector>
+#include "load_submit.h"
 
 namespace py = pybind11;
 using Id = int64_t;
@@ -348,7 +349,13 @@ class Policy {
 };
 
 PYBIND11_MODULE(_vllm_ascend_lrc, m) {
-  m.attr("api_version") = 2;
+  m.attr("api_version") = 3;
+  py::class_<LoadSubmitMigration>(m, "LoadSubmitMigration")
+      .def(py::init<py::object, py::object, py::object>())
+      .def("build_tasks", &LoadSubmitMigration::build_tasks)
+      .def("refresh_scale", &LoadSubmitMigration::refresh_scale)
+      .def("copy_batch", &LoadSubmitMigration::copy_batch)
+      .def("load", &LoadSubmitMigration::load);
   py::class_<Policy>(m, "Policy")
       .def(py::init<Id, Id, Id, double, double, double, double, double, bool>())
       .def("add_layer", &Policy::add_layer)

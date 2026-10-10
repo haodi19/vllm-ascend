@@ -7,6 +7,10 @@ For opt-in native submission and a breakdown of `load_submit`, see the
 [phase-3 H2D experiment](lrc_cpp_h2d_experiment.md). These options are confined
 to the standalone benchmark; the default remains TorchCopy.
 
+For the current **literal Python-to-C++ migration**, use
+[`--load-backend python|cpp`](load_submit_cpp_migration.md) with TorchCopy.
+This is separate from the older ACL batching experiment.
+
 ```bash
 python -B bench_update_weights.py
 ASCEND_RT_VISIBLE_DEVICES=3 python -B bench_update_weights.py --mode npu

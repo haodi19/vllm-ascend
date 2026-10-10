@@ -7,12 +7,13 @@ from setuptools import setup
 
 setup(
     name="vllm-ascend-lrc",
-    version="0.2.0",
+    version="0.3.0",
     py_modules=[],
     ext_modules=[
         Pybind11Extension(
             "_vllm_ascend_lrc",
             ["lrc.cpp"],
+            depends=["load_submit.h"],
             cxx_std=17,
             extra_compile_args=["/O2", "/fp:strict"] if os.name == "nt" else ["-O3", "-ffp-contract=off"],
         )

@@ -71,7 +71,14 @@ class TestUpdateWeightsBenchmark(unittest.TestCase):
             check(layer, [(0, 3)])
 
     def test_npu_only_flags_rejected_in_planning_mode(self):
-        for flags in (["--h2d-backend", "acl"], ["--detail-load"], ["--check-every", "1"], ["--check-every", "-1"]):
+        for flags in (
+            ["--h2d-backend", "acl"],
+            ["--detail-load"],
+            ["--check-every", "1"],
+            ["--check-every", "-1"],
+            ["--load-backend", "cpp"],
+            ["--mode", "npu", "--h2d-backend", "acl", "--load-backend", "cpp"],
+        ):
             with (
                 self.subTest(flags=flags),
                 patch.object(sys, "argv", ["bench", *flags]),
