@@ -42,38 +42,30 @@ in this comparison. The implementation has no dependence on that policy choice.
 
 ## Green execution
 
-Rebuild the small CPU extension (API 3); no main Ascend plugin rebuild is needed:
+Run one command from the green container's repository directory:
 
 ```bash
-cd /home/l00992607/vllm-ascend
-git pull --ff-only origin dev/moeoffload
-python -m pip install -v ./csrc/lrc_policy --no-build-isolation --no-deps
-python -B tests/ut/expert_offload/test_load_submit_cpp.py
+python -B script/run_load_migration_tests.py
 ```
 
-First check copied contents each call. Stop on any failure:
+The runner defaults to physical NPU 4 (logical device 0). It sequentially builds
+and installs the small CPU extension, runs CPU parity tests, checks both versions'
+NPU byte results, runs Python/Cpp/Cpp/Python performance comparisons, and runs
+both detailed timing comparisons. It stops immediately on a failed step.
+There are no Git commands or result/log files; normal build artifacts are created.
+The main Ascend plugin does not need rebuilding.
+
+To choose another physical NPU or skip an already completed extension build:
 
 ```bash
-for implementation in python cpp; do
-  ASCEND_RT_VISIBLE_DEVICES=4 python -B bench_update_weights.py --mode npu --backend cpp --h2d-backend torch --load-backend "$implementation" --warmup 40 --iterations 100 --check-every 1 || break
-done
+python -B script/run_load_migration_tests.py --npu 3
+python -B script/run_load_migration_tests.py --skip-build
 ```
 
-After both pass, compare performance with identical inputs and alternate order:
-
-```bash
-for implementation in python cpp cpp python; do
-  ASCEND_RT_VISIBLE_DEVICES=4 python -B bench_update_weights.py --mode npu --backend cpp --h2d-backend torch --load-backend "$implementation" || break
-done
-```
-
-Finally, collect the same detail timers on each side:
-
-```bash
-for implementation in python cpp; do
-  ASCEND_RT_VISIBLE_DEVICES=4 python -B bench_update_weights.py --mode npu --backend cpp --h2d-backend torch --load-backend "$implementation" --detail-load || break
-done
-```
+Both comparisons fix LRC to `cpp` and transport to `torch`; only `load-backend`
+changes. The script does not enable fused planning or the ACL experiment.
+The final `ALL STEPS PASSED` means validation and measurements finished, not that
+C++ was faster. Return reviewed console output for analysis.
 
 Compare `load_submit`, `host_without_sync`, `outer`, and `total` in runs without
 detail timers. The detailed run explains `load_prepare`, `copy_submit` and
