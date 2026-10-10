@@ -133,7 +133,7 @@ def build_harness(args, settings, repo):
     transport_module = load_transport(base / "h2d_transfer.py")
     manager_class, digest = load_manager(base / "expert_offload_manager.py", torch_npu, transport_module, logger)
     manager = manager_class()
-    policy_class, policy_digest = load_policy(base / "lrc_policy.py")
+    policy_class, policy_digest = load_policy(base / "lrc_policy.py", args.backend)
     manager.cache_policy = policy_class(
         num_layers=1,
         num_experts=args.experts,
@@ -206,6 +206,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     repo = Path(__file__).resolve().parent
     parser.add_argument("--mode", choices=("planning", "npu"), default="planning")
+    parser.add_argument("--backend", choices=("python", "cpp"), default="python")
     parser.add_argument("--test-script", type=Path, default=repo / "script/test_graph2.sh")
     parser.add_argument("--config-source", type=Path, default=repo / "vllm_ascend/ascend_config.py")
     parser.add_argument("--model-config", type=Path)
@@ -249,7 +250,7 @@ def main():
     except (OSError, ValueError, KeyError, IndexError, StopIteration) as exc:
         parser.error(str(exc))
 
-    print(f"mode={args.mode} scenario={args.scenario} prefetch={args.prefetch}", flush=True)
+    print(f"mode={args.mode} backend={args.backend} scenario={args.scenario} prefetch={args.prefetch}", flush=True)
     print(f"experts={args.experts} cache_size={args.cache_size} topk={args.topk} tokens={args.tokens}")
     print(f"recent_window={args.recent_window} router_scores={args.router_scores} seed={args.seed}")
     print(

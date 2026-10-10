@@ -78,14 +78,17 @@ def model_dimensions(path):
             lookup(("num_experts_per_tok", "num_experts_per_token")))
 
 
-def load_policy(path):
+def load_policy(path, backend="python"):
     # Avoid importing vllm_ascend/__init__.py or writing __pycache__.
     source = path.read_bytes()
     module = types.ModuleType(MODULE_NAME)
     module.__file__ = str(path)
     sys.modules[MODULE_NAME] = module
     exec(compile(source, str(path), "exec"), module.__dict__)
-    return module.LRCExpertCachePolicy, hashlib.sha256(source).hexdigest()
+    if backend not in ("python", "cpp"):
+        raise ValueError("backend must be python or cpp")
+    policy = module.LRCExpertCachePolicy if backend == "python" else module.CppLRCExpertCachePolicy
+    return policy, hashlib.sha256(source).hexdigest()
 
 
 def percentile(values, q):
@@ -135,6 +138,7 @@ def main():
     parser.add_argument("--cache-size", type=int, help="Override launch-script slot count")
     parser.add_argument("--topk", type=int, help="Override model top-k")
     parser.add_argument("--tokens", type=int, default=1)
+    parser.add_argument("--backend", choices=("python", "cpp"), default="python")
     parser.add_argument("--recent-window", type=int)
     parser.add_argument("--router-scores", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--warmup", type=int, default=1000)
@@ -177,7 +181,7 @@ def main():
     if not args.policy_file.is_file():
         parser.error(f"Policy file not found: {args.policy_file}")
     try:
-        policy_class, digest = load_policy(args.policy_file)
+        policy_class, digest = load_policy(args.policy_file, args.backend)
     except ModuleNotFoundError as exc:
         parser.exit(1, f"Missing dependency: {exc.name}. Use an environment with NumPy.\n")
 
@@ -246,6 +250,7 @@ def main():
         raise RuntimeError("Zero-count case must return an empty list")
 
     print("LRC CPU microbenchmark (all latency columns are microseconds)")
+    print(f"backend={args.backend}")
     print(f"Policy: {args.policy_file.resolve()}")
     print(f"SHA256: {digest}")
     print(f"Launch script (read only): {args.test_script.resolve()}")

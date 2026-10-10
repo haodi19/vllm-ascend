@@ -519,6 +519,13 @@ class TestAscendConfig(TestBase):
 
 
 class TestExpertOffloadConfig(TestBase):
+    def test_lrc_backend_is_opt_in(self):
+        self.assertEqual(ExpertOffloadConfig({}).cache_policy_backend, "python")
+        self.assertEqual(ExpertOffloadConfig({"cache_policy_backend": "cpp"}).cache_policy_backend, "cpp")
+        for invalid in ("auto", "cuda", None):
+            with self.assertRaises(ValueError):
+                ExpertOffloadConfig({"cache_policy_backend": invalid})
+
     def test_h2d_backend_defaults_to_torch(self):
         config = ExpertOffloadConfig({})
 

@@ -1001,6 +1001,8 @@ class ExpertOffloadConfig:
         "num_device_layers": 2,
         "expert_map_path": None,
         "cache_policy_enabled": False,
+        # CPU LRC implementation; cpp requires the optional csrc/lrc_policy build.
+        "cache_policy_backend": "python",
         "cache_recent_window": 32,
         "cache_ema_beta": 0.9,
         "cache_recent_weight": 1.0,
@@ -1165,6 +1167,8 @@ class ExpertOffloadConfig:
             raise TypeError("expert_offload must be a boolean")
         if not isinstance(self.config["cache_policy_enabled"], bool):
             raise TypeError("cache_policy_enabled must be a boolean")
+        if self.config["cache_policy_backend"] not in ("python", "cpp"):
+            raise ValueError("cache_policy_backend must be 'python' or 'cpp'")
         if not isinstance(self.config["cache_recent_window"], int):
             raise TypeError("cache_recent_window must be an integer")
         if self.config["cache_recent_window"] < 1:

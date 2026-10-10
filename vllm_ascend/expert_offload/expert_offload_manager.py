@@ -24,7 +24,7 @@ from vllm_ascend.expert_offload.h2d_transfer import (
     TorchCopyH2DTransport,
     create_h2d_transport,
 )
-from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy
+from vllm_ascend.expert_offload.lrc_policy import LRCExpertCachePolicy, create_lrc_policy
 from vllm_ascend.ops.fused_moe.experts_selector import (
     commit_expert_substitutions,
     maybe_prune_topk_experts,
@@ -648,7 +648,8 @@ class ExpertOffloadManager:
             self.cache_calls = [0 for _ in range(num_moe_layers)]
             self.last_hit_experts = [[] for _ in range(num_moe_layers)]
             self.last_miss_experts = [[] for _ in range(num_moe_layers)]
-            self.cache_policy = LRCExpertCachePolicy(
+            self.cache_policy = create_lrc_policy(
+                backend=self.offload_config.cache_policy_backend,
                 num_layers=num_moe_layers,
                 num_experts=self.num_total_experts,
                 # cache_size is informational only (LRC eviction keys on
