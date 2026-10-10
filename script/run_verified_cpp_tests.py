@@ -2,6 +2,7 @@
 """Python vs verified C++ LRC: summary.txt, separate logs and inference profiles."""
 
 import argparse
+import ast
 import contextlib
 import hashlib
 import json
@@ -371,6 +372,9 @@ def _inference(args, source, backend, env, log):
                 report = request(opener, args.timing_port, "/stop", {}, timeout=40)
                 if len(requests) == args.requests:
                     print_inference_report(backend, report, requests)
+                    baseline = getattr(args, "python_baseline_report", None)
+                    if backend == "cpp" and baseline is not None:
+                        compare_inference_reports({"python": baseline, "cpp": report})
             finally:
                 request(opener, args.port, "/stop_profile", {}, timeout=args.profile_timeout)
                 wait_profile(profile_dir, args.profile_timeout)
@@ -378,6 +382,95 @@ def _inference(args, source, backend, env, log):
     finally:
         with progress(f"{backend} service cleanup; up to 40s"):
             stop_owned_service(child)
+
+
+def read_python_baseline(path, source, args):
+    """Recover only completed Python timing tables, never execute saved text."""
+    text = path.read_text(encoding="utf-8")
+    fingerprint = re.search(r"Requested NPU=(.+?);.*source_sha256=([0-9a-f]{64})", text)
+    expected_npu = str(args.npu) if args.npu is not None else "inherit test_graph2.sh"
+    if not fingerprint or fingerprint.groups() != (expected_npu, hashlib.sha256(source.encode()).hexdigest()):
+        raise ValueError("Baseline NPU or test_graph2.sh hash differs; use the original device and launch script")
+    section = text.split("=== INFERENCE python:", 1)
+    if len(section) != 2:
+        raise ValueError("No Python inference section in baseline")
+    text = section[1].split("=== INFERENCE cpp:", 1)[0]
+    settings = re.search(r"Warmup=(\d+); measured requests=(\d+); max_tokens=(\d+);", text)
+    if not settings or tuple(map(int, settings.groups())) != (args.warmup_requests, args.requests, args.max_tokens):
+        raise ValueError("Baseline request/warmup/max_tokens settings differ")
+    count = re.search(r"INFERENCE python: callbacks=(\d+); errors=0; dropped=0", text)
+    wall = re.search(r"Request wall time \(ms, TIMERS \+ PROFILER\): (.+)", text)
+    usage = re.search(r"Request usage: (.+)", text)
+    if not count or not wall or not usage:
+        raise ValueError("Python baseline has incomplete or failed callback/request measurements")
+    groups = []
+    for block in text.split("\nkind=")[1:]:
+        header = re.match(
+            r"(prefetch|reactive) token_rows=(\d+) callbacks=(\d+) layers=(\[.*?\]) loads_per_callback=(\{[^\n]+\})",
+            block,
+        )
+        if not header:
+            raise ValueError("Unrecognized Python callback group")
+        kind, rows, calls, layers, loads = header.groups()
+        metrics = {}
+        for line in block.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) == 7 and parts[0] in METRICS:
+                metrics[parts[0]] = dict(zip(("mean", "p50", "p95", "p99", "min", "max"), map(float, parts[1:])))
+        if set(metrics) != set(METRICS):
+            raise ValueError("Python callback timing table is incomplete")
+        groups.append(
+            dict(
+                kind=kind,
+                token_rows=int(rows),
+                count=int(calls),
+                layers=ast.literal_eval(layers),
+                loads=ast.literal_eval(loads),
+                metrics=metrics,
+            )
+        )
+    if not groups or sum(g["count"] for g in groups) != int(count[1]):
+        raise ValueError("Python callback counts do not match")
+    report = dict(groups=groups, request_us=ast.literal_eval(wall[1])["mean"] * 1000, usage=ast.literal_eval(usage[1]))
+    if len(report["usage"]) != args.requests:
+        raise ValueError("Python request usage count does not match")
+    print(f"PYTHON BASELINE: {path}; callbacks={count[1]}; saved means rounded to 0.001 us", flush=True)
+    print("Resume: CPP inference only. Same launch-script hash/NPU/request settings; separate session.", flush=True)
+    return report
+
+
+def compare_inference_reports(reports):
+    grouped = {b: {(g["kind"], g["token_rows"]): g for g in reports[b]["groups"]} for b in reports}
+    for key in sorted(set(grouped["python"]) | set(grouped["cpp"])):
+        if not all(key in grouped[b] for b in grouped):
+            print(f"Unmatched callback group {key}: cannot compare", flush=True)
+            continue
+        a, b = grouped["python"][key], grouped["cpp"][key]
+        print(
+            f"Group {key}: counts python/cpp={a['count']}/{b['count']}; "
+            f"mean loads={a['loads']['mean']:.3f}/{b['loads']['mean']:.3f}",
+            flush=True,
+        )
+        compare(
+            f"INFERENCE {key}",
+            {k: a["metrics"][k]["mean"] for k in METRICS},
+            {k: b["metrics"][k]["mean"] for k in METRICS},
+        )
+    print(
+        f"Request mean ms: python={reports['python']['request_us'] / 1000:.3f} "
+        f"cpp={reports['cpp']['request_us'] / 1000:.3f}",
+        flush=True,
+    )
+    hashes_match = (
+        reports["python"]["digests"] == reports["cpp"]["digests"]
+        if "digests" in reports["python"]
+        else "unavailable in saved baseline"
+    )
+    print(
+        f"Request usage matches: {reports['python']['usage'] == reports['cpp']['usage']}; "
+        f"generated-text hashes match: {hashes_match}",
+        flush=True,
+    )
 
 
 def main(argv=None):
@@ -395,7 +488,12 @@ def main(argv=None):
     parser.add_argument("--request-timeout", type=int, default=300)
     parser.add_argument("--profile-timeout", type=int, default=600)
     parser.add_argument("--output-dir", type=Path, help="New directory for summary.txt and detailed logs")
+    parser.add_argument(
+        "--python-baseline", type=Path, help="Resume with CPP inference only; compare saved Python summary"
+    )
     args = parser.parse_args(argv)
+    if args.python_baseline is not None:
+        args.only = "inference"
     if (args.npu is not None and args.npu < 0) or min(
         args.requests,
         args.warmup_requests,
@@ -443,6 +541,8 @@ def run_tests(args):
         if not base.is_absolute():
             base = REPO / base
         args.profile_run_dir = base / (time.strftime("verified_cpp_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8])
+    if args.python_baseline is not None:
+        args.python_baseline_report = read_python_baseline(args.python_baseline, source, args)
     env = os.environ.copy()
     if args.npu is not None:
         env["ASCEND_RT_VISIBLE_DEVICES"] = str(args.npu)
@@ -508,33 +608,10 @@ def run_tests(args):
             *({k: statistics.mean(r[k] for r in results[b]) for k in METRICS} for b in ("python", "cpp")),
         )
     if args.only != "micro":
-        reports = {b: inference(args, source, b, env) for b in ("python", "cpp")}
-        grouped = {b: {(g["kind"], g["token_rows"]): g for g in reports[b]["groups"]} for b in reports}
-        for key in sorted(set(grouped["python"]) | set(grouped["cpp"])):
-            if not all(key in grouped[b] for b in grouped):
-                print(f"Unmatched callback group {key}: cannot compare", flush=True)
-                continue
-            a, b = grouped["python"][key], grouped["cpp"][key]
-            print(
-                f"Group {key}: counts python/cpp={a['count']}/{b['count']}; "
-                f"mean loads={a['loads']['mean']:.3f}/{b['loads']['mean']:.3f}",
-                flush=True,
-            )
-            compare(
-                f"INFERENCE {key}",
-                {k: a["metrics"][k]["mean"] for k in METRICS},
-                {k: b["metrics"][k]["mean"] for k in METRICS},
-            )
-        print(
-            f"Request mean ms: python={reports['python']['request_us'] / 1000:.3f} "
-            f"cpp={reports['cpp']['request_us'] / 1000:.3f}",
-            flush=True,
-        )
-        print(
-            f"Request usage matches: {reports['python']['usage'] == reports['cpp']['usage']}; "
-            f"generated-text hashes match: {reports['python']['digests'] == reports['cpp']['digests']}",
-            flush=True,
-        )
+        backends = ("cpp",) if args.python_baseline is not None else ("python", "cpp")
+        reports = {b: inference(args, source, b, env) for b in backends}
+        if args.python_baseline is None:
+            compare_inference_reports(reports)
     print("=== VERIFIED CPP TEST COMPLETE; success is not a speedup claim ===", flush=True)
 
 

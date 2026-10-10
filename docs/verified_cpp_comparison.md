@@ -60,6 +60,26 @@ python -B script/run_verified_cpp_tests.py --only inference
 
 ## 与 test_graph2.sh 对齐的范围
 
+如果 Python 推理的计时已经写入旧汇总，但在停止 profiler 时中断，可以只补跑 C++：
+
+```bash
+python -B script/run_verified_cpp_tests.py --npu 5 \
+    --python-baseline bench_results/lrc_compare_01/summary.txt \
+    --output-dir bench_results/lrc_compare_cpp_01
+```
+
+`--python-baseline` 自动选择仅推理模式，仅启动 C++ 服务，不重复单测和 Python 服务。
+仍会构建扩展并运行 LRC 一致性检查。它校验旧汇总的设备编号、启动脚本哈希、预热次数、
+请求次数、max_tokens、回调错误/丢弃数及分项表完整性，不匹配就停止。
+需要使用原来的脚本、设备和请求参数；示例对应 NPU 5、预热 3 次、采样 10 次、max_tokens=5。
+
+新汇总包含 C++ 原始分项数据及与旧 Python 基线的对比，且在 `/stop_profile` 前写出。
+之后照常停止、导出 profile；若导出再失败，已完成的对比仍保留，但整轮标记为未完成。
+两组来自不同运行会话，设备负载等环境差异仍需考虑。旧汇总中的均值精度为 0.001 微秒；
+旧版未保存生成文本哈希，补跑时只能比较 token usage，不能验证两组生成文本是否一致。
+
+## 推理配置保留
+
 脚本读取该文件实际的 `vllm serve` 参数和环境设置，不依据其中可能过时的注释。
 模型路径、量化、MTP、图模式、预取、缓存容量、前缀缓存、debug、seed 等配置保留。
 默认不改 host、端口和设备范围。控制台打印每组实际的完整启动参数。

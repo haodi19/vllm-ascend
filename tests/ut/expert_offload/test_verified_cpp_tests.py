@@ -164,6 +164,42 @@ class TestVerifiedRunner(unittest.TestCase):
         cls.module = runpy.run_path(str(REPO / "script/run_verified_cpp_tests.py"))
         cls.source = (REPO / "script/test_graph2.sh").read_text(encoding="utf-8")
 
+    def test_saved_python_baseline_validation(self):
+        fn = self.module["read_python_baseline"]
+        source = "synthetic launch script"
+        digest = self.module["hashlib"].sha256(source.encode()).hexdigest()
+        text = (
+            f"Requested NPU=5; test_script=script/test_graph2.sh; source_sha256={digest}\n"
+            "=== INFERENCE python: fresh service; profile=/tmp/profile ===\n"
+            "Service ready. Warmup=3; measured requests=1; max_tokens=5;\n"
+            "INFERENCE python: callbacks=2; errors=0; dropped=0\n"
+            "kind=reactive token_rows=3 callbacks=2 layers=[0, 1] loads_per_callback={'mean': 4.0}\n"
+        )
+        text += "\n".join(f"{name} 1 2 3 4 5 6" for name in self.module["METRICS"])
+        text += (
+            "\nRequest wall time (ms, TIMERS + PROFILER): {'mean': 3.5}\nRequest usage: [{'completion_tokens': 5}]\n"
+        )
+        text += "INTERRUPTED: profile export\n"
+        args = types.SimpleNamespace(npu=5, warmup_requests=3, requests=1, max_tokens=5)
+        with tempfile.TemporaryDirectory() as root, contextlib.redirect_stdout(io.StringIO()):
+            path = Path(root) / "summary.txt"
+            path.write_text(text, encoding="utf-8")
+            result = fn(path, source, args)
+            self.assertEqual(result["request_us"], 3500)
+            self.assertEqual(result["groups"][0]["metrics"]["observe"]["mean"], 1)
+            self.assertNotIn("digests", result)
+            for old, new in (
+                ("errors=0", "errors=1"),
+                ("observe 1", "missing 1"),
+                ("callbacks=2;", "callbacks=3;"),
+                ("Warmup=3", "Warmup=2"),
+                ("Requested NPU=5", "Requested NPU=4"),
+                (digest, "0" * 64),
+            ):
+                path.write_text(text.replace(old, new), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    fn(path, source, args)
+
     def test_subprocess_noise_goes_to_log_and_metrics_to_summary(self):
         fn = self.module["run_console"]
         with tempfile.TemporaryDirectory() as root:
@@ -281,10 +317,12 @@ class TestVerifiedRunner(unittest.TestCase):
                 return dict(count=5, errors=0, dropped=0, groups=[])
             if path == "/stop_profile":
                 self.assertIn("INFERENCE cpp: callbacks=5", captured.getvalue())
+                self.assertIn("Request mean ms: python=1.000", captured.getvalue())
             return {}
 
         process = Mock()
         process.poll.return_value = None
+        args.python_baseline_report = dict(groups=[], request_us=1000, usage=[{"completion_tokens": 5}] * 3)
         popen, cleanup = Mock(return_value=process), Mock()
         captured = io.StringIO()
         with (

@@ -186,6 +186,9 @@ class CallbackTimings:
 
             def do_POST(self):
                 try:
+                    # Consume the control request body before closing HTTP/1.0;
+                    # unread bytes can cause a TCP reset instead of a response.
+                    self.rfile.read(int(self.headers.get("Content-Length", "0")))
                     if self.path == "/start":
                         collector.start()
                         self.respond(200, {"started": True})
