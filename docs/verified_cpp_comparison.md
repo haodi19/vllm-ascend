@@ -74,7 +74,7 @@ python -B script/run_verified_cpp_tests.py --npu 5 \
 需要使用原来的脚本、设备和请求参数；示例对应 NPU 5、预热 3 次、采样 10 次、max_tokens=5。
 
 新汇总包含 C++ 原始分项数据及与旧 Python 基线的对比，且在 `/stop_profile` 前写出。
-之后照常停止、导出 profile；若导出再失败，已完成的对比仍保留，但整轮标记为未完成。
+之后照常停止、导出 profile；若导出再失败，已完成的对比仍保留，profile 单独标记为不完整。
 两组来自不同运行会话，设备负载等环境差异仍需考虑。旧汇总中的均值精度为 0.001 微秒；
 旧版未保存生成文本哈希，补跑时只能比较 token usage，不能验证两组生成文本是否一致。
 
@@ -104,20 +104,32 @@ python -B script/run_verified_cpp_tests.py --npu 5 \
 
 以当前脚本配置为例，根目录是 `/home/l00992607/vllm-ascend/moe_profile`。
 在预热后调用 `/start_profile`，对采样请求同时进行 profiler 采集和回调分项计时，
-然后调用 `/stop_profile`，等待导出 `trace_view.json` 和 `analyse.done` 后关闭服务。
+然后调用 `/stop_profile`，限时等待导出 `trace_view.json` 和 `analyse.done`，再关闭服务。
 控制台出现 `PROFILE SAVED` 才表示脚本确认了设备时间线导出。
-默认导出等待上限 600 秒，可用 `--profile-timeout` 调整。
+默认停止与导出共用 120 秒等待预算，可用 `--profile-timeout` 调整。
 profile 留在绿区，可分别导入 MindStudio；无需传回文件。
 
 等待时每约 15 秒输出当前阶段及耗时。`POST .../stop_profile` 表示等待服务的停止采集
 接口返回；`profile export` 表示接口已经返回，正在等时间线和 `analyse.done` 文件。
-两步分别最多等待 `--profile-timeout` 秒。CANN 日志中的 `data parsed` 仅代表相关
+两步共用 `--profile-timeout` 等待预算。CANN 日志中的 `data parsed` 仅代表相关
 解析阶段结束，不保证整个导出和 HTTP 请求完成。`Running: 0` 表示当时没有在跑的请求，
-不能据此断定 profiler 卡死。超时会在汇总中标记 FAILED，并保留已有数据。
+不能据此断定 profiler 卡死。停止或导出失败会标记 `PROFILE INCOMPLETE` 并保留已有数据。
 时延表在 profile 导出前就写入汇总，避免导出失败导致已采集数据不可见。
 
-如果请求或导出失败，脚本停止后续对比并清理自己启动的服务，已有 profile 目录保留。
-导出超时的目录可能不完整，应检查该目录中的 profiler 日志。
+默认优先完成两组计时对比：profile 停止/导出失败后，仍会清理本轮服务并继续下一组。
+服务先接收 SIGTERM；30 秒仍未退出则对本脚本启动的进程组发送 SIGKILL，随后等待端口释放。
+已有 profile 文件不删除，也不冒充完整采集结果。最后分别输出计时完成状态与 `PROFILE STATUS`。
+构建、请求或回调计时失败仍会终止测试；端口未释放也不会强行启动下一组。
+加 `--strict-profile` 可恢复 profile 失败就终止测试的行为。
+
+两组重新测试示例（输出目录必须尚不存在）：
+
+```bash
+python -B script/run_verified_cpp_tests.py --npu 4 --output-dir bench_results/lrc_compare_02
+```
+
+等待 profile 时无需按 Ctrl+C，脚本会自行执行超时清理。强制退出不能保证 profile 完整，
+但发生在请求计时和回调数据保存之后，不会将清理时间算进已记录的时延。
 
 ## 时延字段
 

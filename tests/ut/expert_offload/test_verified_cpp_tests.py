@@ -164,6 +164,95 @@ class TestVerifiedRunner(unittest.TestCase):
         cls.module = runpy.run_path(str(REPO / "script/run_verified_cpp_tests.py"))
         cls.source = (REPO / "script/test_graph2.sh").read_text(encoding="utf-8")
 
+    def test_profile_stop_failures_do_not_block_second_backend(self):
+        fn = self.module["run_tests"]
+        started, stopped = [], []
+
+        def popen(*args, **kwargs):
+            process = Mock()
+            process.poll.return_value = None
+            started.append(process)
+            return process
+
+        def request(opener, port, path, payload=None, timeout=None):
+            if path == "/status":
+                return dict(backend=("python", "cpp")[len(started) - 1], load_backend="python")
+            if path == "/v1/completions":
+                return dict(choices=[{"text": "same"}], usage={"completion_tokens": 5})
+            if path == "/stop":
+                return dict(count=5, errors=0, dropped=0, groups=[])
+            if path == "/stop_profile":
+                raise TimeoutError("profiler stuck")
+            return {}
+
+        with tempfile.TemporaryDirectory() as root:
+            args = types.SimpleNamespace(
+                test_script=REPO / "script/test_graph2.sh",
+                only="inference",
+                npu=4,
+                port=8155,
+                timing_port=18155,
+                python_baseline=None,
+                skip_build=True,
+                output_dir=Path(root),
+                startup_timeout=20,
+                request_timeout=10,
+                warmup_requests=1,
+                requests=1,
+                max_tokens=5,
+                profile_timeout=1,
+                strict_profile=False,
+            )
+            captured = io.StringIO()
+            with (
+                patch.dict(
+                    fn.__globals__,
+                    {
+                        "request": request,
+                        "assert_port_free": Mock(),
+                        "stop_owned_service": stopped.append,
+                        "run_console": Mock(),
+                    },
+                ),
+                patch("subprocess.Popen", side_effect=popen),
+                contextlib.redirect_stdout(captured),
+            ):
+                fn(args)
+            self.assertEqual(len(started), 2)
+            self.assertEqual(stopped, started)
+            self.assertIn("Request mean ms: python=", captured.getvalue())
+            self.assertIn("{'python': 'incomplete', 'cpp': 'incomplete'}", captured.getvalue())
+            self.assertIn("TIMING TEST COMPLETE", captured.getvalue())
+
+    def test_profile_export_failure_policy(self):
+        fn = self.module["finish_profile"]
+        args = types.SimpleNamespace(port=8155, profile_timeout=10, strict_profile=False)
+        with (
+            patch.dict(
+                fn.__globals__, {"request": Mock(), "wait_profile": Mock(side_effect=RuntimeError("missing trace"))}
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(fn(None, args, Path("profile")), "incomplete")
+            args.strict_profile = True
+            with self.assertRaisesRegex(RuntimeError, "missing trace"):
+                fn(None, args, Path("profile"))
+
+    def test_cleanup_escalates_only_owned_process_group(self):
+        fn = self.module["stop_owned_service"]
+        child = Mock(pid=12345)
+        fake_os = Mock()
+        fake_time = Mock()
+        fake_time.monotonic.side_effect = [0, 31]
+        fake_signal = types.SimpleNamespace(SIGTERM=15, SIGKILL=9)
+        with (
+            patch.dict(fn.__globals__, {"os": fake_os, "time": fake_time, "signal": fake_signal}),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            fn(child)
+        self.assertEqual([call.args for call in fake_os.killpg.call_args_list], [(12345, 15), (12345, 9)])
+        child.wait.assert_called_once_with(timeout=10)
+
     def test_saved_python_baseline_validation(self):
         fn = self.module["read_python_baseline"]
         source = "synthetic launch script"

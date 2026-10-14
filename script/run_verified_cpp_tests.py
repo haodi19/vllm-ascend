@@ -243,9 +243,25 @@ def stop_owned_service(child):
         except ProcessLookupError:
             return
         time.sleep(0.2)
+    print(f"Service group {child.pid} did not exit after SIGTERM; sending SIGKILL to this group only.", flush=True)
     with contextlib.suppress(ProcessLookupError):
         os.killpg(child.pid, signal.SIGKILL)
     child.wait(timeout=10)
+
+
+def wait_service_ports_free(args):
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            assert_port_free(args.port)
+            assert_port_free(args.timing_port)
+            return
+        except RuntimeError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Owned service ports are still occupied after cleanup; next backend not started"
+                ) from None
+            time.sleep(0.2)
 
 
 def wait_profile(directory, timeout):
@@ -271,6 +287,22 @@ def wait_profile(directory, timeout):
             )
             next_update = time.monotonic() + 15
         time.sleep(2)
+
+
+def finish_profile(opener, args, profile_dir):
+    """Bound stop/export waiting independently of already collected timings."""
+    deadline = time.monotonic() + args.profile_timeout
+    try:
+        request(opener, args.port, "/stop_profile", {}, timeout=args.profile_timeout)
+        wait_profile(profile_dir, max(0, deadline - time.monotonic()))
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"PROFILE INCOMPLETE: {type(exc).__name__}: {exc}", flush=True)
+        print(f"Existing profile files retained: {profile_dir}", flush=True)
+        if getattr(args, "strict_profile", False):
+            raise
+        print("Timing data retained. Clean up owned service, then continue remaining backend tests.", flush=True)
+        return "incomplete"
+    return "complete"
 
 
 def print_inference_report(backend, report, requests):
@@ -376,12 +408,13 @@ def _inference(args, source, backend, env, log):
                     if backend == "cpp" and baseline is not None:
                         compare_inference_reports({"python": baseline, "cpp": report})
             finally:
-                request(opener, args.port, "/stop_profile", {}, timeout=args.profile_timeout)
-                wait_profile(profile_dir, args.profile_timeout)
+                profile_status = finish_profile(opener, args, profile_dir)
+        report["profile_status"] = profile_status
         return report
     finally:
-        with progress(f"{backend} service cleanup; up to 40s"):
+        with progress(f"{backend} service cleanup and port release; up to 50s"):
             stop_owned_service(child)
+            wait_service_ports_free(args)
 
 
 def read_python_baseline(path, source, args):
@@ -486,7 +519,14 @@ def main(argv=None):
     parser.add_argument("--max-tokens", type=int, default=5)
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=300)
-    parser.add_argument("--profile-timeout", type=int, default=600)
+    parser.add_argument(
+        "--profile-timeout", type=int, default=120, help="Stop/export waiting budget per backend; default 120 seconds"
+    )
+    parser.add_argument(
+        "--strict-profile",
+        action="store_true",
+        help="Abort on incomplete profile instead of continuing with saved timings",
+    )
     parser.add_argument("--output-dir", type=Path, help="New directory for summary.txt and detailed logs")
     parser.add_argument(
         "--python-baseline", type=Path, help="Resume with CPP inference only; compare saved Python summary"
@@ -612,7 +652,8 @@ def run_tests(args):
         reports = {b: inference(args, source, b, env) for b in backends}
         if args.python_baseline is None:
             compare_inference_reports(reports)
-    print("=== VERIFIED CPP TEST COMPLETE; success is not a speedup claim ===", flush=True)
+        print(f"PROFILE STATUS: { {b: r['profile_status'] for b, r in reports.items()} }", flush=True)
+    print("=== VERIFIED CPP TIMING TEST COMPLETE; check PROFILE STATUS separately; not a speedup claim ===", flush=True)
 
 
 if __name__ == "__main__":
