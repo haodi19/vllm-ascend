@@ -47,6 +47,72 @@ vLLM Ascend Plugin
 
 ---
 
+## MoE 卸载：LRC C++ 迁移实验
+
+本开发分支研究 MoE 专家权重卸载：部分权重保存在 CPU，推理时按需加载到 NPU，
+通过缓存和预取减少等待。本轮将缓存策略 LRC 的 `observe`（更新访问记录）和
+`choose_victims`（选择淘汰专家）迁移到可选 C++ 扩展，保留 Python 版本用于对照。
+`_update_weights` 外围逻辑、`load_submit` 和 TorchCopy 传输仍使用原实现；
+本轮未启用融合规划、ACL 实验或 C++ 加载提交实验。
+
+以下为 **2026-10-10 绿区实测**。变化率为 `(C++ / Python - 1)`，负值表示耗时降低。
+`total` 为回调内部总耗时；`outer = total - observe - choose_victims - synchronize`，
+其中包含 `load_submit`，各行不能直接相加。
+
+### 单测对比
+
+合成权重场景：256 个专家、24 个缓存槽、top-k=6、1 行 token 输入。
+每轮预热 1000 次、测量 10000 次，按 Python → C++ → C++ → Python 运行，
+表中为每种后端两轮的平均值，单位 **μs/次回调**。单测关闭 debug 和 profiler。
+
+| 指标 | Python | C++ | 耗时变化 |
+| --- | ---: | ---: | ---: |
+| `observe` | 7.340 | 2.228 | −69.7% |
+| `choose_victims` | 25.882 | 2.881 | −88.9% |
+| `synchronize` | 219.996 | 217.534 | −1.1% |
+| `outer` | 89.016 | 84.728 | −4.8% |
+| `load_submit`（包含在 outer 内） | 62.676 | 60.446 | −3.6% |
+| `host_without_sync`（total 减同步等待） | 122.236 | 89.837 | −26.5% |
+| `total` | 342.232 | 307.371 | −10.2% |
+
+### 实际推理对比
+
+沿用 [script/test_graph2.sh](script/test_graph2.sh) 的 DeepSeek-V4-Flash 单卡配置，
+开启 MTP（2 个 speculative tokens）、预取、debug 和 profiler。
+两组在同一张 NPU 上分别启动服务，各预热 3 个请求、测量 10 个请求，
+固定提示词、temperature=0、max_tokens=5。
+两组均记录 860 次当前层加载（3 行 token）和 840 次预取（1 行 token），
+平均加载专家数分别为 4.028 和 0.885，回调无错误、无丢弃。
+
+下表为平均耗时，单位 **μs/次回调**。
+
+| 指标 | 当前层 Python | 当前层 C++ | 预取 Python | 预取 C++ |
+| --- | ---: | ---: | ---: | ---: |
+| `observe` | 34.658 | 7.601 | 0.000 | 0.000 |
+| `choose_victims` | 22.189 | 5.980 | 33.008 | 6.624 |
+| `synchronize` | 889.087 | 914.515 | 216.934 | 219.183 |
+| `outer` | 591.195 | 624.745 | 315.971 | 343.499 |
+| `load_submit`（包含在 outer 内） | 300.224 | 325.670 | 87.295 | 94.530 |
+| `host_without_sync` | 648.041 | 638.326 | 348.979 | 350.123 |
+| `total` | 1537.128 | 1552.841 | 565.912 | 569.306 |
+
+| 请求整体指标 | Python | C++ | 耗时变化 |
+| --- | ---: | ---: | ---: |
+| 平均请求时延（ms） | 3382.166 | 3478.205 | +2.84% |
+
+### 简要结论
+
+- **LRC 局部迁移有效**：单测两函数合计耗时降低约 84.6%；实际推理当前层 LRC
+  合计降低约 76.1%，预取的淘汰选择降低约 79.9%。
+- **本轮未观察到整体推理提速**：单测总耗时降低约 10.2%，但实际当前层/预取回调
+  总耗时分别增加约 1.0%/0.6%，平均请求时延增加约 2.84%。外围和同步耗时增加抵消了局部收益。
+- 两组推理来自不同会话，且包含 debug、profiler 和计时开销；不能将整体变化直接归因于
+  C++ 迁移，也不能作为关闭采集后的生产性能。token usage 一致，生成文本一致性未验证。
+  分项计时已保存，但 profile 停止/导出完成尚未确认。
+
+实验入口为 [script/run_verified_cpp_tests.py](script/run_verified_cpp_tests.py)，
+执行方式与字段说明见 [实验说明](docs/verified_cpp_comparison.md)。
+
 ## Overview
 
 vLLM Ascend (`vllm-ascend`) is a community maintained hardware plugin for running vLLM seamlessly on the Ascend NPU.
