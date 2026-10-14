@@ -82,7 +82,7 @@ def progress(label, interval=15):
         print(f"{state}: {label}; elapsed={time.monotonic() - begin:.1f}s", flush=True)
 
 
-def launch_spec(source, backend, npu, port, timing_port, profile_dir=None):
+def launch_spec(source, backend, npu, port, timing_port, profile_dir=None, mstx=False):
     """Read literal serve options; retain environment setup, not shell side effects."""
     matches = list(re.finditer(r"(?m)^vllm\s+serve\s+", source))
     if len(matches) != 1:
@@ -113,6 +113,10 @@ def launch_spec(source, backend, npu, port, timing_port, profile_dir=None):
         h2d_backend="torch",
         callback_timing_port=timing_port,
     )
+    if mstx:
+        offload["callback_mstx_enabled"] = True
+    else:
+        offload.pop("callback_mstx_enabled", None)
     replace("--additional-config", json.dumps(config))
     if port is not None:
         replace("--port", port)
@@ -306,6 +310,8 @@ def finish_profile(opener, args, profile_dir):
 
 
 def print_inference_report(backend, report, requests):
+    if report.get("mstx_enabled"):
+        print(f"MSTX {backend}: enabled=True; marker_errors={report.get('mstx_errors', 0)}", flush=True)
     if report["errors"] or report["dropped"] or not report["count"]:
         raise RuntimeError(
             f"Incomplete callback timing: count={report['count']} errors={report['errors']} dropped={report['dropped']}"
@@ -349,7 +355,9 @@ def inference(args, source, backend, env):
 
 def _inference(args, source, backend, env, log):
     profile_dir = args.profile_run_dir / backend
-    prefix, command, model, _ = launch_spec(source, backend, args.npu, args.port, args.timing_port, profile_dir)
+    prefix, command, model, _ = launch_spec(
+        source, backend, args.npu, args.port, args.timing_port, profile_dir, mstx=getattr(args, "mstx", False)
+    )
     assert_port_free(args.port)
     assert_port_free(args.timing_port)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -369,6 +377,8 @@ def _inference(args, source, backend, env, log):
                     status = request(opener, args.timing_port, "/status", timeout=2)
                     if status.get("backend") != backend or status.get("load_backend") != "python":
                         raise RuntimeError(f"Unexpected worker timing identity: {status}")
+                    if getattr(args, "mstx", False) and status.get("mstx_enabled") is not True:
+                        raise RuntimeError("Worker did not enable MSTX; check source/install paths")
                     break
                 except (urllib.error.URLError, TimeoutError, ConnectionError):
                     if time.monotonic() >= deadline:
@@ -410,11 +420,36 @@ def _inference(args, source, backend, env, log):
             finally:
                 profile_status = finish_profile(opener, args, profile_dir)
         report["profile_status"] = profile_status
+        if getattr(args, "mstx", False):
+            report["mstx_trace_occurrences"] = inspect_mstx_trace(profile_dir)
         return report
     finally:
         with progress(f"{backend} service cleanup and port release; up to 50s"):
             stop_owned_service(child)
             wait_service_ports_free(args)
+
+
+def inspect_mstx_trace(profile_dir):
+    """Bounded-memory presence check, including partially exported large traces."""
+    needle = b"moe_offload/"
+    total = 0
+    for path in sorted(profile_dir.rglob("trace_view.json")):
+        count = 0
+        tail = b""
+        with path.open("rb") as trace:
+            while chunk := trace.read(1024 * 1024):
+                data = tail + chunk
+                count += data.count(needle)
+                tail = data[-(len(needle) - 1) :]
+        print(f"MSTX TRACE: {path}; label_occurrences={count}", flush=True)
+        total += count
+    if not total:
+        print("MSTX NOT VERIFIED: no moe_offload/ labels found in trace_view.json; inspect profiler logs.", flush=True)
+    else:
+        print(
+            "MSTX labels found; open the profile in MindStudio to verify nesting and host/device alignment.", flush=True
+        )
+    return total
 
 
 def read_python_baseline(path, source, args):
@@ -512,6 +547,7 @@ def main(argv=None):
     parser.add_argument("--test-script", type=Path, default=REPO / "script/test_graph2.sh")
     parser.add_argument("--only", choices=("all", "micro", "inference"), default="all")
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--mstx", action="store_true", help="Add host function ranges to inference profiles")
     parser.add_argument("--port", type=int, help="Default: inherit test_graph2.sh")
     parser.add_argument("--timing-port", type=int, default=18155)
     parser.add_argument("--requests", type=int, default=10)
@@ -532,6 +568,8 @@ def main(argv=None):
         "--python-baseline", type=Path, help="Resume with CPP inference only; compare saved Python summary"
     )
     args = parser.parse_args(argv)
+    if args.mstx and (args.python_baseline is not None or args.only == "micro"):
+        parser.error("--mstx requires fresh inference runs; cannot use --python-baseline or --only micro")
     if args.python_baseline is not None:
         args.only = "inference"
     if (args.npu is not None and args.npu < 0) or min(
@@ -566,6 +604,7 @@ def main(argv=None):
 
 
 def run_tests(args):
+    print(f"MSTX host ranges: {getattr(args, 'mstx', False)}; enabled ranges add diagnostic overhead", flush=True)
     source = args.test_script.read_text(encoding="utf-8")
     prefix, words, _, model_config = launch_spec(source, "python", args.npu, args.port, args.timing_port)
     args.port = int(words[words.index("--port") + 1]) if "--port" in words else 8000
@@ -616,6 +655,8 @@ def run_tests(args):
             args.output_dir / "build.log",
         )
     run_console([*py, "tests/ut/expert_offload/test_lrc_cpp.py", "--require-cpp"], env, args.output_dir / "parity.log")
+    if getattr(args, "mstx", False):
+        run_console([*py, "tests/ut/expert_offload/test_callback_mstx.py"], env, args.output_dir / "mstx_tests.log")
     if args.only != "inference":
         if not model_config.is_file():
             raise RuntimeError(f"Local model config is required to align micro dimensions: {model_config}")

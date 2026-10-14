@@ -50,9 +50,12 @@ def summarize(values):
 
 
 class CallbackTimings:
-    def __init__(self, backend, clock=time.perf_counter_ns):
+    def __init__(self, backend, clock=time.perf_counter_ns, mstx=None):
         self.backend = backend
         self.clock = clock
+        self.mstx = mstx
+        self.marker_errors = 0
+        self.call_id = 0
         self.local = threading.local()
         self.condition = threading.Condition()
         self.active = False
@@ -67,7 +70,31 @@ class CallbackTimings:
                 raise ValueError("A measurement window is already active or draining")
             self.samples.clear()
             self.errors = self.dropped = 0
+            self.marker_errors = 0
             self.active = True
+
+    def range_start(self, name):
+        if self.mstx is None:
+            return None
+        try:
+            # No stream argument: measure CPU execution/waiting, not NPU work.
+            range_id = self.mstx.range_start(f"moe_offload/{name}|{self.local.context}")
+            if not isinstance(range_id, int) or range_id <= 0:
+                raise RuntimeError("MSTX did not return a valid range ID")
+            return range_id
+        except Exception:
+            # Diagnostics must not change callback execution or mask its errors.
+            with self.condition:
+                self.marker_errors += 1
+            return None
+
+    def range_end(self, range_id):
+        if range_id is not None:
+            try:
+                self.mstx.range_end(range_id)
+            except Exception:
+                with self.condition:
+                    self.marker_errors += 1
 
     def wrap(self, name, fn, count_loads=False):
         @functools.wraps(fn)
@@ -77,11 +104,13 @@ class CallbackTimings:
                 return fn(*args, **kwargs)
             if count_loads:
                 values["loads"] += len(args[2])  # manager passes planned_loads list
+            range_id = self.range_start(name)
             begin = self.clock()
             try:
                 return fn(*args, **kwargs)
             finally:
                 values[name] += self.clock() - begin
+                self.range_end(range_id)
 
         return measured
 
@@ -92,10 +121,18 @@ class CallbackTimings:
                 enabled = self.active
                 if enabled:
                     self.inflight += 1
+                    self.call_id += 1
+                    call_id = self.call_id
             if not enabled:
                 return fn(args)
             values = dict.fromkeys((*METRICS, "loads"), 0)
             self.local.values = values
+            if self.mstx is not None:
+                kind = "prefetch" if args[5] else "reactive"
+                self.local.context = (
+                    f"backend={self.backend}|layer={args[3]}|kind={kind}|rows={args[0].shape[0]}|call={call_id}"
+                )
+            range_id = self.range_start("update_weights")
             success = False
             begin = self.clock()
             try:
@@ -104,6 +141,7 @@ class CallbackTimings:
                 return result
             finally:
                 values["total"] = self.clock() - begin
+                self.range_end(range_id)
                 self.local.values = None
                 values["host_without_sync"] = values["total"] - values["synchronize"]
                 values["outer"] = values["host_without_sync"] - values["observe"] - values["choose_victims"]
@@ -150,7 +188,14 @@ class CallbackTimings:
                 )
             )
         return dict(
-            backend=self.backend, count=len(samples), errors=errors, dropped=dropped, groups=reports, units="us"
+            backend=self.backend,
+            count=len(samples),
+            errors=errors,
+            dropped=dropped,
+            groups=reports,
+            units="us",
+            mstx_enabled=self.mstx is not None,
+            mstx_errors=self.marker_errors,
         )
 
     def serve(self, port):
@@ -181,6 +226,7 @@ class CallbackTimings:
                         policy="LRC only",
                         transport="torch",
                         load_backend="python",
+                        mstx_enabled=collector.mstx is not None,
                     ),
                 )
 
@@ -218,7 +264,14 @@ def install_callback_timing(manager, port):
         raise ValueError("Callback timing requires single-card python/cpp LRC")
     if manager.offload_config.h2d_backend != "torch":
         raise ValueError("Callback timing requires original TorchCopy transport")
-    collector = CallbackTimings(backend)
+    mstx = None
+    if manager.offload_config.callback_mstx_enabled:
+        # Lazy import: standalone CPU benchmarks and disabled mode need no NPU API.
+        from torch_npu.npu import mstx
+
+        if not all(callable(getattr(mstx, name, None)) for name in ("range_start", "range_end")):
+            raise RuntimeError("Installed torch_npu does not provide MSTX host ranges")
+    collector = CallbackTimings(backend, mstx=mstx)
     for name in ("observe", "choose_victims"):
         setattr(manager.cache_policy, name, collector.wrap(name, getattr(manager.cache_policy, name)))
     for method, metric in (

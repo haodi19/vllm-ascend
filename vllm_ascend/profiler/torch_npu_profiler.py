@@ -41,8 +41,12 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
         if not profiler_config.torch_profiler_dir:
             raise RuntimeError("torch_profiler_dir cannot be empty.")
         msmonitor_use_daemon = envs_ascend.MSMONITOR_USE_DAEMON
+        mstx_options = {}
         with suppress(RuntimeError):
-            msmonitor_use_daemon = get_ascend_config().msmonitor_use_daemon
+            ascend_config = get_ascend_config()
+            msmonitor_use_daemon = ascend_config.msmonitor_use_daemon
+            if ascend_config.expert_offload_config.callback_mstx_enabled is True:
+                mstx_options["mstx"] = True
         if msmonitor_use_daemon:
             raise RuntimeError("MSMONITOR_USE_DAEMON and torch profiler cannot be both enabled at the same time.")
 
@@ -56,6 +60,7 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             data_simplification=True,
             record_op_args=False,
             gc_detect_threshold=None,
+            **mstx_options,
         )
 
         return torch_npu.profiler.profile(

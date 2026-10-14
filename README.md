@@ -124,6 +124,10 @@ vLLM Ascend Plugin
 实验入口为 [script/run_verified_cpp_tests.py](script/run_verified_cpp_tests.py)，
 执行方式与字段说明见 [实验说明](docs/verified_cpp_comparison.md)。
 
+如需在 MindStudio 时间线上查看 `_update_weights`、LRC、加载提交和同步等待的
+CPU 时间范围，使用可选的 [MSTX 可视化采集](docs/offload_mstx.md)。默认关闭，
+Python/C++ 两组均支持；打标数据用于定位，不替换上述性能基线。
+
 ## Overview
 
 vLLM Ascend (`vllm-ascend`) is a community maintained hardware plugin for running vLLM seamlessly on the Ascend NPU.
