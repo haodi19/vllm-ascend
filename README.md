@@ -128,6 +128,9 @@ vLLM Ascend Plugin
 CPU 时间范围，使用可选的 [MSTX 可视化采集](docs/offload_mstx.md)。默认关闭，
 Python/C++ 两组均支持；打标数据用于定位，不替换上述性能基线。
 
+理解 CPU/NPU 执行顺序、Prefill、预取、图捕获/重放及 host callback，参见
+[MoE 卸载流程中文说明](docs/moe_offload_cpu_npu_flow_zh.md)，其中包含槽位替换示例和同步开销的测量边界。
+
 ## Overview
 
 vLLM Ascend (`vllm-ascend`) is a community maintained hardware plugin for running vLLM seamlessly on the Ascend NPU.
