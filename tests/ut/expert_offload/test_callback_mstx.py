@@ -35,6 +35,40 @@ class FakeMstx:
 
 
 class TestMstx(unittest.TestCase):
+    def test_gap_steps_timing_disabled_and_exception(self):
+        now = [0]
+        mstx = FakeMstx()
+        collector = TIMING["CallbackTimings"]("cpp", clock=lambda: now[0], mstx=mstx)
+        manager = SimpleNamespace(_callback_timing=collector)
+
+        def update(args):
+            for index, name in enumerate(TIMING["GAP_METRICS"], 1):
+                with TIMING["callback_stage"](manager, name):
+                    now[0] += index * 1000
+
+        call = collector.wrap_update(update)
+        call(self.args())
+        self.assertEqual(mstx.events, [])
+        collector.start()
+        call(self.args())
+        gap = collector.stop()["groups"][0]["gap_metrics"]
+        for index, name in enumerate(TIMING["GAP_METRICS"], 1):
+            self.assertEqual(gap[name]["mean"], index)
+
+        def fail(args):
+            with TIMING["callback_stage"](manager, "gap_debug"):
+                raise RuntimeError("log failure")
+
+        collector.start()
+        with self.assertRaisesRegex(RuntimeError, "log failure"):
+            collector.wrap_update(fail)(self.args())
+        self.assertEqual(collector.stop()["errors"], 1)
+        self.assertEqual(sum(e[0] == "start" for e in mstx.events), sum(e[0] == "end" for e in mstx.events))
+        collector.mstx = None
+        collector.start()
+        call(self.args())
+        self.assertEqual(collector.stop()["groups"][0]["gap_metrics"], {})
+
     @staticmethod
     def args(layer=2, prefetch=False):
         return (SimpleNamespace(shape=(3, 8)), None, None, layer, None, prefetch)

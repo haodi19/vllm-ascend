@@ -335,6 +335,17 @@ def print_inference_report(backend, report, requests):
                 ),
                 flush=True,
             )
+        gap = group.get("gap_metrics", {})
+        if gap:
+            measured_sum = sum(item["mean"] for item in gap.values())
+            print("GAP BREAKDOWN: ranked by mean; share of measured substeps, not the whole timeline gap", flush=True)
+            for name, item in sorted(gap.items(), key=lambda pair: pair[1]["mean"], reverse=True):
+                share = 100 * item["mean"] / measured_sum if measured_sum else 0
+                print(
+                    f"{name:26} mean_us={item['mean']:.3f} p95_us={item['p95']:.3f} "
+                    f"max_us={item['max']:.3f} measured_share={share:.1f}%",
+                    flush=True,
+                )
     stats = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))["summarize"]
     print(f"Request wall time (ms, TIMERS + PROFILER): {stats([r[0] / 1000 for r in requests])}", flush=True)
     print(f"Request usage: {[r[1] for r in requests]}", flush=True)

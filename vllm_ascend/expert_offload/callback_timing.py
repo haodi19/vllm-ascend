@@ -11,9 +11,11 @@ import os
 import statistics
 import threading
 import time
+from contextlib import contextmanager, nullcontext
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MAX_SAMPLES = 50000
+GAP_METRICS = ("gap_mapping", "gap_missing", "gap_hit_stats", "gap_cache_stats", "gap_slots", "gap_debug")
 DRAIN_SECONDS = 30
 METRICS = (
     "total",
@@ -47,6 +49,14 @@ def summarize(values):
         min=values[0],
         max=values[-1],
     )
+
+
+def callback_stage(manager, name):
+    """Fine-grained diagnostics only inside an active MSTX callback window."""
+    collector = getattr(manager, "_callback_timing", None)
+    if collector is None or collector.mstx is None or getattr(collector.local, "values", None) is None:
+        return nullcontext()
+    return collector.stage(name)
 
 
 class CallbackTimings:
@@ -114,6 +124,16 @@ class CallbackTimings:
 
         return measured
 
+    @contextmanager
+    def stage(self, name):
+        range_id = self.range_start(name)
+        begin = self.clock()
+        try:
+            yield
+        finally:
+            self.local.values[name] += self.clock() - begin
+            self.range_end(range_id)
+
     def wrap_update(self, fn):
         @functools.wraps(fn)
         def measured(args):
@@ -125,7 +145,7 @@ class CallbackTimings:
                     call_id = self.call_id
             if not enabled:
                 return fn(args)
-            values = dict.fromkeys((*METRICS, "loads"), 0)
+            values = dict.fromkeys((*METRICS, *GAP_METRICS, "loads"), 0)
             self.local.values = values
             if self.mstx is not None:
                 kind = "prefetch" if args[5] else "reactive"
@@ -185,6 +205,11 @@ class CallbackTimings:
                     layers=sorted({r[0] for r in records}),
                     loads=summarize([r[1]["loads"] for r in records]),
                     metrics={key: summarize([r[1][key] / 1000 for r in records]) for key in METRICS},
+                    gap_metrics=(
+                        {key: summarize([r[1][key] / 1000 for r in records]) for key in GAP_METRICS}
+                        if self.mstx is not None
+                        else {}
+                    ),
                 )
             )
         return dict(

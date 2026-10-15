@@ -16,6 +16,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.expert_offload.callback_timing import callback_stage
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.expert_offload.expert_predictor import maybe_create_driver
 from vllm_ascend.expert_offload.h2d_transfer import (
@@ -3156,78 +3157,85 @@ class ExpertOffloadManager:
                 else:
                     needed = set(_valid_eids(topk_ids_h))
 
-                l2p_list = log2phy_np.tolist()
-                slot_owner = {s: e for e, s in enumerate(l2p_list) if s >= 0}
-                on_device = set(slot_owner.values())
+                with callback_stage(self, "gap_mapping"):
+                    l2p_list = log2phy_np.tolist()
+                    slot_owner = {s: e for e, s in enumerate(l2p_list) if s >= 0}
+                    on_device = set(slot_owner.values())
 
-                if is_prefetch:
-                    # Prefetch: load at most prefetch_topk experts for the layer — a
-                    # GLOBAL cap across all predicted token rows, not one per token —
-                    # chosen as the highest-scoring predictions not already resident.
-                    # An expert predicted by several tokens is one transfer and takes
-                    # its best score across them.
-                    rows_ids = topk_ids_h.tolist()
-                    rows_w = topk_weights_h.tolist() if topk_weights_h is not None else None
-                    n_rows = len(rows_ids)
-                    best_score: dict[int, float] = {}
-                    for r, row in enumerate(rows_ids):
-                        for c, eid in enumerate(row):
-                            if eid in on_device:
-                                continue          # resident: nothing to transfer
-                            if rows_w is not None:
-                                score = rows_w[r][c]
-                            else:
-                                # No scores available: interleave rows by rank so
-                                # every row's rank-0 outranks every row's rank-1,
-                                # rather than concatenating rows — the bias this
-                                # block exists to remove. At one row this is plain
-                                # column order.
-                                score = -float(c * n_rows + r)
-                            if score > best_score.get(eid, float("-inf")):
-                                best_score[eid] = score
-                    need_to_load = set(
-                        sorted(best_score, key=best_score.get, reverse=True)
-                        [:self.prefetch_topk])
-                else:
-                    need_to_load = needed - on_device
+                with callback_stage(self, "gap_missing"):
+                    if is_prefetch:
+                        # Prefetch: load at most prefetch_topk experts for the layer — a
+                        # GLOBAL cap across all predicted token rows, not one per token —
+                        # chosen as the highest-scoring predictions not already resident.
+                        # An expert predicted by several tokens is one transfer and takes
+                        # its best score across them.
+                        rows_ids = topk_ids_h.tolist()
+                        rows_w = topk_weights_h.tolist() if topk_weights_h is not None else None
+                        n_rows = len(rows_ids)
+                        best_score: dict[int, float] = {}
+                        for r, row in enumerate(rows_ids):
+                            for c, eid in enumerate(row):
+                                if eid in on_device:
+                                    continue          # resident: nothing to transfer
+                                if rows_w is not None:
+                                    score = rows_w[r][c]
+                                else:
+                                    # No scores available: interleave rows by rank so
+                                    # every row's rank-0 outranks every row's rank-1,
+                                    # rather than concatenating rows — the bias this
+                                    # block exists to remove. At one row this is plain
+                                    # column order.
+                                    score = -float(c * n_rows + r)
+                                if score > best_score.get(eid, float("-inf")):
+                                    best_score[eid] = score
+                        need_to_load = set(
+                            sorted(best_score, key=best_score.get, reverse=True)
+                            [:self.prefetch_topk])
+                    else:
+                        need_to_load = needed - on_device
 
-                already_there = needed & on_device              # for cache_stats / debug
+                    already_there = needed & on_device              # for cache_stats / debug
 
             # both hit-rate numerators must be taken HERE — the load loop
             # below mutates on_device. `needed` is the post-substitution routed
             # set; gt_set is what the router originally selected (identical when
             # substitution is off, which is what makes the two series equal in
             # that case, exactly).
-            stat_hit_post = stat_hit_pre = None
-            gt_set = None
-            if stats is not None and not is_prefetch:
-                gt_set = gt_ids if gt_ids is not None else needed
-                stat_hit_post = (len(already_there) / len(needed)
-                                 if needed else 0.0)
-                stat_hit_pre = (len(gt_set & on_device) / len(gt_set)
-                                if gt_set else 0.0)
+            with callback_stage(self, "gap_hit_stats"):
+                stat_hit_post = stat_hit_pre = None
+                gt_set = None
+                if stats is not None and not is_prefetch:
+                    gt_set = gt_ids if gt_ids is not None else needed
+                    stat_hit_post = (len(already_there) / len(needed)
+                                     if needed else 0.0)
+                    stat_hit_pre = (len(gt_set & on_device) / len(gt_set)
+                                    if gt_set else 0.0)
 
             # Reactive pass only. On the prefetch pass `needed` is the
             # PREDICTED set, so these legacy counters were mixing predicted with
             # actual routing and their hit rate moved when prefetch was toggled.
-            if self.cache_policy is not None and not is_prefetch:
-                self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device)
-            reusable_slots = (range(fused_plan["reusable_count"]) if fused_plan is not None else
-                              [s for s, e in slot_owner.items() if e not in needed])
+            with callback_stage(self, "gap_cache_stats"):
+                if self.cache_policy is not None and not is_prefetch:
+                    self._record_cache_stats(layer_idx, already_there, need_to_load, needed, on_device)
 
-            if self._debug:
-                flag = '[PREFETCH-W]' if is_prefetch else '[UPDATE-W]'
-                already_there_layer = (set(_valid_eids(topk_ids_h[0:1])) & on_device)
-                logger.info("%s l=%d expert_hit=%s expert_miss=%s hit_rate=%.2f layer_expert_hit=%s needed=%s topk_ids_h=%s" ,
-                            flag,layer_idx, sorted(already_there),
-                            # sorted(need_to_load), len(already_there_layer) / topk_ids_h.shape[1],
-                            sorted(need_to_load), len(already_there) / (len(already_there) + len(need_to_load)) if len(already_there) + len(need_to_load) > 0 else 0,
-                            already_there_layer, needed, topk_ids_h)
-                if need_to_load and len(need_to_load) > len(reusable_slots):
-                    logger.info("%s l=%d SHORTFALL: need %d load but only %d slots, "
-                                "to_load=%s",
-                                flag,layer_idx, len(need_to_load), len(reusable_slots),
-                                sorted(need_to_load)[:20])
+            with callback_stage(self, "gap_slots"):
+                reusable_slots = (range(fused_plan["reusable_count"]) if fused_plan is not None else
+                                  [s for s, e in slot_owner.items() if e not in needed])
+
+            with callback_stage(self, "gap_debug"):
+                if self._debug:
+                    flag = '[PREFETCH-W]' if is_prefetch else '[UPDATE-W]'
+                    already_there_layer = (set(_valid_eids(topk_ids_h[0:1])) & on_device)
+                    logger.info("%s l=%d expert_hit=%s expert_miss=%s hit_rate=%.2f layer_expert_hit=%s needed=%s topk_ids_h=%s" ,
+                                flag,layer_idx, sorted(already_there),
+                                # sorted(need_to_load), len(already_there_layer) / topk_ids_h.shape[1],
+                                sorted(need_to_load), len(already_there) / (len(already_there) + len(need_to_load)) if len(already_there) + len(need_to_load) > 0 else 0,
+                                already_there_layer, needed, topk_ids_h)
+                    if need_to_load and len(need_to_load) > len(reusable_slots):
+                        logger.info("%s l=%d SHORTFALL: need %d load but only %d slots, "
+                                    "to_load=%s",
+                                    flag,layer_idx, len(need_to_load), len(reusable_slots),
+                                    sorted(need_to_load)[:20])
 
             # (merge): rank all resident candidates once with
             # choose_victims(count=len(need_to_load)) instead of calling

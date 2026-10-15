@@ -81,6 +81,36 @@ moe_offload/update_weights|backend=cpp|layer=12|kind=reactive|rows=3|call=42
 
 ## 开关和测量影响
 
+### observe 到 choose_victims 之间的细分
+
+开启 `--mstx` 时，这段外围逻辑另有六个时间块，并在 `summary.txt` 的
+`GAP BREAKDOWN` 中按平均耗时从大到小输出。按 backend、kind 和 token_rows 分组，
+给出每个回调中的平均、P95、最大耗时（微秒）。无需等待 profile 导出成功即可读取这些统计。
+
+| 标记 | 对应步骤 |
+| --- | --- |
+| gap_mapping | 映射转列表、构造槽位归属字典和驻留专家集合 |
+| gap_missing | 当前层缺失/命中集合计算；预取路径还包括预测候选评分和筛选 |
+| gap_hit_stats | 计算命中率等统计值 |
+| gap_cache_stats | 更新缓存统计，包含达到间隔时的统计整理与可能的统计日志 |
+| gap_slots | 构造可替换槽位列表 |
+| gap_debug | debug 参数整理、排序、张量格式化及日志输出；关闭 debug 时仅经过分支判断 |
+
+`measured_share` 的分母是六个小项平均时间之和，不是可视化中整个间隔的宽度。
+没有执行的分支贡献零耗时（或范围内分支判断开销）；这里不是按实际操作调用次数求平均。
+子范围之间仍有打标、Python 控制流和可能的线程调度开销。
+这些子项属于 `outer`，不要再加到 `outer` 或 `total` 上。
+若要解释某一个特别大的空泡，需在 MindStudio 对照同一 `call` 的子块，
+不能只用跨回调的平均值代替该次耗时。预取不执行 observe，所以其小项不是 observe 后间隔。
+
+复测可使用新目录：
+
+```bash
+python -B script/run_verified_cpp_tests.py --only inference --mstx --npu 1 --requests 1 --profile-timeout 300 --output-dir bench_results/mstx_gap_01
+```
+
+### 默认行为
+
 默认关闭。`--mstx` 为两组注入 `expert_offload_config.callback_mstx_enabled=true`，
 并启用 profiler 的 MSTX 导出。此开关要求 `callback_timing_port` 已设置，支持现有单卡
 Python/CPP LRC + TorchCopy 诊断模式。标记仅在计时窗口打开后生成，预热不打标。
