@@ -2,7 +2,8 @@
 
 本文面向只有 LLM 基础的读者，说明本项目如何在 CPU 内存与 NPU 显存之间管理专家权重，
 重点解释 `_launch_host_func`、`_update_weights` 和图捕获/重放。
-以当前 `script/test_graph2.sh` 的单卡、LRC、TorchCopy 路径为主，核对日期为 2026-10-15。
+以当前 `script/test_graph2.sh` 的单卡、LRC、TorchCopy 路径为主，核对日期为 2026-10-16。
+容器已确认 torch_npu 版本为 2.10.0；底层分析以公开 v2.10.0 源码为依据，定制构建的差异需另行核对。
 本文解释已有实现，不新增同步优化，也不把待验证的性能猜测当作结论。
 
 ## 先读：一次 MoE 卸载，CPU 与 NPU 到底怎样接力
@@ -51,6 +52,10 @@ torch_npu.npu._launch_host_func(
 
 “host callback / 主机回调”就是这次由运行时触发的 CPU 函数执行。
 它不是 NPU 在执行 Python。提交这个安排的线程与实际执行回调的线程，也不要当成同一个线程。
+
+`current_compute_stream` 指定把回调放入哪条设备流，从而建立它与前后设备任务的顺序关系。
+这里没有另设一个 Python Event 来检测“回传结束”；运行时在前序任务完成、执行到回调任务时触发它。
+它也不指定回调中的权重加载流：加载流由 `_update_weights` 内部选择。
 
 ### 第三步：CPU 判断搬谁、放哪里
 
@@ -115,6 +120,11 @@ log2phy.copy_(log2phy_h, non_blocking=...)
 
 例如告诉 NPU“专家 5 现在在槽位 0”。权重和映射都就绪后，后续 MoE 才能正确计算。
 CPU 提前更新映射数据，不代表 NPU 可以在权重加载完成前使用它；上述依赖保证二者一致。
+
+这里要分清提交与执行：CPU 调用 `_launch_host_func` 返回后，可以继续执行映射写回那一行，
+但这只是提前安排后续工作。回调采用阻塞属性，所以映射拷贝的设备执行必须等回调结束。
+图重放时，回调返回给运行时，随后执行已记录的映射拷贝；不会返回某一行外层 Python 继续执行。
+普通 Eager 路径则是直接调用 guarded 函数，返回后由外层 Python 继续安排映射拷贝。
 
 ### 六步放在一张图里看
 
@@ -228,7 +238,12 @@ MoE 缓存判断却需要每轮读取新路由，不能只保留捕获时的一�
 
 ### _launch_host_func 就是在图中安排这项 CPU 工作
 
-本项目捕获的流程可以理解为：
+本项目的捕获入口在 `vllm_ascend/compilation/acl_graph.py`。框架进入
+`with torch.npu.graph(...)` 后执行模型前向；执行到 MoE 层的路由之后、专家计算之前，
+调用外层 `update_weights`。它安排路由/映射回传、CPU 回调和新映射写回，
+这些任务及依赖成为被捕获流程的一部分。捕获的不是 `_update_weights` 中每一条 Python 语句。
+
+这段流程可以理解为：
 
 ```text
 [NPU 路由] → [回传名单] → [调用 CPU 回调] → [写回新映射] → [NPU MoE]
@@ -246,6 +261,11 @@ MoE 缓存判断却需要每轮读取新路由，不能只保留捕获时的一�
 重复的是回调入口，不是固定的加载名单。
 回调动态提交的权重拷贝，也不能一概视为捕获时就固定好的拷贝节点。
 **CPU 回调在图的流程里，不等于回调内的 Python/C++ 在 NPU 上执行。**
+
+路由暂存区可以保持同一个地址，但每轮 D2H 会写入本轮数据：第一次是 `[2, 5]`，
+第二次是 `[2, 7]`。回调通过保存的 Tensor 对象读取暂存区，因而能作出不同的加载决策。
+固定地址本身并不保证读到最新数据，还必须保证本轮写入完成、读取期间不被提前覆盖。
+图中的任务顺序正是保障这些条件的一部分；图固定的是执行结构和缓冲区安排，而不是输入内容。
 
 ### 为什么 capturing 分支只运行在捕获时，重放仍然有回调
 
@@ -352,7 +372,66 @@ LRC 参与访问统计和替换决策：`observe` 更新真实访问统计，`ch
 当前已验证的 C++ 模式迁移了这部分，其他规划、日志、加载提交等仍保留原实现。
 卸载通常节省显存，但会增加传输、CPU 管理和依赖等待，性能目标是减少这些额外开销。
 
-## 4. 三种“同步”不要混为一谈
+## 4. 回调的底层执行与同步关系
+
+### 4.1 提交接口与阻塞属性
+
+torch_npu 2.10.0 的 Python `_launch_host_func` 将参数转交给 `_C` 扩展。
+C++ 绑定保存 Python 函数与参数对象，并安排 C++ 包装函数 `LaunchCallFunc`。
+其调用链是：
+
+```text
+torch_npu.npu._launch_host_func(stream, guarded, args)
+    → torch_npu._C._launch_host_func
+    → c10_npu::launch_callback(stream, LaunchCallFunc, data)
+    → AclrtLaunchCallback(..., ACL_CALLBACK_BLOCK, stream)
+```
+
+`launch_callback` 将类型明确设为 `ACL_CALLBACK_BLOCK`，该 Python 接口没有提供非阻塞选项。
+虽然名字包含 host_func，这条路径使用的是 `aclrtLaunchCallback`，并非简单调用同名的
+`aclrtLaunchHostFunc`。依据见 [C++ 绑定](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/npu/Graph.cpp)
+和 [底层提交](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/core/npu/NPUGraph.cpp)。
+
+提交接口不以业务回调执行完毕为返回条件。CPU 可以继续组织后面的任务，
+但指定流的后续设备任务必须等待阻塞式回调完成。对应当前层按需加载路径：
+
+```text
+CPU 安排顺序：提交路由回传 → 安排回调 → 提交映射写回
+设备依赖顺序：路由回传完成 → 回调执行并完成 → 映射写回执行
+```
+
+因此，“异步提交”和“阻塞后续设备任务”同时成立。这里的阻塞不直接作用于所有设备流。
+若换成不阻塞后续任务的机制，必须另行保证权重和映射就绪，否则映射写回可能读取旧内容。
+
+### 4.2 报告线程如何进入业务函数
+
+项目在首次使用相关流时调用 `_subscribe_report(stream)`。公开实现按需创建处理线程，
+设置设备上下文，并将该线程订阅到流；线程循环调用 `aclrtProcessReport(...)` 处理回调报告。
+它不是每次安排回调就新建一个线程，也不是 Python 循环检查路由 Tensor 是否变化。
+
+运行时触发回调后，报告处理线程进入 `LaunchCallFunc`。这个包装函数获取 GIL，
+构造 Python 调用参数，通过 `PyObject_CallObject` 调用 `_update_weights_guarded(args)`。
+GIL 是常规 CPython 中线程执行 Python 所需的解释器锁；存在这一步不代表它一定是耗时瓶颈。
+
+```text
+前序设备任务完成，回调任务具备执行条件
+    → 报告处理线程进入 LaunchCallFunc
+    → 获取 GIL、构造 Python 调用参数
+    → _update_weights_guarded
+    → _update_weights：缓存规划、提交加载、等待加载流
+    → 返回 guarded，再返回 C++ 包装层
+    → 清理临时对象、释放获取的 GIL 状态
+    → 回调完成，本流后续设备任务可以继续
+```
+
+函数和参数通过 `PyFuncStruct` 保持 Python 引用，以维持它们的有效期，
+不是把 Tensor 内容在登记时复制成永远不变的数据。
+这使回调能反复读取同一暂存区中的本轮内容。
+线程、调用包装与引用管理分别见
+[Graph.cpp](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/npu/Graph.cpp)
+和 [Graph.h](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/npu/Graph.h)。
+
+### 4.3 区分回调等待、加载等待和跨流等待
 
 | 位置 | 谁在等谁 | 本项目的意义 |
 | --- | --- | --- |
@@ -364,13 +443,9 @@ LRC 参与访问统计和替换决策：`observe` 更新真实访问统计，`ch
 `stream.synchronize()` 则是主机侧等待。异步提交不意味着没有任何依赖等待，
 多个 Stream 也不意味着回调可以与所有计算自由重叠。
 
-CANN 的公开 HostFunc 文档说明异步提交与阻塞本流后续任务可以同时成立，
-也列出了回调中可调用 API 的限制。见
-[官方 HostFunc 接口说明](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1959.html)。
-但不能因此认定本环境的 `torch_npu.npu._launch_host_func` 私有接口就是该 C API 的简单直通包装：
-本项目还显式使用 `_subscribe_report`，实际绑定实现需结合绿区 torch_npu/CANN 版本核对。
-当前代码确实在回调内提交其他流的拷贝并同步；后续若更换底层同步方法，
-必须确认接口限制和跨流依赖，不能直接把现有回调原样塞进另一套 C API。
+当前代码在回调内向另一条加载流提交拷贝，并等待该流完成；这是业务函数引入的等待，
+不能全部算成底层回调调度成本。报告处理、GIL 获取、回调包装和结束处理也是潜在开销，
+但目前没有各项独立测量值。更换底层同步机制前，需要核对对应接口的调用限制并保留跨流依赖。
 
 ## 5. 预取：提前做可能会需要的加载
 
