@@ -81,6 +81,61 @@ moe_offload/update_weights|backend=cpp|layer=12|kind=reactive|rows=3|call=42
 
 ## 开关和测量影响
 
+### 相邻预取与按需回调之间的间隔
+
+`--mstx` 现在还记录 `moe_offload/host_callback`，与内部 `update_weights` 使用相同的
+backend/layer/kind/rows/call。当前层回调覆盖 guarded 函数；预取回调还覆盖映射快照与异常恢复，
+分别显示为 `prefetch_snapshot` 和仅失败时出现的 `prefetch_failure_restore`。
+这是 Python 包装范围，不覆盖进入 Python 之前的报告调度/GIL 获取，或返回运行时之后的收尾。
+没有新增 host callback、设备同步或跨流等待来测量这些边界。
+
+完整导出 profile 后，一键脚本自动分析 `trace_view.json`，在摘要中输出两个方向的 `GAP` 表，
+并在本轮 `--output-dir` 中写入 `trace_with_gaps_<backend>_<序号>.json`。
+该文件保留原始 traceEvents，新增三段派生时间块（不是设备上实测的新 MSTX 事件）：
+
+| 派生时间块 | 区间含义 |
+| --- | --- |
+| callback_tail | 上一次内层 update_weights 结束，到它的 Python host_callback 范围结束 |
+| between_callbacks_unattributed | 上一次 Python 回调范围结束，到下一次 Python 回调范围开始 |
+| callback_head | 下一次 Python 回调范围开始，到其内部 update_weights 开始 |
+
+三段之和等于相邻内层范围的间隔。回调头部可能包含预取快照；尾部包含 Python 收尾与计时器工作。
+本工具按同一进程内的时间相邻事件配对，只比较 prefetch/reactive 切换；
+不声称这些回调属于同一层或同一请求。每个派生块参数保留两端 layer/call，可自行核对。
+并发重叠或不满足包含关系的样本跳过，并报告 skipped。
+
+`memcpy_overlap_us` 统计间隔中名称含 MEMCPY_ASYNC 的完整事件的时间覆盖并集，
+不是各 Stream 耗时简单相加。需在原图确认这些事件是否位于设备轨道、方向和归属；
+此字段不区分路由、权重、映射，不代表因果，也不能与上述三段再次相加。
+没有覆盖 MEMCPY 的时间不等于设备完全空闲，更不等于 GIL 等待。
+
+新版时间线若支持在 MindStudio 中单独导入 JSON，可导入派生文件并搜索 `gap/`，
+同时查看原有 CPU/NPU 轨道；若该版本只接受原始 profile 文件夹，则仍导入原始目录，
+查看新增的真实 MSTX host_callback 标记，派生 JSON 可在兼容 Chrome Trace 的查看器中打开。
+导入兼容性和实际阶段数据均待绿区验证。
+
+首轮建议：
+
+```bash
+python -B script/run_verified_cpp_tests.py --only inference --mstx --npu 1 --requests 1 --profile-timeout 300 --output-dir bench_results/mstx_boundary_01
+```
+
+原始文件不改写。导出不完整时不自动分析，可在确认导出完成后单独执行：
+
+```bash
+python -B script/analyze_callback_gaps.py /实际路径/trace_view.json bench_results/trace_with_gaps_manual.json
+```
+
+分析器目前支持导出为 `ph=X` 完整范围的 MSTX 格式，其他格式会提示未验证，
+不伪造配对结果。读取流式进行，但有最多 100 万个候选区间的保护限制；建议先采集一个请求。
+返回摘要中的 GAP 表、pairs/skipped、marker_errors 即可，无需传输 profile 文件。
+
+设备传输、预测算子和事件等待仍查看原始设备轨道。目前没有把这些阶段全部赋予独立 MSTX 名称：
+当前流程在 profiler 开启前已经捕获图，torch_npu 2.10.0 的 MSTX 实现会在未开启采集时跳过打标，
+因此不能简单在捕获期 Python copy_/wait_event 两侧打标就宣称测到了重放耗时。
+依据见 [MSTX 实现](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/profiler/mstx_mgr.cpp)。
+报告调度、GIL 获取及设备恢复仍包含在未归因区间，需要底层观测能力才能进一步独立测量。
+
 ### observe 到 choose_victims 之间的细分
 
 开启 `--mstx` 时，这段外围逻辑另有六个时间块，并在 `summary.txt` 的

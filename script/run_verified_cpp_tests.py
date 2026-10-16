@@ -433,6 +433,13 @@ def _inference(args, source, backend, env, log):
         report["profile_status"] = profile_status
         if getattr(args, "mstx", False):
             report["mstx_trace_occurrences"] = inspect_mstx_trace(profile_dir)
+            if profile_status == "complete":
+                analyze = runpy.run_path(str(REPO / "script/analyze_callback_gaps.py"))["analyze"]
+                for index, trace in enumerate(sorted(profile_dir.rglob("trace_view.json"))):
+                    try:
+                        analyze(trace, args.output_dir / f"trace_with_gaps_{backend}_{index}.json")
+                    except (ValueError, OSError) as exc:
+                        print(f"GAP ANALYSIS NOT VERIFIED: {exc}", flush=True)
         return report
     finally:
         with progress(f"{backend} service cleanup and port release; up to 50s"):

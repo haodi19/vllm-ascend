@@ -35,6 +35,78 @@ class FakeMstx:
 
 
 class TestMstx(unittest.TestCase):
+    def test_outer_callback_context_and_snapshot(self):
+        mstx = FakeMstx()
+        collector = TIMING["CallbackTimings"]("cpp", mstx=mstx)
+        manager = SimpleNamespace(_callback_timing=collector)
+        inner = collector.wrap_update(lambda args: 5)
+
+        def outer(args):
+            with TIMING["callback_boundary_stage"](manager, "prefetch_snapshot"):
+                pass
+            return inner(args)
+
+        call = collector.wrap_callback(outer)
+        call(self.args(prefetch=True))
+        self.assertEqual(mstx.events, [])
+        collector.start()
+        self.assertEqual(call(self.args(prefetch=True)), 5)
+        report = collector.stop()
+        self.assertEqual(report["count"], 1)
+        starts = [e[2] for e in mstx.events if e[0] == "start"]
+        self.assertEqual(
+            [s.split("|")[0] for s in starts],
+            ["moe_offload/host_callback", "moe_offload/prefetch_snapshot", "moe_offload/update_weights"],
+        )
+        self.assertEqual(len({s.partition("|")[2] for s in starts}), 1)
+        self.assertEqual(collector.inflight, 0)
+        self.assertIsNone(collector.local.outer_context)
+
+    def test_outer_exception_drains_and_closes(self):
+        collector = TIMING["CallbackTimings"]("python", mstx=FakeMstx())
+
+        def fail(args):
+            raise ValueError("snapshot failed")
+
+        collector.start()
+        with self.assertRaisesRegex(ValueError, "snapshot failed"):
+            collector.wrap_callback(fail)(self.args())
+        self.assertEqual(collector.inflight, 0)
+        self.assertEqual([e[0] for e in collector.mstx.events], ["start", "end"])
+        collector.stop()
+
+    def test_gap_analysis_union_and_boundaries(self):
+        module = runpy.run_path(str(REPO / "script/analyze_callback_gaps.py"))
+
+        def event(name, call, kind, ts, dur):
+            return dict(
+                name=f"moe_offload/{name}|call={call}|kind={kind}|layer=2", ph="X", pid=1, tid=1, ts=ts, dur=dur
+            )
+
+        data = [
+            event("host_callback", 1, "prefetch", 0, 15),
+            event("update_weights", 1, "prefetch", 2, 10),
+            event("host_callback", 2, "reactive", 25, 15),
+            event("update_weights", 2, "reactive", 28, 10),
+            dict(name="MEMCPY_ASYNC", ph="X", ts=14, dur=6),
+            dict(name="MEMCPY_ASYNC", ph="X", ts=18, dur=4),
+        ]
+        with tempfile.TemporaryDirectory() as folder:
+            path, out = Path(folder) / "trace.json", Path(folder) / "overlay.json"
+            path.write_text(json.dumps(dict(traceEvents=data)), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rows = module["analyze"](path, out)
+            row = rows[0]
+            self.assertEqual(
+                (row["gap_us"], row["callback_tail_us"], row["between_callbacks_us"], row["callback_head_us"]),
+                (16, 3, 10, 3),
+            )
+            self.assertEqual(row["memcpy_overlap_us"], 8)
+            self.assertEqual(len(json.loads(out.read_text(encoding="utf-8"))["traceEvents"]), len(data) + 3)
+            path.write_text('{"traceEvents":[{"ph":"X"}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "完整"):
+                list(module["events"](path))
+
     def test_gap_steps_timing_disabled_and_exception(self):
         now = [0]
         mstx = FakeMstx()

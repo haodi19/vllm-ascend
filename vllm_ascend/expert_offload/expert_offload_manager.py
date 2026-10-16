@@ -16,7 +16,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.expert_offload.callback_timing import callback_stage
+from vllm_ascend.expert_offload.callback_timing import callback_boundary_stage, callback_stage
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
 from vllm_ascend.expert_offload.expert_predictor import maybe_create_driver
 from vllm_ascend.expert_offload.h2d_transfer import (
@@ -3634,12 +3634,18 @@ class ExpertOffloadManager:
                 # so a partial failure would publish residency for experts whose
                 # H2D never happened (log2phy applied then clamped -> slot 0,
                 # silent misroute). Restoring makes the write-back a no-op.
-                saved = log2phy_h.clone()
+                with callback_boundary_stage(self, "prefetch_snapshot"):
+                    saved = log2phy_h.clone()
                 try:
                     prefetch_fn(_args)
                 except Exception:
-                    log2phy_h.copy_(saved)
-                    self._note_cb_failure("prefetch")
+                    with callback_boundary_stage(self, "prefetch_failure_restore"):
+                        log2phy_h.copy_(saved)
+                        self._note_cb_failure("prefetch")
+
+            timing = getattr(self, '_callback_timing', None)
+            if timing is not None and timing.mstx is not None:
+                _prefetch_host_cb = timing.wrap_callback(_prefetch_host_cb)
 
             if _EXTRA_CTX.capturing:
                 if self.enable_multi_card:

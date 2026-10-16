@@ -59,6 +59,13 @@ def callback_stage(manager, name):
     return collector.stage(name)
 
 
+def callback_boundary_stage(manager, name):
+    collector = getattr(manager, "_callback_timing", None)
+    if collector is None or not getattr(collector.local, "outer_context", None):
+        return nullcontext()
+    return collector.boundary_stage(name)
+
+
 class CallbackTimings:
     def __init__(self, backend, clock=time.perf_counter_ns, mstx=None):
         self.backend = backend
@@ -125,6 +132,43 @@ class CallbackTimings:
         return measured
 
     @contextmanager
+    def boundary_stage(self, name):
+        range_id = self.range_start(name)
+        try:
+            yield
+        finally:
+            self.range_end(range_id)
+
+    def wrap_callback(self, fn):
+        @functools.wraps(fn)
+        def measured(args):
+            with self.condition:
+                enabled = self.active and self.mstx is not None
+                if enabled:
+                    self.inflight += 1
+                    self.call_id += 1
+                    call_id = self.call_id
+            if not enabled:
+                return fn(args)
+            previous = getattr(self.local, "context", None)
+            kind = "prefetch" if args[5] else "reactive"
+            self.local.context = (
+                f"backend={self.backend}|layer={args[3]}|kind={kind}|rows={args[0].shape[0]}|call={call_id}"
+            )
+            self.local.outer_context = self.local.context
+            try:
+                with self.boundary_stage("host_callback"):
+                    return fn(args)
+            finally:
+                self.local.outer_context = None
+                self.local.context = previous
+                with self.condition:
+                    self.inflight -= 1
+                    self.condition.notify_all()
+
+        return measured
+
+    @contextmanager
     def stage(self, name):
         range_id = self.range_start(name)
         begin = self.clock()
@@ -138,7 +182,7 @@ class CallbackTimings:
         @functools.wraps(fn)
         def measured(args):
             with self.condition:
-                enabled = self.active
+                enabled = self.active or bool(getattr(self.local, "outer_context", None))
                 if enabled:
                     self.inflight += 1
                     self.call_id += 1
@@ -147,7 +191,7 @@ class CallbackTimings:
                 return fn(args)
             values = dict.fromkeys((*METRICS, *GAP_METRICS, "loads"), 0)
             self.local.values = values
-            if self.mstx is not None:
+            if self.mstx is not None and not getattr(self.local, "outer_context", None):
                 kind = "prefetch" if args[5] else "reactive"
                 self.local.context = (
                     f"backend={self.backend}|layer={args[3]}|kind={kind}|rows={args[0].shape[0]}|call={call_id}"
@@ -297,6 +341,8 @@ def install_callback_timing(manager, port):
         if not all(callable(getattr(mstx, name, None)) for name in ("range_start", "range_end")):
             raise RuntimeError("Installed torch_npu does not provide MSTX host ranges")
     collector = CallbackTimings(backend, mstx=mstx)
+    if mstx is not None:
+        manager._update_weights_guarded = collector.wrap_callback(manager._update_weights_guarded)
     for name in ("observe", "choose_victims"):
         setattr(manager.cache_policy, name, collector.wrap(name, getattr(manager.cache_policy, name)))
     for method, metric in (
