@@ -382,11 +382,51 @@ torch_npu 部分依据公开的 2.10.0 源码；Runtime 与驱动部分依据公
 尚未与绿区实际加载的 CANN、驱动版本和硬件路径逐项匹配。
 下文用 STARS 的 Event 实现串联设备侧依赖，其他硬件分支可能使用不同的完成通知机制。
 
-### 4.1 提交线程安排路由回传与回调
+### 4.1 第一步：CPU 提交线程执行到 `_launch_host_func`
 
-torch_npu 2.10.0 的 Python `_launch_host_func` 将参数转交给 `_C` 扩展。
-C++ 绑定保存 Python 函数与参数对象，并安排 C++ 包装函数 `LaunchCallFunc`。
-其调用链是：
+外层 `update_weights` 先安排路由回传，再登记 CPU 回调，最后安排映射写回。
+下面是图捕获分支的简化代码：
+
+```python
+topk_ids_h.copy_(topk_ids, non_blocking=True)  # 路由结果 NPU → CPU
+log2phy_h.copy_(log2phy, non_blocking=True)    # 当前映射 NPU → CPU
+
+torch_npu.npu._launch_host_func(
+    current_compute_stream,
+    self._update_weights_guarded,
+    args,
+)
+
+log2phy.copy_(log2phy_h, non_blocking=True)    # 更新后的映射 CPU → NPU
+```
+
+此时 CPU 提交线程是在安排任务，不是在这里直接执行 `_update_weights_guarded`。
+`_launch_host_func` 返回后，提交线程可以继续执行下一行，提前安排映射写回。
+设备需要遵守的顺序则是：路由回传完成，CPU 回调处理完成，然后才能执行映射写回。
+接下来的几步说明这层依赖如何建立。
+
+### 4.2 第二步：torch_npu 将 Python 回调包装成 C++ 可调用的形式
+
+Python `_launch_host_func` 将参数转交给 `_C` 扩展。CANN 接口不能直接执行 Python 函数对象，
+因此 C++ 绑定保存 Python 函数与参数，并登记一个桥接函数 `LaunchCallFunc`：
+
+```text
+保存的 Python 函数：_update_weights_guarded
+保存的 Python 参数：args
+
+交给 CANN 的函数：LaunchCallFunc
+交给 CANN 的参数：指向上述保存信息的指针
+```
+
+等到设备通知可以执行回调时，`LaunchCallFunc` 再进入 Python 调用业务函数。
+`PyFuncStruct` 保存对象引用、保持对象有效，并不在登记时自动搬运 Tensor 内容；
+CPU 所需的路由数据由第一步的显式 `copy_` 准备。
+实现见 [Graph.cpp](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/npu/Graph.cpp)
+和 [Graph.h](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/npu/Graph.h)。
+
+### 4.3 第三步：调用 `AclrtLaunchCallback`，将回调安排到指定流
+
+包装完成后，调用继续沿下面的路径进入 Runtime：
 
 ```text
 torch_npu.npu._launch_host_func(stream, guarded, args)
@@ -402,18 +442,12 @@ torch_npu.npu._launch_host_func(stream, guarded, args)
 `aclrtLaunchHostFunc`。依据见 [C++ 绑定](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/npu/Graph.cpp)
 和 [底层提交](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/core/npu/NPUGraph.cpp)。
 
-`LaunchCallFunc` 是 C++ 与 Python 之间的桥接函数。CANN 接收这个 C++ 函数及其参数指针，
-等到需要执行回调时，再通过它调用 Python 的 `_update_weights_guarded(args)`。
-`PyFuncStruct` 保存 Python 函数和参数对象的引用，保持对象有效；这条登记路径不自动
-搬运参数中 Tensor 的内容。路由数据的 D2H 由项目中的显式 `copy_` 完成。
-引用管理见 [Graph.h](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/npu/Graph.h)。
-
 大写开头的 `AclrtLaunchCallback` 是 torch_npu 的封装，获取并缓存 CANN 接口函数地址后
 转发调用。真正的回调任务安排继续进入 CANN Runtime。
 实现见 [AclInterface.cpp](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/core/npu/interface/AclInterface.cpp)。
 
-提交接口不以业务回调执行完毕为返回条件。CPU 可以继续组织后面的任务，
-但指定流的后续设备任务必须等待阻塞式回调完成。对应当前层按需加载路径：
+`stream` 决定回调放在哪条流上，从而确定其前序任务；`ACL_CALLBACK_BLOCK` 要求该流
+后续任务等待回调完成。提交接口本身不以业务回调执行完毕为返回条件：
 
 ```text
 CPU 安排顺序：提交路由回传 → 安排回调 → 提交映射写回
@@ -423,7 +457,7 @@ CPU 安排顺序：提交路由回传 → 安排回调 → 提交映射写回
 因此，“异步提交”和“阻塞后续设备任务”同时成立。这里的阻塞不直接作用于所有设备流。
 若换成不阻塞后续任务的机制，必须另行保证权重和映射就绪，否则映射写回可能读取旧内容。
 
-### 4.2 Runtime 为设备安排通知与等待任务
+### 4.4 第四步：Runtime 为设备安排通知 CPU 和等待 CPU 的任务
 
 相关流在使用回调前，已通过 `_subscribe_report(stream)` 与报告线程建立订阅关系。
 torch_npu 按需创建常驻报告线程，设置设备上下文，随后循环调用 `aclrtProcessReport`。
@@ -452,8 +486,9 @@ SQE 是交给设备调度系统的任务描述，其中携带 Event 编号、流
 因此不能进一步认定硬件采用某种轮询频率或由一个 AIV 核持续读标志。
 任务编码见 [event_task_v100.cc](https://github.com/hicann/runtime/blob/c9dda362ac0fbe2507d1357b6341df186facd2f9/src/runtime/core/src/task/task_info/event/event_task_v100.cc)。
 
-### 4.3 设备到达回调节点，驱动唤醒报告线程
+### 4.5 第五步：NPU 执行到回调任务，通知 CPU 报告线程
 
+前四步介绍 CPU 如何安排任务，从这里开始跟随设备的实际执行过程。
 设备按依赖执行前面的路由回传，到达回调通知任务后，产生回调报告。
 报告携带识别和执行该回调所需的信息，包括函数地址、参数地址以及流、任务等信息。
 执行时机由设备到达任务节点决定，CPU 不需要检查路由 Tensor 来猜测何时开始回调。
@@ -490,7 +525,7 @@ Runtime 再调用 `halCqReportGet` 获取报告缓冲区地址和数量。
 实现见 [报告接收与获取](https://github.com/hicann/driver/blob/master/src/ascend_hal/trs/core/trs_sqcq.c)
 和 [回调事件转换](https://github.com/hicann/driver/blob/master/src/ascend_hal/trs/core/trs_cb_event.c)。
 
-### 4.4 报告线程进入 Python，执行权重更新
+### 4.6 第六步：报告线程执行 `LaunchCallFunc`，进入 `_update_weights`
 
 Runtime 从报告中取出函数与参数地址，在报告线程中调用 `LaunchCallFunc`。这个包装函数获取 GIL，
 构造 Python 调用参数，通过 `PyObject_CallObject` 调用 `_update_weights_guarded(args)`。
@@ -513,20 +548,41 @@ GIL 是常规 CPython 中线程执行 Python 所需的解释器锁；存在这�
 Python 回调开始前的报告处理与 GIL 获取、结束后的 C++ 清理，不完全包含在现有
 `host_callback` 的 Python MSTX 范围内。
 
-### 4.5 Runtime 返回完成通知，设备继续执行
+执行 `_update_weights` 期间，原计算流仍在等待回调完成，权重拷贝则在加载流上执行。
+其中 `_synchronize_h2d()` 是 CPU 等待加载完成，属于业务函数内部的等待，
+不能全部算成回调通知和线程调度的成本。
+
+### 4.7 第七步：CPU 回调结束，Runtime 向设备发送完成通知
 
 业务函数返回后，`LaunchCallFunc` 清理 Python 临时对象、释放获取的 GIL 状态，
 再返回报告处理逻辑。此时 Runtime 仍需完成设备侧通知。
 在上述 STARS 分支中，Runtime 填写包含流、任务和 Event 编号的完成命令，
 经 `SqCommandSend`、驱动 `halSqMsgSend` 发送。
-设备处理对应完成状态后，Event 等待条件满足，后续映射 H2D 和专家计算才能继续。
+这一步仍由报告线程执行 Runtime 代码；Runtime 是运行时库，不是另外一条固定线程。
 驱动接口见 [npu_driver_res.cc](https://github.com/hicann/runtime/blob/master/src/runtime/driver/npu_driver_res.cc)。
 
 因此，Python 回调返回、原生回调返回和后续设备任务开始，是不同的时间点。
 回调结束不会返回到一段被挂起的外层 Python `update_weights`；提交线程早已可以继续
 组织后续工作，设备侧通过已安排的等待依赖决定何时放行。
 
-### 4.6 捕获、重放与非图执行中的线程分工
+### 4.8 第八步：设备收到完成状态，原来的流继续执行
+
+设备处理完成通知后，对应 Event 的等待条件满足，第四步安排的等待任务才可以通过。
+随后执行 Event 重置和原本的后续任务：
+
+```text
+CPU 回调完成通知到达设备
+    → Event 等待通过
+    → Event 重置
+    → 更新后的 log2phy 映射 H2D
+    → 后续专家计算
+```
+
+这使得第一步提前提交的映射写回不会读取尚未更新好的内容。
+CPU 侧等待队列用于等待回调报告，设备侧 Event 用于阻止后续任务提前执行，
+两者分处交接的两端，不是同一个等待对象。
+
+#### 图重放中的完整时间线
 
 图捕获时，CPU 提交线程运行外层 `update_weights`，安排路由 D2H、登记回调节点，
 并安排映射 H2D。图重放时，这段外层 Python 不再逐行执行；提交线程提交图执行，
@@ -562,7 +618,7 @@ CPU 提交线程             CPU 报告线程                  NPU
 图中“等待报告”是 CPU 线程的内核等待队列机制，“Event 等待”是设备流的执行依赖，
 二者位于不同侧，不能视为同一个等待对象。
 
-### 4.7 区分交接开销与业务等待
+#### 时间线中的等待与开销
 
 | 位置 | 谁在等谁 | 本项目的意义 |
 | --- | --- | --- |
