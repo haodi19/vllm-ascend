@@ -638,6 +638,123 @@ CPU 提交线程             CPU 报告线程                  NPU
 不能将其整体当成交接成本。后续 AIV 与共享内存 polling 方案要比较的是通知、等待和
 恢复执行的机制成本，同时保留路由数据可见、权重加载完成及映射就绪的正确顺序。
 
+### 4.9 参考方案：vLLM-ascend-DSA 的任务标志与完成标志交互
+
+当前项目内的 `vLLM-ascend-DSA` 提供了另一种 CPU–NPU 交接方式：设备发布任务，
+Host 常驻线程轮询处理，完成后回写标志，设备检测到完成再继续。
+下面沿 raw-Hcomm token-gather 与 remote Attention 路径介绍。
+它处理的是 KV Cache 数据，尚未接入本项目的 MoE 卸载，也不是已验证的回调替代方案。
+
+这条路径包含三个角色：设备侧 Hcomm 代码发布搬运任务，Host 工作线程处理任务，
+设备侧 AIV 消费数据。AIV 是 NPU 上执行向量类计算的单元；这里的 AIV 代码属于
+Attention 算子，在读取远端搬来的 KV 前检查完成状态。
+
+#### 第一步：设备准备任务，发布提交标志
+
+每次任务使用一个序号 `generation`。以第 17 次任务为例，交接涉及两处存储：
+
+```text
+Host 内存中的任务槽：
+    generation       = 17    任务内容中的编号
+    commitGeneration = 17    该任务已发布，可以处理
+
+NPU 内存中的完成槽：
+    expectedGeneration = 17  本轮等待的编号
+    observedGeneration = 0   尚未收到本轮完成状态
+```
+
+设备先初始化完成槽，再准备搬运任务的内容，包括数据来源、目标位置和本轮编号。
+随后构造 Hcomm WRITE 操作，先发送任务内容，再发送 `commitGeneration`。
+Host 轮询的是发送到 Host 内存的任务槽；设备侧另有构造任务用的暂存数据，
+其中同名字段不能与 Host 轮询的那份混为一谈。
+
+这里的标志通过注册内存与通信地址交互，不是一个可以由双方任意访问的普通 Python 变量。
+序号用于区分不同轮次，还需要配合正确的发布顺序和槽位复用，避免读取旧任务。
+字段与发布代码见参考仓库中的
+`hcomm_kernel/raw_ub_hybrid_protocol.h`（`RawUbCompletionSlot` 等结构）和
+`hcomm_kernel/kvcache_scatter_copy_hcomm.cpp`（任务内容与提交序号的 WRITE 描述符）。
+
+#### 第二步：Host 常驻线程轮询并处理任务
+
+Host Mock Pool 中的 `PollCommands` 持续检查自己负责的任务槽：
+
+```text
+循环检查任务槽
+    → commitGeneration 非零
+    → 进入 ProcessCommand
+    → 确认 commitGeneration 与任务内容的 generation 匹配
+    → 按任务描述整理、搬运 KV 数据
+```
+
+这里是主动读取内存状态的 polling，不经过前文 `_launch_host_func` 的报告等待路径。
+线程由 Host Mock Pool 服务组织，不能与当前 MoE 进程的报告线程混为一谈。
+
+`--poll-threads` 配置轮询线程数，代码默认值为 1；`--poll-cpus` 可指定 CPU 绑定。
+多个轮询线程按编号分担槽位，例如两个线程时，线程 0 检查 0、2、4 等槽位，
+线程 1 检查 1、3、5 等槽位。它们是同类工作线程，发现任务后都会执行处理逻辑。
+另有 `--gather-threads` 配置数据整理工作线程，与轮询线程的职责不同。
+相关实现位于 `test/urma_mock_pool/urma_mock_pool.cpp` 的 `PollCommands`、
+`ProcessCommand` 和启动参数处理代码。
+
+#### 第三步：Host 完成数据传输，回写完成序号
+
+Host 整理数据、提交传输后，先通过 `PollJfc` 等待相关数据传输完成，
+再通过 URMA WRITE 将本轮序号写到 NPU 内存中的 `observedGeneration`。
+URMA 是这里使用的底层通信接口；完成标志的回写本身也是一次通信操作。
+
+```text
+整理 KV 数据 → 提交数据传输 → 确认传输完成
+    → 回写 observedGeneration = 17
+    → 确认完成标志写入结束 → 清理任务槽提交标志
+```
+
+这个顺序使完成状态代表数据已准备好，而不仅仅是 Host 开始处理或已经提交了传输。
+代码仍在 `ProcessCommand` 中，数据传输完成后构造独立的 `completionWrite`，
+再清理 `commitGeneration`。
+
+#### 第四步：设备检查完成状态，继续消费数据
+
+同一次 Host 完成等待可以放在不同阶段。在 Hcomm kernel 中，代码通过
+`commandEntryCount != 0 && !deferCompletion` 决定是否等待：
+
+- 不延后等待：Hcomm kernel 读取完成序号，匹配本轮编号后再继续。
+- 延后到 Attention：当 `localOnly == 0`、`tokenLayout` 成立、`scatterAfterGather == 0`
+  且 `deferCompletionToAttention != 0` 时，跳过这里的完成等待，由后续 AIV 消费阶段检查。
+
+延后路径中的 `WaitRemoteReady` 反复将完成槽从设备全局内存读入算子本地缓冲区，
+执行流水屏障，再检查期望编号非零且完成编号与期望编号相等。
+条件满足后，才读取远端搬来的 KV 并继续 Attention。
+这是明确写在算子中的轮询循环，与前文由 Runtime 下发的专用 `EVENT_WAIT` 任务不同。
+实现位于参考仓库的
+`csrc/src/a5_sparse_and_tail_attention_and_remote_scatter_copy/op_kernel/a5_sfa/arch35/sparse_flash_attention_service_vector_mla.h`
+中的 `WaitRemoteReady` 和 `CopyInSingleRemoteKv`。
+
+上述分支将这次完成等待从 Hcomm 阶段移到 AIV 消费阶段，并不意味着程序中其他传输同步
+也被取消。两个阶段都在 NPU 设备侧；下面将它们放在同一列，时间从上向下：
+
+```text
+NPU 设备侧                                  Host CPU 侧
+    │                                            │
+Hcomm 代码准备任务                               │
+发送任务内容、commitGeneration ───────────→ 轮询发现新任务
+    │                                      检查本轮编号
+    │                                      整理 KV、提交传输
+AIV 到达数据消费位置                        等待数据传输完成
+读取 observed/expected                          │
+不匹配则继续读取 ←──────────────────────── 回写完成序号
+编号匹配后读取 KV                          清理任务槽
+继续 Attention                             继续轮询
+```
+
+#### 与本项目 MoE 卸载的对应关系
+
+这套方案可供借鉴的是交接协议：把“路由准备好”对应为任务发布，把 CPU 专家管理工作
+对应为 Host 任务处理，再由明确的完成状态放行设备后续计算。
+它替换的是通知和等待机制，不会自动消除 LRC 计算、权重传输或映射更新。
+迁移时必须明确完成标志代表 CPU 规划结束还是权重与映射已经就绪，
+并重新核对共享状态、内存可见性、设备资源和跨流依赖。
+参考代码中的 KV 布局、Hcomm/URMA 通信和 Host 服务组织不能直接套用到 MoE。
+
 ## 5. 预取：提前做可能会需要的加载
 
 ### 5.1 目标和限制
