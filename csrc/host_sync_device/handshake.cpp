@@ -105,3 +105,51 @@ extern "C" void host_sync_publish_launch(void* stream, void* request, void* stat
 extern "C" void host_sync_wait_launch(void* stream, void* completion, void* state, uint64_t maxPolls) {
   host_sync_wait<<<1, nullptr, stream>>>(completion, state, maxPolls);
 }
+
+// Stage 5 consumer: check the handshake before consuming newly copied data.
+// Output is [first_weight + mapping + route, last_weight, mapping, route].
+extern "C" __global__ __aicore__ void host_sync_consume(GM_ADDR weights, GM_ADDR mapping, GM_ADDR route, GM_ADDR state,
+                                                        GM_ADDR output, uint64_t count, uint64_t requireSuccess) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  TPipe pipe;
+  TBuf<TPosition::VECCALC> scratch;
+  pipe.InitBuffer(scratch, kBufferBytes);
+  auto local = scratch.Get<uint8_t>();
+  auto words = local.ReinterpretCast<uint64_t>();
+  GlobalTensor<uint8_t> weightGm, mappingGm, routeGm, stateGm, outputGm;
+  weightGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(weights));
+  mappingGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(mapping));
+  routeGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(route));
+  stateGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(state));
+  outputGm.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(output));
+  weightGm.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+  mappingGm.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+  routeGm.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+  stateGm.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+  if (requireSuccess != 0) {
+    Read(local, stateGm);
+    if (words.GetValue(1) != kSuccess) {
+      for (uint32_t i = 0; i < 4; ++i) words.SetValue(i, 0);
+      Write(outputGm, local, kBufferBytes);
+      return;
+    }
+  }
+  Read(local, routeGm);
+  const uint64_t routeValue = words.GetValue(0);
+  Read(local, mappingGm);
+  const uint64_t mappingValue = words.GetValue(0);
+  Read(local, weightGm);
+  const uint64_t first = words.GetValue(0);
+  Read(local, weightGm[(count - 4) * kGenerationBytes]);
+  const uint64_t last = words.GetValue(3);
+  words.SetValue(0, first + mappingValue + routeValue);
+  words.SetValue(1, last);
+  words.SetValue(2, mappingValue);
+  words.SetValue(3, routeValue);
+  Write(outputGm, local, kBufferBytes);
+}
+
+extern "C" void host_sync_consume_launch(void* stream, void* weights, void* mapping, void* route, void* state,
+                                         void* output, uint64_t count, uint64_t requireSuccess) {
+  host_sync_consume<<<1, nullptr, stream>>>(weights, mapping, route, state, output, count, requireSuccess);
+}

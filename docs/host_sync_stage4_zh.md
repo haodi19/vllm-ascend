@@ -31,10 +31,14 @@ CPU 算法变快；两组执行的是相同计数逻辑。
 两组 profile 均导出了文件，但首次采集有 `Stop profiler while current state is RECORD`
 警告，原脚本的 PASS 仅检查文件存在，不能据此认定采集完整。
 已改为明确的采集 schedule 并逐轮调用 `step()`，在预定窗口结束后导出，再停止 profiler；
-同时检查 trace 中回调与重放 MSTX 区间数量是否等于采集次数。此修复尚待绿区验证。
+同时检查 trace 中回调与重放 MSTX 区间数量是否等于采集次数。
+补采已在绿区验证通过：callback 和 MTE 各有 5 个回调区间、5 个重放等待区间，
+采集状态警告消失，两个 trace 均导出成功。本次使用 `--only profile`，没有更新计时数据。
+对应目录为 `moe_profile/host_sync_stage4/run_16e99a957ba94c12a5e69b0125f72259`。
 
 后续依次验证真实 D2H 路由数据、CPU 线程中的 H2D 提交与完成等待、映射写回及消费顺序，
 再以可选后端接入 MoE，并用原推理配置比较正确性和时延。
+数据流验证脚本见[第五阶段说明](host_sync_stage5_zh.md)。
 
 ## 两组实验
 
