@@ -7,12 +7,58 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import make_dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
 class MoeHostSyncTests(unittest.TestCase):
+    def quant_task(self):
+        class Storage(bytearray):
+            def nbytes(self):
+                return len(self)
+
+        def tensor(device, offset):
+            return SimpleNamespace(
+                device=SimpleNamespace(type=device),
+                dtype="float32",
+                shape=(2,),
+                is_contiguous=lambda: True,
+                numel=lambda: 2,
+                element_size=lambda: 4,
+                storage_offset=lambda: offset,
+                untyped_storage=lambda: Storage(range(32)),
+            )
+
+        task_type = make_dataclass("Task", ["source", "destination", "nbytes", "name", "non_blocking"])
+        return task_type(tensor("cpu", 1), tensor("npu", 3), 8, "scale", True)
+
+    def test_quant_storage_copy_preserves_byte_offsets_and_size(self):
+        task = self.quant_task()
+        converted = self.module.storage_quant_copy(task, lambda tensor: 2)
+        self.assertEqual(converted.source, bytearray(range(4, 12)))
+        self.assertEqual(converted.destination, bytearray(range(12, 20)))
+        self.assertEqual(converted.nbytes, 8)
+        self.assertTrue(converted.non_blocking)
+        self.assertEqual(task.source.dtype, "float32")
+
+    def test_quant_storage_copy_rejects_unsafe_layout_or_conversion(self):
+        for mode in ("dtype", "shape", "stride", "format", "bytes", "bounds"):
+            task = self.quant_task()
+            if mode == "dtype":
+                task.destination.dtype = "float16"
+            elif mode == "shape":
+                task.destination.shape = (1, 2)
+            elif mode == "stride":
+                task.destination.is_contiguous = lambda: False
+            elif mode == "bytes":
+                task.nbytes = 4
+            elif mode == "bounds":
+                task.destination.storage_offset = lambda: 8
+            with self.subTest(mode=mode), self.assertRaises(RuntimeError):
+                self.module.storage_quant_copy(task, lambda tensor, mode=mode: 29 if mode == "format" else 2)
+
     @classmethod
     def setUpClass(cls):
         cls.root = Path(__file__).resolve().parents[3]

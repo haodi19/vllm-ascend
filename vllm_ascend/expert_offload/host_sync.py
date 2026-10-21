@@ -8,7 +8,37 @@ import sys
 import threading
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
+
+
+def storage_quant_copy(task, get_format):
+    """Byte-preserving copy for dense ND quantization tensors on MTE path."""
+    source, destination = task.source, task.destination
+    if (
+        source.device.type != "cpu"
+        or destination.device.type != "npu"
+        or source.dtype != destination.dtype
+        or tuple(source.shape) != tuple(destination.shape)
+        or not source.is_contiguous()
+        or not destination.is_contiguous()
+        or get_format(destination) != 2
+        or source.numel() * source.element_size() != task.nbytes
+        or destination.numel() * destination.element_size() != task.nbytes
+    ):
+        raise RuntimeError(
+            f"MTE quant storage copy requires matching dtype/shape, contiguous CPU->NPU ND tensors: "
+            f"{task.name}; src_dtype={source.dtype}; dst_dtype={destination.dtype}"
+        )
+
+    def byte_view(tensor):
+        start = tensor.storage_offset() * tensor.element_size()
+        storage = tensor.untyped_storage()
+        if start + task.nbytes > storage.nbytes():
+            raise RuntimeError(f"MTE quant storage copy exceeds storage: {task.name}")
+        return storage[start : start + task.nbytes]
+
+    return replace(task, source=byte_view(source), destination=byte_view(destination))
 
 
 def create_offload_load_stream(npu, backend):

@@ -2431,12 +2431,16 @@ class ExpertOffloadManager:
                     nbytes = dst.numel() * dst.element_size()
                 else:
                     continue
-                tasks.append(H2DCopyTask(
+                task = H2DCopyTask(
                     source=source,
                     destination=dst,
                     nbytes=nbytes,
                     name=f"{attr_name}[L{layer_idx},E{eid}->S{slot}]",
-                ))
+                )
+                if getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte':
+                    from vllm_ascend.expert_offload.host_sync import storage_quant_copy
+                    task = storage_quant_copy(task, torch_npu.get_npu_format)
+                tasks.append(task)
         return tasks
 
     def _copy_quant_attrs_into_slot(self, layer, layer_idx, eid, slot):

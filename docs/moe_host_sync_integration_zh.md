@@ -50,6 +50,17 @@ python -B script/run_moe_host_sync.py --npu 1 --backend mte --diagnose-load-stag
 日志由摘要保留，不包含权重内容。该模式改变任务重叠，只用于定位，不能比较性能。
 默认关闭，不改变原 callback 路径。若失败，继续返回 summary.txt；若通过，也要关闭诊断后再验证。
 
+第四轮分阶段结果：第 0 层加载与刷新全部完成；第 1 层预取中已有流任务完成，
+8 MiB 的 w13 和 4 MiB 的 w2 拷贝也完成，随后 512 KiB 的 w13_weight_scale
+打印 SUBMITTED 但没有 COMPLETE。未进入该批次的 scale_refresh，故本次阻塞点
+在量化参数 Tensor 拷贝的完成等待，不能归因于后续刷新。
+
+本轮仅对 MTE 后端的量化参数拷贝改用 Storage 字节视图，与大权重的拷贝方式一致。
+严格要求 CPU→NPU、相同 dtype/shape、连续内存、目标为 ND 格式、字节数匹配且不越界；
+视图包含 storage_offset，避免写错专家槽位。条件不满足直接报错，不进行隐式布局或类型转换。
+默认 callback 仍使用原 Tensor 拷贝。此修改尝试绕开 Tensor copy 的额外处理，
+尚不能据此断言底层死锁机制，仍需用上述诊断命令确认量化参数拷贝能否完成。
+
 ## 接入位置与执行流程
 
 原来的 `host_sync_backend=callback` 是默认路径，继续使用 `_launch_host_func`。
