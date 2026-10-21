@@ -73,7 +73,12 @@ python -B script/run_host_sync_stage2.py --npu 1
 python -B script/run_host_sync_stage2.py --npu 1 --cann-root /usr/local/Ascend/cann-9.1.0
 ```
 
-使用现有 CANN 中的编译器与 `ascendc.cmake`，目标为 `ascend950`。
+使用现有 CANN 中的编译器与 `ascendc.cmake`。`SOC_VERSION` 默认使用已确认的具体
+型号 `ascend950pr_9579`，`ASCEND_COMPUTE_UNIT` 使用架构名 `ascend950`，两者不能混用。
+其他 Ascend950 型号可用 `--soc-version` 指定具体名称，并需在当前 CANN 支持列表中。
+首次绿区第二阶段测试通过 18 项 Host 单测与 3 项结果校验，但因把架构名误作
+`SOC_VERSION` 而停在 CMake 配置；已修正，真实 NPU 交接仍待验证。
+本次修复直接重新执行上述命令，不加 `--skip-build`，脚本会覆盖旧缓存中的型号参数。
 算子编译产物保存在 `build/host_sync_device_stage2`，不修改 CANN 安装目录。
 未修改代码且已经成功构建时，可以加 `--skip-build`。
 

@@ -3,15 +3,28 @@
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
 from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, positive_number, run_step
 
 
+def soc_version(value):
+    value = value.lower()
+    if not re.fullmatch(r"ascend950(?:pr|dt)_[a-z0-9]+", value):
+        raise argparse.ArgumentTypeError("Use a concrete SoC, e.g. ascend950pr_9579, not ascend950")
+    return value
+
+
+def target_cmake_args(soc):
+    return [f"-DSOC_VERSION={soc_version(soc)}", "-DASCEND_COMPUTE_UNIT=ascend950"]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number, default=0)
+    parser.add_argument("--soc-version", type=soc_version, default="ascend950pr_9579")
     parser.add_argument("--cann-root", type=Path, default=Path("/usr/local/Ascend/ascend-toolkit/latest"))
     parser.add_argument("--build-dir", type=Path, default=REPOSITORY_ROOT / "build/host_sync_device_stage2")
     parser.add_argument("--skip-build", action="store_true")
@@ -26,6 +39,7 @@ def main():
         parser.error("Stage 2 build/device tests require Linux + Ascend CANN")
     print("=== HOST SYNC STAGE 2: isolated eager MTE handshake ===", flush=True)
     print("No MoE integration, OPP installation, graph replay or performance comparison.", flush=True)
+    print(f"Build target: SOC_VERSION={args.soc_version}; ASCEND_COMPUTE_UNIT=ascend950", flush=True)
     prefix = [sys.executable, "-u", "-B"]
     stage1 = [*prefix, str(REPOSITORY_ROOT / "script/run_host_sync_stage1.py"), "--cpu-only"]
     if args.skip_build:
@@ -50,8 +64,7 @@ def main():
             "-B",
             str(build),
             f"-DASCEND_CANN_PACKAGE_PATH={args.cann_root.resolve()}",
-            "-DSOC_VERSION=ascend950",
-            "-DASCEND_COMPUTE_UNIT=ascend950",
+            *target_cmake_args(args.soc_version),
             "-DCMAKE_BUILD_TYPE=Release",
         ]
         if not run_step("configure isolated AscendC kernels", configure, args.build_timeout):
