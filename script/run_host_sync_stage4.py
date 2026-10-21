@@ -49,6 +49,7 @@ def capture_step(label, command, timeout, env):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number, default=0)
+    parser.add_argument("--only", choices=("all", "profile"), default="all")
     parser.add_argument("--soc-version", type=soc_version, default="ascend950pr_9579")
     parser.add_argument("--cann-root", type=Path, default=Path("/usr/local/Ascend/ascend-toolkit/latest"))
     parser.add_argument("--build-dir", type=Path)
@@ -133,7 +134,7 @@ def main(argv=None):
         return result
 
     results = []
-    for repeat in range(args.repeats):
+    for repeat in range(args.repeats if args.only == "all" else 0):
         order = ("callback", "mte") if repeat % 2 == 0 else ("mte", "callback")
         for backend in order:
             success, text = capture_step(
@@ -149,14 +150,15 @@ def main(argv=None):
             if len(records) != 1 or records[0]["backend"] != backend:
                 raise RuntimeError("Missing or mismatched benchmark result")
             results.extend(records)
-    print("COMPARISON " + json.dumps(compare_results(results)), flush=True)
-    print("These are complete mechanism measurements, not pure CPU/NPU synchronization overhead.", flush=True)
+    if results:
+        print("COMPARISON " + json.dumps(compare_results(results)), flush=True)
+        print("These are complete mechanism measurements, not pure CPU/NPU synchronization overhead.", flush=True)
     profile_status = {}
     for backend in ("callback", "mte"):
         success, _ = capture_step(f"separate profile: {backend}", command(backend, True), args.profile_timeout, env)
         profile_status[backend] = "PASS" if success else "INCOMPLETE"
     print("\n=== STAGE 4 SUMMARY ===", flush=True)
-    print("Unprofiled timing and callback counts: PASS", flush=True)
+    print("Unprofiled timing: " + ("PASS" if results else "NOT RUN (--only profile)"), flush=True)
     print("PROFILE STATUS " + json.dumps(profile_status), flush=True)
     print(f"Profile root: {profile_root}", flush=True)
     print("MoE integration / inference speedup / pure synchronization cost: NOT ESTABLISHED", flush=True)

@@ -28,6 +28,30 @@ def summarize(values):
     }
 
 
+def inspect_profile(path, backend, rounds):
+    labels = {key: f"host_sync/{backend}/{key}" for key in ("callback_body", "replay_and_wait")}
+    counts = dict.fromkeys(labels, 0)
+    traces = list(path.rglob("trace_view.json"))
+    for trace in traces:
+        data = json.loads(trace.read_text(encoding="utf-8"))
+        events = data.get("traceEvents", []) if isinstance(data, dict) else data
+        for event in events:
+            if event.get("ph") not in ("X", "B", "b"):
+                continue
+            for key, label in labels.items():
+                if label == event.get("name"):
+                    counts[key] += 1
+    result = {
+        "backend": backend,
+        "trace_files": [str(p) for p in traces],
+        "mstx_ranges": counts,
+        "expected_ranges": rounds,
+    }
+    if not traces or any(count != rounds for count in counts.values()):
+        raise RuntimeError("Profile content validation failed: " + json.dumps(result))
+    return result
+
+
 def run(args):
     # Keep CLI and statistics checks independent of NPU libraries.
     import torch
@@ -111,6 +135,7 @@ def run(args):
     if args.profile_dir:
         args.profile_dir.mkdir(parents=True, exist_ok=True)
         profiler = torch_npu.profiler.profile(
+            schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=args.rounds, repeat=1),
             activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
             record_shapes=False,
             profile_memory=False,
@@ -122,6 +147,9 @@ def run(args):
             ),
         )
         profiler.start()
+        # Advance the profiler's preparation step before the measured workload.
+        # The graph itself was already warmed up outside the profiler.
+        profiler.step()
         profile_active = True
 
     start = torch.npu.Event(enable_timing=True)
@@ -131,7 +159,7 @@ def run(args):
     end.synchronize()
     event_times, wall_times = [], []
     timing_active = profiler is None
-    for _ in range(args.rounds):
+    for sample in range(args.rounds):
         mark = torch_npu.npu.mstx.range_start(f"host_sync/{args.backend}/replay_and_wait") if profile_active else None
         start.record(stream)
         began = time.perf_counter_ns()
@@ -147,10 +175,13 @@ def run(args):
         wall_times.append(elapsed)
         expected += 1
         validate(expected)
+        if profiler is not None:
+            if sample == args.rounds - 1:
+                print("PROFILE_WORKLOAD_PASS: all callbacks/results verified; starting scheduled export.", flush=True)
+            profiler.step()
     timing_active = False
     profile_active = False
     if profiler is not None:
-        print("PROFILE_WORKLOAD_PASS: all callbacks/results verified; starting profiler export.", flush=True)
         profiler.stop()
 
     stream.synchronize()
@@ -183,10 +214,7 @@ def run(args):
             flush=True,
         )
     else:
-        traces = [str(p) for p in args.profile_dir.rglob("trace_view.json")]
-        if not traces:
-            raise RuntimeError(f"Profiler returned but trace_view.json missing under {args.profile_dir}")
-        print("PROFILE_RESULT " + json.dumps({"backend": args.backend, "trace_files": traces}), flush=True)
+        print("PROFILE_RESULT " + json.dumps(inspect_profile(args.profile_dir, args.backend, args.rounds)), flush=True)
 
 
 def main():

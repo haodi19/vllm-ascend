@@ -7,6 +7,7 @@ import io
 import json
 import runpy
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -20,6 +21,7 @@ class BenchmarkTests(unittest.TestCase):
             bench = runpy.run_path(str(scripts / "host_sync_benchmark.py"))
             runner = runpy.run_path(str(scripts / "run_host_sync_stage4.py"))
         cls.summarize = staticmethod(bench["summarize"])
+        cls.inspect_profile = staticmethod(bench["inspect_profile"])
         cls.compare = staticmethod(runner["compare_results"])
         cls.runner = staticmethod(runner["main"])
 
@@ -68,7 +70,7 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.compare(records)
 
-    def run_mock_runner(self, steps):
+    def run_mock_runner(self, steps, extra_args=()):
         capture = Mock(side_effect=steps)
         output = io.StringIO()
         with (
@@ -81,7 +83,7 @@ class BenchmarkTests(unittest.TestCase):
             patch.object(sys, "platform", "linux"),
             contextlib.redirect_stdout(output),
         ):
-            result = self.runner(["--npu", "4"])
+            result = self.runner(["--npu", "4", *extra_args])
         return result, capture, output.getvalue()
 
     def test_profile_failure_preserves_comparison_and_runs_other_profile(self):
@@ -101,6 +103,40 @@ class BenchmarkTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertEqual(capture.call_count, 1)
         self.assertNotIn("COMPARISON ", output)
+
+    def test_profile_only_does_not_generate_timing_results(self):
+        result, capture, output = self.run_mock_runner([(True, "ok"), (True, "ok")], ("--only", "profile"))
+        self.assertEqual(result, 0)
+        self.assertEqual(capture.call_count, 2)
+        self.assertNotIn("COMPARISON ", output)
+        self.assertIn("NOT RUN (--only profile)", output)
+        for invocation in capture.call_args_list:
+            self.assertIn("--profile-dir", invocation.args[1])
+
+    def test_profile_requires_expected_mstx_ranges_not_just_a_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = root / "trace_view.json"
+            trace.write_text('{"traceEvents": []}', encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                self.inspect_profile(root, "mte", 1)
+            events = [{"ph": "X", "name": f"host_sync/mte/{label}"} for label in ("callback_body", "replay_and_wait")]
+            trace.write_text(json.dumps({"traceEvents": events}), encoding="utf-8")
+            result = self.inspect_profile(root, "mte", 1)
+            self.assertEqual(result["mstx_ranges"], {"callback_body": 1, "replay_and_wait": 1})
+            with self.assertRaises(RuntimeError):
+                self.inspect_profile(root, "mte", 2)
+
+    def test_profile_end_events_are_not_counted_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            events = [
+                {"ph": phase, "name": f"host_sync/callback/{label}"}
+                for label in ("callback_body", "replay_and_wait")
+                for phase in ("B", "E")
+            ]
+            (root / "trace_view.json").write_text(json.dumps(events), encoding="utf-8")
+            self.assertEqual(self.inspect_profile(root, "callback", 1)["expected_ranges"], 1)
 
 
 if __name__ == "__main__":
