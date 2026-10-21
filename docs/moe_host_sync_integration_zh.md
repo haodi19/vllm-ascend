@@ -9,6 +9,17 @@
 本轮已完成可选后端接入代码，尚待绿区验证实际模型。此前结果只证明独立数据流正确，
 不能代替真实模型的正确性和性能结论。
 
+首轮真实模型结果：callback 组完成 3 次测量，510 次卸载回调无错误，请求均值约 3349 ms；
+停止 profiler 超时，profile 标记为不完整。MTE 组服务启动成功，但首个预热请求中
+`slot=2 generation=1` 超过 120 秒仍未完成，保护机制终止引擎。这不是性能对比成功，
+也不能由该日志确定是权重拷贝还是流等待卡住。
+
+针对这个接入问题，MTE 后端在未完成请求持续约 10 秒时输出一次槽位状态、活动回调
+及工作线程/主线程 Python 栈，不读取 NPU tensor，也不执行额外设备同步。
+诊断块会保留在 `summary.txt`，不再被后续 HTTP 错误堆栈挤出摘要。
+下一轮可只执行 `python -B script/run_moe_host_sync.py --npu 1 --backend mte`，
+继续真实模型联调，不需要重跑 callback 基线。
+
 ## 接入位置与执行流程
 
 原来的 `host_sync_backend=callback` 是默认路径，继续使用 `_launch_host_func`。

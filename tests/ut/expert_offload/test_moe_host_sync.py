@@ -57,6 +57,7 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.alias, obj.stride, obj.done_offset, obj.state_base = 10000, 1024, 512, 20000
         obj.publish, obj.wait = Mock(), Mock()
         obj.manager, obj.completed = SimpleNamespace(_cb_failures=0), 0
+        obj.active_callback = None
         return obj
 
     def test_capture_slots_and_submission_order(self):
@@ -121,6 +122,39 @@ class MoeHostSyncTests(unittest.TestCase):
             obj._watch()
         obj._fatal.assert_called_once()
         self.assertIn("exceeded", obj._fatal.call_args.args[0])
+
+    def test_stall_diagnostics_once_before_fatal_timeout(self):
+        obj = self.dispatcher()
+        obj.next_slot = 2
+        obj.stopping = Mock()
+        obj.stopping.wait.side_effect = [False, False, False, True]
+        obj.session = Mock()
+        obj.session.snapshot.return_value = {"request_generation": 1, "done_generation": 0, "error_generation": 0}
+        obj._dump_stall, obj._fatal = Mock(), Mock()
+        with patch.object(self.module.time, "monotonic", side_effect=[0, 11, 12]):
+            obj._watch()
+        obj._dump_stall.assert_called_once_with(1, obj.session.snapshot.return_value)
+        obj._fatal.assert_not_called()
+
+    def test_diagnostic_includes_worker_stack_without_device_queries(self):
+        obj = self.dispatcher()
+        obj.entries[1] = (lambda args: None, (None, None, None, 7))
+        obj.next_slot = 2
+        obj.session = Mock()
+        with patch("builtins.print") as output:
+            obj._dump_stall(1, {"request_generation": 1})
+        text = output.call_args.args[0]
+        self.assertIn("DIAGNOSTIC BEGIN", text)
+        self.assertIn("layer=7", text)
+        self.assertIn("Python thread=", text)
+        obj.publish.assert_not_called()
+        obj.wait.assert_not_called()
+
+    def test_error_summary_keeps_diagnostic_before_shutdown_tail(self):
+        block = "[MOE-MTE DIAGNOSTIC BEGIN]\nworker stack\n[MOE-MTE DIAGNOSTIC END]\n"
+        result = self.runner.failure_excerpt(block + "shutdown noise\n" * 100)
+        self.assertIn("worker stack", result)
+        self.assertEqual(result.count("shutdown noise"), 70)
 
     def test_close_synchronizes_before_releasing_lease(self):
         obj = self.dispatcher()

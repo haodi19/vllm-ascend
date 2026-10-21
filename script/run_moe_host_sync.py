@@ -32,6 +32,21 @@ def configured_source(source, backend, library):
     return source[: start.start()] + shlex.join(words) + "\n"
 
 
+def failure_excerpt(text):
+    """Retain first-cause diagnostics even after HTTP shutdown floods the tail."""
+    lines = text.splitlines()
+    selected = set(range(max(0, len(lines) - 70), len(lines)))
+    inside = False
+    for index, line in enumerate(lines):
+        if "[MOE-MTE DIAGNOSTIC BEGIN]" in line:
+            inside = True
+        if inside or "[MOE-MTE" in line:
+            selected.add(index)
+        if "[MOE-MTE DIAGNOSTIC END]" in line:
+            inside = False
+    return "\n".join(lines[index] for index in sorted(selected))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number, required=True)
@@ -63,8 +78,7 @@ def main():
             print(f"FAILED: {type(exc).__name__}: {exc}", flush=True)
             for log in root.glob("*/inference_python.log"):
                 print(
-                    f"SERVICE LOG TAIL: {log}\n"
-                    + "\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-70:]),
+                    f"SERVICE LOG TAIL: {log}\n" + failure_excerpt(log.read_text(encoding="utf-8", errors="replace")),
                     flush=True,
                 )
             return 1

@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 
@@ -36,6 +37,7 @@ class MteHostDispatcher:
     STATE_BYTES = 32
     STALL_SECONDS = 120
     WARMUP_MAX_POLLS = 1000000
+    DIAGNOSTIC_SECONDS = 10
 
     def __init__(self, manager, library_path):
         # Optional runtime dependencies are loaded only for the opt-in backend.
@@ -59,6 +61,7 @@ class MteHostDispatcher:
         self.entries = [None] * self.SLOT_CAPACITY
         self.next_slot = 1
         self.completed = 0
+        self.active_callback = None
         self.closed = False
         self.stopping = threading.Event()
         self.states = torch.zeros((self.SLOT_CAPACITY, 4), dtype=torch.int64, device="npu")
@@ -99,6 +102,7 @@ class MteHostDispatcher:
 
     def _run(self, slot):
         try:
+            self.active_callback = (slot, threading.get_ident())
             fn, args = self.entries[slot]
             failures = getattr(self.manager, "_cb_failures", 0)
             fn(args)
@@ -110,6 +114,41 @@ class MteHostDispatcher:
                     print("[MOE-MTE] first real offload callback completed", flush=True)
         except BaseException as exc:
             self._fatal(f"slot={slot}: {type(exc).__name__}: {exc}")
+        finally:
+            self.active_callback = None
+
+    def _dump_stall(self, slot, state):
+        # Only on a stalled request, never on the normal callback hot path.
+        # Do not query NPU tensors or stream handles here: that could block
+        # the watchdog on the same device work it is trying to diagnose.
+        active = self.active_callback
+        lines = [
+            f"[MOE-MTE DIAGNOSTIC BEGIN] pending_slot={slot} state={state}",
+            f"active_callback={active}; completed={self.completed}; captured_slots={self.next_slot - 1}",
+        ]
+        for selected in sorted({slot, active[0] if active else slot}):
+            fn, args = self.entries[selected]
+            layer = args[3] if isinstance(args, tuple) and len(args) > 3 else "unknown"
+            lines.append(
+                f"slot={selected} callback={getattr(fn, '__name__', type(fn).__name__)} "
+                f"layer={layer} state={self.session.snapshot(selected)}"
+            )
+        frames = sys._current_frames()
+        # The active callback and Python main thread distinguish a worker
+        # blocked inside copy/sync from a request not yet picked up by worker.
+        ids = [active[1]] if active else []
+        main_id = threading.main_thread().ident
+        if main_id not in ids:
+            ids.append(main_id)
+        for ident in ids:
+            frame = frames.get(ident)
+            lines.append(f"Python thread={ident}; active_worker={bool(active and ident == active[1])}")
+            if frame is not None:
+                lines.extend(line.rstrip() for line in traceback.format_stack(frame, limit=24))
+            else:
+                lines.append("No Python frame available; native wait cannot be resolved from this snapshot.")
+        lines.append("[MOE-MTE DIAGNOSTIC END]")
+        print("\n".join(lines), file=sys.stderr, flush=True)
 
     def launch(self, stream, callback, args):
         if self.closed or self.next_slot >= self.SLOT_CAPACITY:
@@ -128,6 +167,7 @@ class MteHostDispatcher:
 
     def _watch(self):
         pending = {}
+        diagnosed = False
         while not self.stopping.wait(1):
             try:
                 now = time.monotonic()
@@ -144,6 +184,9 @@ class MteHostDispatcher:
                         pending[slot] = (generation, now)
                     elif now - previous[1] > self.STALL_SECONDS:
                         self._fatal(f"slot={slot} generation={generation} exceeded {self.STALL_SECONDS}s")
+                    elif not diagnosed and now - previous[1] > self.DIAGNOSTIC_SECONDS:
+                        self._dump_stall(slot, state)
+                        diagnosed = True
             except BaseException as exc:
                 self._fatal(f"watchdog failed: {exc}")
 
