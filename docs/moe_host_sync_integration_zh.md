@@ -61,6 +61,16 @@ python -B script/run_moe_host_sync.py --npu 1 --backend mte --diagnose-load-stag
 默认 callback 仍使用原 Tensor 拷贝。此修改尝试绕开 Tensor copy 的额外处理，
 尚不能据此断言底层死锁机制，仍需用上述诊断命令确认量化参数拷贝能否完成。
 
+第五轮在模型初始化阶段退出，未执行预热；旧摘要只保留了 API Server 的外层异常，
+没有保留 EngineCore 根因，因此不能确认是否由新增布局校验触发。
+摘要提取现已保留初始化 traceback，也可直接读取已有日志，无须重跑模型：
+
+```bash
+python -B script/run_moe_host_sync.py --read-log bench_results/moe_host_sync_db462862/mte/inference_python.log
+```
+
+此入口只向控制台输出既有日志中的诊断信息，不构建、不启动服务、不生成结果文件。
+
 ## 接入位置与执行流程
 
 原来的 `host_sync_backend=callback` 是默认路径，继续使用 `_launch_host_func`。

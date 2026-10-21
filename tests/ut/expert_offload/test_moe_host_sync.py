@@ -3,6 +3,7 @@
 
 import ast
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -270,6 +271,29 @@ class MoeHostSyncTests(unittest.TestCase):
         result = self.runner.failure_excerpt(block + "shutdown noise\n" * 100)
         self.assertIn("worker stack", result)
         self.assertEqual(result.count("shutdown noise"), 70)
+
+    def test_error_summary_keeps_engine_startup_root_before_statistics(self):
+        text = (
+            "(EngineCore pid=1) Traceback (most recent call last):\n"
+            "(EngineCore pid=1) RuntimeError: invalid tensor layout\n"
+            + "final statistics\n" * 180
+            + "(APIServer) engine initialization failed\n"
+        )
+        self.assertIn("invalid tensor layout", self.runner.failure_excerpt(text))
+
+    def test_read_existing_log_does_not_launch_or_build(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "service.log"
+            path.write_text("RuntimeError: saved failure", encoding="utf-8")
+            with (
+                patch.object(sys, "argv", ["run_moe_host_sync.py", "--read-log", str(path)]),
+                patch.object(self.runner, "run") as run,
+                patch("sys.stdout", new_callable=io.StringIO) as output,
+            ):
+                self.assertEqual(self.runner.main(), 0)
+                self.assertIn("saved failure", output.getvalue())
+                run.assert_not_called()
+            self.assertEqual(list(Path(directory).iterdir()), [path])
 
     def test_close_synchronizes_before_releasing_lease(self):
         obj = self.dispatcher()

@@ -46,12 +46,22 @@ def failure_excerpt(text):
             selected.add(index)
         if "[MOE-MTE DIAGNOSTIC END]" in line:
             inside = False
+    # Startup failures precede final statistics and API-server tracebacks.
+    # Preserve the first engine/native traceback windows, not only shutdown.
+    roots = [
+        index
+        for index, line in enumerate(lines)
+        if ("Traceback (most recent call last)" in line and "APIServer" not in line) or "MTE quant storage copy" in line
+    ]
+    for index in roots[:6]:
+        selected.update(range(max(0, index - 8), min(len(lines), index + 120)))
     return "\n".join(lines[index] for index in sorted(selected))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--npu", type=npu_number, required=True)
+    parser.add_argument("--npu", type=npu_number)
+    parser.add_argument("--read-log", type=Path, help="Print existing log diagnostics only; no build or model startup")
     parser.add_argument("--backend", choices=("both", "callback", "mte"), default="both")
     parser.add_argument(
         "--diagnose-load-stages",
@@ -68,6 +78,12 @@ def main():
     parser.add_argument("--timing-port", type=int, default=18155)
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
+    if args.read_log is not None:
+        print(f"READ-ONLY SERVICE LOG: {args.read_log}", flush=True)
+        print(failure_excerpt(args.read_log.read_text(encoding="utf-8", errors="replace")), flush=True)
+        return 0
+    if args.npu is None:
+        parser.error("--npu is required for inference")
     if sys.platform != "linux":
         parser.error("Run inside the Linux NPU container")
     if min(args.requests, args.warmup_requests, args.startup_timeout, args.request_timeout, args.profile_timeout) < 1:
