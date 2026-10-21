@@ -26,6 +26,8 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    if not isinstance(config.get("host_sync_diagnose_load", False), bool):
+        raise ValueError("host_sync_diagnose_load must be boolean")
     backend = config.get("host_sync_backend", "callback")
     if backend not in ("callback", "mte"):
         raise ValueError("host_sync_backend must be callback or mte")
@@ -75,6 +77,7 @@ class MteHostDispatcher:
         self.entries = [None] * self.SLOT_CAPACITY
         self.next_slot = 1
         self.completed = 0
+        self.load_diagnostic_batches = 0
         self.active_callback = None
         self.closed = False
         self.stopping = threading.Event()
@@ -130,6 +133,40 @@ class MteHostDispatcher:
             self._fatal(f"slot={slot}: {type(exc).__name__}: {exc}")
         finally:
             self.active_callback = None
+
+    def diagnose_load(self, tasks, loads, layer, layer_idx):
+        """Temporarily serialize real loads to locate the first blocked task.
+
+        Only explicit diagnostic mode uses this path. It changes overlap and
+        is not a performance measurement. Limit output to eight batches.
+        """
+        enabled = getattr(self.manager.offload_config, "host_sync_diagnose_load", False)
+        if not enabled or self.active_callback is None or not tasks or self.load_diagnostic_batches >= 8:
+            return False
+        self.load_diagnostic_batches += 1
+        batch = self.load_diagnostic_batches
+        stream = self.manager.load_stream
+
+        def checkpoint(label, operation):
+            prefix = f"[MOE-MTE LOAD] batch={batch} layer={layer_idx} {label}"
+            print(f"{prefix} BEGIN", flush=True)
+            operation()
+            print(f"{prefix} SUBMITTED", flush=True)
+            stream.synchronize()
+            print(f"{prefix} COMPLETE", flush=True)
+
+        checkpoint("prior_stream_work", lambda: None)
+        transport = self.manager._get_h2d_transport()
+        for index, task in enumerate(tasks):
+            checkpoint(
+                f"copy[{index}] name={task.name} bytes={task.nbytes}", lambda task=task: transport.copy_batch([task])
+            )
+        for target_slot, _ in loads:
+            checkpoint(
+                f"scale_refresh slot={target_slot}",
+                lambda target_slot=target_slot: self.manager._refresh_expert_fp32_scale(layer, target_slot),
+            )
+        return True
 
     def _dump_stall(self, slot, state):
         # Only on a stalled request, never on the normal callback hot path.

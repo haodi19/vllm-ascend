@@ -1012,6 +1012,7 @@ class ExpertOffloadConfig:
         "callback_mstx_enabled": False,
         # Opt-in single-card graph handoff. Default preserves ACL callbacks.
         "host_sync_backend": "callback",
+        "host_sync_diagnose_load": False,
         "host_sync_library": "",
         "cache_recent_window": 32,
         "cache_ema_beta": 0.9,

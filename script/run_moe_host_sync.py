@@ -18,7 +18,7 @@ from run_host_sync_stage3 import select_build_directory
 from run_verified_cpp_tests import SummaryTee, inference, launch_spec
 
 
-def configured_source(source, backend, library):
+def configured_source(source, backend, library, diagnose_load=False):
     start = re.search(r"(?m)^vllm\s+serve\s+", source)
     if start is None:
         raise ValueError("Missing vllm serve command")
@@ -28,6 +28,8 @@ def configured_source(source, backend, library):
     offload = config["expert_offload_config"]
     offload["host_sync_backend"] = backend
     offload["host_sync_library"] = str(library) if backend == "mte" else ""
+    if diagnose_load:
+        offload["host_sync_diagnose_load"] = backend == "mte"
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -51,6 +53,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number, required=True)
     parser.add_argument("--backend", choices=("both", "callback", "mte"), default="both")
+    parser.add_argument(
+        "--diagnose-load-stages",
+        action="store_true",
+        help="Serialize the first eight MTE load batches for diagnosis, not performance",
+    )
     parser.add_argument("--test-script", type=Path, default=REPOSITORY_ROOT / "script/test_graph2.sh")
     parser.add_argument("--requests", type=int, default=3)
     parser.add_argument("--warmup-requests", type=int, default=1)
@@ -148,9 +155,15 @@ def run(args, root):
             mstx=True,
         )
         print(f"\n=== REAL MOE HOST BACKEND: {backend} ===", flush=True)
-        reports[backend] = inference(run_args, configured_source(source, backend, library), "python", env)
+        if args.diagnose_load_stages:
+            print("DIAGNOSTIC LOAD BARRIERS ENABLED: timings are not a performance comparison", flush=True)
+        reports[backend] = inference(
+            run_args, configured_source(source, backend, library, args.diagnose_load_stages), "python", env
+        )
         if backend == "mte":
             log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
+            if args.diagnose_load_stages:
+                print("\n".join(line for line in log.splitlines() if "[MOE-MTE LOAD]" in line), flush=True)
             if "[MOE-MTE] first real offload callback completed" not in log:
                 raise RuntimeError("No evidence that real offload callbacks executed through MTE")
         print(

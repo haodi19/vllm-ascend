@@ -30,6 +30,45 @@ class MoeHostSyncTests(unittest.TestCase):
         self.module.validate_host_sync_config({})
         self.module.validate_host_sync_config({"host_sync_backend": "callback"})
 
+    def test_load_diagnosis_disabled_does_not_touch_stream(self):
+        obj = self.dispatcher()
+        obj.manager.offload_config = SimpleNamespace()
+        self.assertFalse(obj.diagnose_load([object()], [(0, 1)], None, 1))
+
+    def test_load_diagnosis_preserves_copies_and_scale_order(self):
+        obj = self.dispatcher()
+        events = Mock()
+        obj.manager.offload_config = SimpleNamespace(host_sync_diagnose_load=True)
+        obj.active_callback = (2, 123)
+        obj.load_diagnostic_batches = 0
+        obj.manager.load_stream = events.stream
+        obj.manager._get_h2d_transport = lambda: events.transport
+        obj.manager._refresh_expert_fp32_scale = events.refresh
+        task = SimpleNamespace(name="weight", nbytes=64)
+        with patch("builtins.print"):
+            self.assertTrue(obj.diagnose_load([task], [(3, 9)], "layer", 1))
+        self.assertEqual(
+            [c[0] for c in events.mock_calls],
+            ["stream.synchronize", "transport.copy_batch", "stream.synchronize", "refresh", "stream.synchronize"],
+        )
+        events.transport.copy_batch.assert_called_once_with([task])
+        events.refresh.assert_called_once_with("layer", 3)
+        obj.load_diagnostic_batches = 8
+        self.assertFalse(obj.diagnose_load([task], [(3, 9)], "layer", 1))
+
+    def test_diagnostic_failed_copy_does_not_run_scale_refresh(self):
+        obj = self.dispatcher()
+        obj.manager.offload_config = SimpleNamespace(host_sync_diagnose_load=True)
+        obj.active_callback, obj.load_diagnostic_batches = (2, 123), 0
+        obj.manager.load_stream = Mock()
+        transport = Mock()
+        transport.copy_batch.side_effect = RuntimeError("copy failure")
+        obj.manager._get_h2d_transport = lambda: transport
+        obj.manager._refresh_expert_fp32_scale = Mock()
+        with patch("builtins.print"), self.assertRaisesRegex(RuntimeError, "copy failure"):
+            obj.diagnose_load([SimpleNamespace(name="weight", nbytes=64)], [(3, 9)], None, 1)
+        obj.manager._refresh_expert_fp32_scale.assert_not_called()
+
     def test_callback_keeps_ordinary_load_stream(self):
         npu = SimpleNamespace(Stream=Mock(return_value="ordinary"))
         self.assertEqual(self.module.create_offload_load_stream(npu, "callback"), "ordinary")

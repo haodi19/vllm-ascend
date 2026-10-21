@@ -2892,6 +2892,9 @@ class ExpertOffloadManager:
         for slot, eid in loads:
             tasks.extend(
                 self._build_expert_h2d_tasks(layer, layer_idx, eid, slot))
+        dispatcher = getattr(self, '_host_dispatcher', None)
+        if dispatcher is not None and dispatcher.diagnose_load(tasks, loads, layer, layer_idx):
+            return
         self._get_h2d_transport().copy_batch(tasks)
         for slot, _ in loads:
             self._refresh_expert_fp32_scale(layer, slot)

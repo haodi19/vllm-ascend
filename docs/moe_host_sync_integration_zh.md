@@ -33,6 +33,23 @@ torch_npu 2.10 的普通流 `synchronize()` 先经 `stream()` 排空提交队列
 接口缺失时直接报错，不回退到普通流。
 接口语义见 [SyncLaunchStream 源码](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/npu/streams.py)。
 
+第三轮结果：日志确认 SyncLaunchStream 已生效，但仍在同一个第 1 层预取的
+`synchronize()` 中超时；此前绕开提交队列的修改未解决问题。加载流不仅有权重拷贝，
+还可能有 `_refresh_expert_fp32_scale` 的类型转换和设备复制，不能将流等待直接解释为
+权重 H2D 未完成，也不能据此确认 AIV 资源争用。
+
+为定位第一个未完成的设备操作，增加显式诊断模式：
+
+```bash
+python -B script/run_moe_host_sync.py --npu 1 --backend mte --diagnose-load-stages
+```
+
+该模式只在前 8 个非空真实回调加载批次中，先等待已有流任务，再逐项提交原拷贝任务并等待，
+最后逐槽位执行原 scale 刷新并等待。日志打印 BEGIN、SUBMITTED、COMPLETE：
+停在 SUBMITTED 表示该阶段已返回提交接口但流未完成；停在 BEGIN 则是提交接口尚未返回。
+日志由摘要保留，不包含权重内容。该模式改变任务重叠，只用于定位，不能比较性能。
+默认关闭，不改变原 callback 路径。若失败，继续返回 summary.txt；若通过，也要关闭诊断后再验证。
+
 ## 接入位置与执行流程
 
 原来的 `host_sync_backend=callback` 是默认路径，继续使用 `_launch_host_func`。
