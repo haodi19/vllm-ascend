@@ -23,7 +23,7 @@ import vllm_ascend_host_sync as hs
 
 torch.npu.set_device(0)
 torch.npu.current_stream()
-assert hs.API_VERSION == 1, hs.API_VERSION
+assert hs.API_VERSION >= 1, hs.API_VERSION
 print("device_name=" + str(torch.npu.get_device_name(0)), flush=True)
 print("torch_version=" + str(torch.__version__), flush=True)
 print("torch_npu_version=" + str(torch_npu.__version__), flush=True)

@@ -109,6 +109,7 @@ class Session {
     reject_worker_call("submit_for_test");
     check_slot(slot);
     if (state_ != "running") throw std::runtime_error("session is not running");
+    if (device_access_) throw std::runtime_error("device producer owns the session; Host test submission is disabled");
     if (!callbacks_[slot]) throw std::runtime_error("slot has no registered callback");
     auto& signal = signals_[slot];
     const uint64_t previous = signal.request.generation.load(std::memory_order_acquire);
@@ -185,7 +186,36 @@ class Session {
     result["device_address"] = memory_->device_address();
     result["worker_thread_id"] = worker_id_ == std::thread::id() ? size_t(0) : std::hash<std::thread::id>{}(worker_id_);
     result["device_protocol_verified"] = false;
+    result["device_access_active"] = device_access_;
     return result;
+  }
+
+  // Experimental device tests must keep this lease until the submitting
+  // stream has synchronized successfully. It blocks Host producers/cleanup.
+  uintptr_t begin_device_access() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    reject_worker_call("begin_device_access");
+    if (backend_ != "acl" || state_ != "running" || device_access_) {
+      throw std::runtime_error("device access requires a running ACL session without an active lease");
+    }
+    for (size_t i = 0; i < slots_; ++i) {
+      if (!callbacks_[i] || signals_[i].request.generation.load(std::memory_order_acquire) != 0) {
+        throw std::runtime_error("device access requires registered, unused slots");
+      }
+    }
+    device_access_ = true;
+    return memory_->device_address();
+  }
+
+  void end_device_access(bool stream_synchronized) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    reject_worker_call("end_device_access");
+    if (!device_access_ || !stream_synchronized) {
+      throw std::runtime_error("release requires an active lease and successful device stream synchronization");
+    }
+    device_access_ = false;
   }
 
   void stop(int64_t timeout_ms) {
@@ -194,6 +224,8 @@ class Session {
       std::lock_guard<std::mutex> lock(mutex_);
       reject_worker_call("stop");
       if (state_ == "closed") return;
+      if (device_access_)
+        throw std::runtime_error("synchronize device users and release device access before stop/close");
       if (state_ == "created") {
         state_ = "stopped";
         finished_ = true;
@@ -368,12 +400,13 @@ class Session {
   std::string startup_error_;
   bool ready_ = false;
   bool finished_ = false;
+  bool device_access_ = false;
 };
 
 }  // namespace host_sync
 
 PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
-  module.attr("API_VERSION") = 1;
+  module.attr("API_VERSION") = 2;
   py::register_exception<host_sync::WaitTimeout>(module, "WaitTimeout", PyExc_TimeoutError);
   py::class_<host_sync::Session>(module, "_Session")
       .def(py::init<size_t, const std::string&, int, const std::string&>(), py::arg("slots"), py::arg("backend"),
@@ -384,6 +417,8 @@ PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
       .def("wait", &host_sync::Session::wait, py::arg("slot"), py::arg("generation"), py::arg("timeout_ms") = 5000)
       .def("snapshot", &host_sync::Session::snapshot)
       .def("info", &host_sync::Session::info)
+      .def("begin_device_access", &host_sync::Session::begin_device_access)
+      .def("end_device_access", &host_sync::Session::end_device_access, py::arg("stream_synchronized"))
       .def("stop", &host_sync::Session::stop, py::arg("timeout_ms") = 5000)
       .def("close", &host_sync::Session::close, py::arg("timeout_ms") = 5000);
 }

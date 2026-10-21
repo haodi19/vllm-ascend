@@ -33,6 +33,18 @@ class HostSyncSessionTests(unittest.TestCase):
             self.assertEqual(snapshot["error_generation"], 0)
             self.assertEqual(snapshot["status"], 0)
 
+    def test_cpu_backend_cannot_grant_device_access(self):
+        session = self.make_session()
+        session.register_task(0, lambda: None)
+        session.start()
+        with self.assertRaises(RuntimeError):
+            session.begin_device_access()
+        with self.assertRaises(RuntimeError):
+            session.end_device_access(stream_synchronized=True)
+        self.assertFalse(session.info()["device_access_active"])
+        session.submit_for_test(0, 1)
+        session.wait(0, 1)
+
     def test_many_rounds_and_slots_use_one_worker(self):
         session = self.make_session(slots=3)
         calls = [0, 0, 0]

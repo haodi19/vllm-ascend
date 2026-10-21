@@ -1,4 +1,4 @@
-"""Optional Host synchronization foundation; device polling is not yet implemented."""
+"""Optional Host synchronization foundation and experimental device access lease."""
 
 import atexit
 
@@ -9,8 +9,8 @@ class Session:
     """Own mapped control memory and one native worker; explicitly close before NPU teardown.
 
     ``cpu`` is a simulation backend. ``acl`` validates allocation/registration
-    only in stage 1. Neither backend authorizes a device kernel to use the
-    experimental addresses yet. Callbacks are zero-argument functions.
+    only in stage 1. Stage 2 device tests must acquire a device access lease
+    and synchronize the device before releasing it. Callbacks take no arguments.
     """
 
     def __init__(self, slots=1, backend="acl", device_id=0, acl_library=""):
@@ -55,6 +55,14 @@ class Session:
 
     def info(self):
         return self._native.info()
+
+    def begin_device_access(self):
+        """Reserve registered memory for the isolated stage 2 device producer."""
+        return self._native.begin_device_access()
+
+    def end_device_access(self, *, stream_synchronized):
+        """Caller must have completed device synchronization; a timeout is not enough."""
+        self._native.end_device_access(stream_synchronized)
 
     def stop(self, timeout_ms=5000):
         """Stop accepting requests; finish active work and cancel unstarted work."""
