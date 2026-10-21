@@ -67,7 +67,22 @@ class GraphRunnerTests(unittest.TestCase):
     def setUp(self):
         scripts = Path(__file__).resolve().parents[3] / "script"
         with patch.object(sys, "path", [str(scripts), *sys.path]):
-            self.main = runpy.run_path(str(scripts / "run_host_sync_stage3.py"))["main"]
+            module = runpy.run_path(str(scripts / "run_host_sync_stage3.py"))
+        self.main = module["main"]
+        self.select_build = module["select_build_directory"]
+
+    def test_default_rebuild_uses_fresh_directory(self):
+        first = self.select_build(None, False)
+        second = self.select_build(None, False)
+        self.assertNotEqual(first, second)
+        self.assertEqual(first.parent.name, "host_sync_device_stage3")
+        self.assertFalse(first.exists())
+
+    def test_skip_build_and_explicit_directory_preserved(self):
+        self.assertEqual(self.select_build(None, True).name, "host_sync_device_stage2")
+        requested = Path("build/known_success")
+        for skip in (True, False):
+            self.assertEqual(self.select_build(requested, skip), requested.resolve())
 
     def invoke(self, eager_result, graph_results):
         eager = Mock(return_value=eager_result)
@@ -98,8 +113,11 @@ class GraphRunnerTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertIn("--skip-build", eager.call_args.args[0])
         self.assertIn("STAGE 3 SUMMARY", output)
+        eager_args = eager.call_args.args[0]
+        build_dir = Path(eager_args[eager_args.index("--build-dir") + 1])
         for invocation, case in zip(step.call_args_list, ("normal", "callback-error", "poll-limit")):
             command = invocation.args[1]
+            self.assertEqual(Path(command[command.index("--library") + 1]), build_dir / "lib/libhost_sync_device.so")
             self.assertEqual(command[command.index("--mode") + 1], "graph")
             self.assertEqual(command[command.index("--case") + 1], case)
             self.assertEqual(command[command.index("--rounds") + 1], "3")

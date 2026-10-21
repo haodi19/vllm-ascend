@@ -33,7 +33,12 @@ python -B script/run_host_sync_stage3.py --npu 1
 ```
 
 `--npu` 指定物理卡号；`--rounds` 指定正常测试的重放次数，默认 100。
-`--cann-root`、`--soc-version`、`--build-dir` 与第二阶段一致。
+`--cann-root`、`--soc-version` 与第二阶段一致。
+默认每次在 `build/host_sync_device_stage3/run_<唯一编号>` 中重新构建，路径显示在控制台。
+这样避免复用 CANN 增量构建的中间文件，旧目录和已成功的动态库不会删除。
+`--build-dir` 可指定精确目录；重新构建时应使用新的空目录。
+仅复用成功产物时使用 `--skip-build --build-dir <成功输出中的构建目录>`。
+单独使用 `--skip-build` 则沿用第二阶段的 `build/host_sync_device_stage2`。
 脚本自动复跑普通执行与图执行两组检查，输出直接显示在控制台，不含 Git 操作。
 只产生必要构建产物，不写实验结果文件。请返回 `CAPTURE PASS`、各项 `RESULT` 和
 `STAGE 3 SUMMARY`；出错时返回失败步骤及其报错。
@@ -48,5 +53,10 @@ python -B script/run_host_sync_stage3.py --npu 1
 图正确性通过后，再设计 `_launch_host_func` 对照、时延计量与 profile，避免把未通过验证
 的图路径作为性能基线。等待有轮询上限，子进程有超时保护；图或设备同步失败后仍按
 第二阶段的隔离进程退出策略处理，不提前释放可能被设备使用的内存。
+
+首次绿区第三阶段执行通过了 18 项 Host 单测和 10 项校验，但复用第二阶段目录时，
+CANN 的 `ld.lld` 对已有 `.o` 报 `unknown file type`，测试停在构建阶段。
+该结果不说明图捕获失败，因为尚未运行图测试。由于相同算子此前已构建并通过第二阶段，
+目前先采用独立新目录排除增量构建产物的影响；具体中间文件为何不可识别尚未确认。
 
 接口依据：[torch_npu 2.10 图捕获与重放实现](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/npu/graphs.py)。

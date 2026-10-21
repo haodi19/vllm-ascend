@@ -5,10 +5,21 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, positive_number, run_step
 from run_host_sync_stage2 import main as run_eager_regression
 from run_host_sync_stage2 import soc_version
+
+
+def select_build_directory(requested, skip_build):
+    if requested is not None:
+        return requested.resolve()
+    if skip_build:
+        return REPOSITORY_ROOT / "build/host_sync_device_stage2"
+    # CANN's generated subprojects may reuse incompatible intermediate objects
+    # on an incremental build. Keep all previous artifacts; use a fresh tree.
+    return REPOSITORY_ROOT / "build/host_sync_device_stage3" / f"run_{uuid4().hex}"
 
 
 def main(argv=None):
@@ -16,7 +27,7 @@ def main(argv=None):
     parser.add_argument("--npu", type=npu_number, default=0)
     parser.add_argument("--soc-version", type=soc_version, default="ascend950pr_9579")
     parser.add_argument("--cann-root", type=Path, default=Path("/usr/local/Ascend/ascend-toolkit/latest"))
-    parser.add_argument("--build-dir", type=Path, default=REPOSITORY_ROOT / "build/host_sync_device_stage2")
+    parser.add_argument("--build-dir", type=Path, help="Exact build directory; default: a fresh directory per run")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--rounds", type=int, default=100)
     parser.add_argument("--max-polls", type=int, default=100000)
@@ -28,6 +39,8 @@ def main(argv=None):
     if sys.platform != "linux":
         parser.error("Stage 3 requires Linux + Ascend CANN")
     print("=== HOST SYNC STAGE 3: graph capture/replay correctness ===", flush=True)
+    args.build_dir = select_build_directory(args.build_dir, args.skip_build)
+    print(f"Build directory: {args.build_dir}", flush=True)
     prefix = [sys.executable, "-u", "-B"]
     stage2 = [
         "--npu",
