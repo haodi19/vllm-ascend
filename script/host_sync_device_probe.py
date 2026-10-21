@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Isolated stage 2 NPU experiment. Never import this into a serving process."""
+"""Isolated eager/graph NPU experiments. Never import into a serving process."""
 
 import argparse
 import ctypes
@@ -19,6 +19,11 @@ def check_result(result, generation, expected_code):
         raise RuntimeError(f"NPU did not execute a completion poll: {result}")
 
 
+def check_capture_unchanged(before, after, calls):
+    if after != before or calls != [1]:
+        raise RuntimeError(f"Capture unexpectedly executed work: before={before}, after={after}, calls={calls}")
+
+
 def run_probe(args):
     # Lazy imports keep CPU checks/help independent of the NPU runtime.
     import torch
@@ -31,7 +36,8 @@ def run_probe(args):
     name = torch.npu.get_device_name(0)
     if not name.startswith("Ascend950"):
         raise RuntimeError(f"Stage 2 currently targets Ascend950, found {name}")
-    print(f"device={name}; torch_npu={torch_npu.__version__}; case={args.case}", flush=True)
+    graph_mode = args.mode == "graph"
+    print(f"device={name}; torch_npu={torch_npu.__version__}; mode={args.mode}; case={args.case}", flush=True)
     library = ctypes.CDLL(str(args.library.resolve()))
     publish = library.host_sync_publish_launch
     publish.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
@@ -41,11 +47,11 @@ def run_probe(args):
     wait.restype = None
 
     # No Torch operations are queued between raw launches. Drain allocation /
-    # initialization before using the runtime stream directly. Graph integration
-    # and mixed Torch/native task-queue ordering are intentionally not tested yet.
-    stream = torch.npu.current_stream()
+    # initialization before using the runtime stream directly. A dedicated
+    # non-default stream is used for capture. No mixed Torch operations in it.
+    stream = torch.npu.Stream() if graph_mode else torch.npu.current_stream()
     state = torch.zeros(4, dtype=torch.int64, device="npu:0")
-    stream.synchronize()
+    torch.npu.synchronize()
     stream_pointer = int(stream.npu_stream)
     session = hs.Session(slots=1, backend="acl", device_id=0)
     info = session.info()
@@ -61,12 +67,15 @@ def run_probe(args):
             raise RuntimeError(f"Unsupported protocol layout {key}={info[key]}, expected {expected}")
     calls = []
     release_callback = threading.Event()
+    warmup_rounds = 1 if graph_mode else 0
 
     def callback():
         generation = session.snapshot(0)["request_generation"]
         if generation != len(calls) + 1:
             raise RuntimeError(f"Host observed out-of-order generation {generation}")
         calls.append(generation)
+        if generation <= warmup_rounds:
+            return
         if args.case == "callback-error":
             raise RuntimeError("deliberate stage 2 callback failure")
         if args.case == "poll-limit" and not release_callback.wait(30):
@@ -95,9 +104,34 @@ def run_probe(args):
     rounds = args.rounds if args.case == "normal" else 1
     code = {"normal": 1, "callback-error": 2, "poll-limit": 3}[args.case]
     poll_counts = []
-    for generation in range(1, rounds + 1):
+
+    def launch_pair(max_polls):
         publish(stream_pointer, request, state.data_ptr())
-        wait(stream_pointer, completion, state.data_ptr(), 8 if args.case == "poll-limit" else args.max_polls)
+        wait(stream_pointer, completion, state.data_ptr(), max_polls)
+
+    graph = None
+    if graph_mode:
+        # Initialize both native kernel launch paths before capture. This round
+        # succeeds even in the intentional error/timeout cases.
+        launch_pair(args.max_polls)
+        stream.synchronize()
+        before_capture = state.cpu().tolist()
+        check_result(before_capture, 1, 1)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph, stream=stream):
+            launch_pair(8 if args.case == "poll-limit" else args.max_polls)
+        stream.synchronize()
+        check_capture_unchanged(before_capture, state.cpu().tolist(), calls)
+        print("CAPTURE PASS: native launch pair recorded; no new Host task during capture.", flush=True)
+
+    total_requests = warmup_rounds + rounds
+    for generation in range(warmup_rounds + 1, total_requests + 1):
+        if graph is None:
+            launch_pair(8 if args.case == "poll-limit" else args.max_polls)
+        else:
+            # Replay only: no Host generation write and no native launch_pair.
+            with torch.npu.stream(stream):
+                graph.replay()
         stream.synchronize()
         result = state.cpu().tolist()
         check_result(result, generation, code)
@@ -105,20 +139,23 @@ def run_probe(args):
     # The device no longer accesses the Host allocation. Release a gated Host
     # callback before asking stop() to join it.
     release_callback.set()
+    if graph is not None:
+        # Destroy the executable graph before releasing its registered addresses.
+        graph.reset()
     session.end_device_access(stream_synchronized=True)
     try:
-        session.wait(0, rounds)
+        session.wait(0, total_requests)
     except RuntimeError as exc:
         if args.case != "callback-error" or "deliberate stage 2 callback failure" not in str(exc):
             raise
     session.stop()
     snapshot = session.snapshot(0)
-    if calls != list(range(1, rounds + 1)):
-        raise RuntimeError(f"Callback count/order mismatch: expected {rounds}, observed {calls}")
+    if calls != list(range(1, total_requests + 1)):
+        raise RuntimeError(f"Callback count/order mismatch: expected {total_requests}, observed {calls}")
     if args.case == "callback-error":
-        if snapshot["error_generation"] != 1 or snapshot["done_generation"] == 1:
+        if snapshot["error_generation"] != total_requests or snapshot["done_generation"] == total_requests:
             raise RuntimeError(f"Callback error incorrectly published as success: {snapshot}")
-    elif snapshot["done_generation"] != rounds:
+    elif snapshot["done_generation"] != total_requests:
         raise RuntimeError(f"Host completion mismatch: {snapshot}")
     session.close()
     print(
@@ -126,8 +163,11 @@ def run_probe(args):
         + json.dumps(
             {
                 "case": args.case,
+                "mode": args.mode,
                 "result": "PASS",
-                "npu_generated_requests": rounds,
+                "warmup_requests": warmup_rounds,
+                "graph_replays": rounds if graph_mode else 0,
+                "npu_generated_requests": total_requests,
                 "host_callbacks": len(calls),
                 "last_npu_result": result,
                 "poll_count_min": min(poll_counts),
@@ -137,12 +177,13 @@ def run_probe(args):
         ),
         flush=True,
     )
-    print("Poll counts are not time measurements. Graph replay/MoE/performance: NOT TESTED.", flush=True)
+    print("Poll counts are not time measurements. MoE integration/performance/profile: NOT TESTED.", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--mode", choices=("eager", "graph"), default="eager")
     parser.add_argument("--case", choices=("normal", "callback-error", "poll-limit"), default="normal")
     parser.add_argument("--rounds", type=int, default=100)
     parser.add_argument("--max-polls", type=int, default=100000)

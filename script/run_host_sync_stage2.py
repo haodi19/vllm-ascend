@@ -21,7 +21,7 @@ def target_cmake_args(soc):
     return [f"-DSOC_VERSION={soc_version(soc)}", "-DASCEND_COMPUTE_UNIT=ascend950"]
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number, default=0)
     parser.add_argument("--soc-version", type=soc_version, default="ascend950pr_9579")
@@ -32,7 +32,7 @@ def main():
     parser.add_argument("--max-polls", type=int, default=100000)
     parser.add_argument("--build-timeout", type=positive_number, default=600)
     parser.add_argument("--test-timeout", type=positive_number, default=120)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if not 1 <= args.rounds <= 10000 or not 1 <= args.max_polls <= 10000000:
         parser.error("rounds must be 1..10000 and max-polls must be 1..10000000")
     if sys.platform != "linux":
