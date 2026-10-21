@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
+from vllm_ascend.expert_offload.host_sync import validate_host_sync_config
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
@@ -1008,6 +1010,9 @@ class ExpertOffloadConfig:
         "callback_timing_port": 0,
         # Diagnostic CPU ranges; requires callback timing and MSTX-capable torch_npu.
         "callback_mstx_enabled": False,
+        # Opt-in single-card graph handoff. Default preserves ACL callbacks.
+        "host_sync_backend": "callback",
+        "host_sync_library": "",
         "cache_recent_window": 32,
         "cache_ema_beta": 0.9,
         "cache_recent_weight": 1.0,
@@ -1174,6 +1179,7 @@ class ExpertOffloadConfig:
             raise TypeError("cache_policy_enabled must be a boolean")
         if self.config["cache_policy_backend"] not in ("python", "cpp", "cpp_fused"):
             raise ValueError("cache_policy_backend must be 'python', 'cpp' or 'cpp_fused'")
+        validate_host_sync_config(self.config)
         if self.config["cache_policy_backend"] == "cpp_fused" and self.config["enable_multi_card"]:
             raise ValueError("cpp_fused currently supports single-card expert offload only")
         port = self.config["callback_timing_port"]

@@ -112,6 +112,7 @@ class ExpertOffloadManager:
         from vllm_ascend.ascend_config import get_ascend_config
 
         self.offload_config = get_ascend_config().expert_offload_config
+        self._host_dispatcher = None
         # The minimum capacity is the conservative global dispatch threshold;
         # actual weight and placement sizes are resolved per MoE layer.
         self.num_device_experts = min(
@@ -807,6 +808,12 @@ class ExpertOffloadManager:
             # Diagnostic-only lazy import; disabled production has no wrappers.
             from vllm_ascend.expert_offload.callback_timing import install_callback_timing
             install_callback_timing(self, self.offload_config.callback_timing_port)
+        if (getattr(self.offload_config, "host_sync_backend", "callback") == "mte"
+                and self._host_dispatcher is None):
+            from vllm_ascend.expert_offload.host_sync import MteHostDispatcher
+            self._host_dispatcher = MteHostDispatcher(self, self.offload_config.host_sync_library)
+            logger.info("[MOE-MTE] real offload callback dispatch enabled; capacity=%d",
+                        self._host_dispatcher.SLOT_CAPACITY)
 
     def process_weights_after_loading(self):
         """Convert resident CPU expert buffers to the on-device weight format.
@@ -1962,7 +1969,8 @@ class ExpertOffloadManager:
 
         current_compute_stream = torch_npu.npu.current_stream()
         subscribed_compute_streams = get_subscribed_compute_streams()
-        if current_compute_stream not in subscribed_compute_streams:
+        if (getattr(self, '_host_dispatcher', None) is None
+                and current_compute_stream not in subscribed_compute_streams):
             torch_npu.npu._subscribe_report(current_compute_stream)
             subscribed_compute_streams.add(current_compute_stream)
         self._is_prefetch = False
@@ -1983,7 +1991,7 @@ class ExpertOffloadManager:
         )
         # launch the guarded wrapper — see _note_cb_failure.
         if _EXTRA_CTX.capturing:
-            torch_npu.npu._launch_host_func(
+            self._launch_offload_callback(
                 current_compute_stream,
                 self._update_weights_guarded,
                 args,
@@ -2829,6 +2837,9 @@ class ExpertOffloadManager:
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
+        dispatcher = getattr(self, '_host_dispatcher', None)
+        if dispatcher is not None:
+            dispatcher.close()
         timing = getattr(self, '_callback_timing', None)
         if timing is not None:
             timing.close()
@@ -3034,6 +3045,13 @@ class ExpertOffloadManager:
             logger.error(
                 "[EXPERT-OFFLOAD] %s host callback keeps failing; further "
                 "tracebacks suppressed", where)
+
+    def _launch_offload_callback(self, stream, callback, args):
+        dispatcher = getattr(self, '_host_dispatcher', None)
+        if dispatcher is None:
+            torch_npu.npu._launch_host_func(stream, callback, args)
+        else:
+            dispatcher.launch(stream, callback, args)
 
     def _update_weights_guarded(self, args):
         """_update_weights, with the report-thread exception made visible."""
@@ -3619,7 +3637,8 @@ class ExpertOffloadManager:
                 self._prefetch_stream.wait_event(ready_event)
             current_compute_stream = torch_npu.npu.current_stream()
             subscribed_compute_streams = get_subscribed_compute_streams()
-            if current_compute_stream not in subscribed_compute_streams:
+            if (getattr(self, '_host_dispatcher', None) is None
+                    and current_compute_stream not in subscribed_compute_streams):
                 torch_npu.npu._subscribe_report(current_compute_stream)
                 subscribed_compute_streams.add(current_compute_stream)
 
@@ -3651,7 +3670,7 @@ class ExpertOffloadManager:
                 if self.enable_multi_card:
                     self._log_mc_debug_schedule(
                         next_idx, is_prefetch=True)
-                torch_npu.npu._launch_host_func(
+                self._launch_offload_callback(
                     current_compute_stream, _prefetch_host_cb, prefetch_args)
             else:
                 _prefetch_host_cb(prefetch_args)

@@ -1,0 +1,170 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Run real MoE inference with original callback or optional MTE dispatch."""
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import shlex
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from uuid import uuid4
+
+from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, run_step
+from run_host_sync_stage2 import target_cmake_args
+from run_host_sync_stage3 import select_build_directory
+from run_verified_cpp_tests import SummaryTee, inference, launch_spec
+
+
+def configured_source(source, backend, library):
+    start = re.search(r"(?m)^vllm\s+serve\s+", source)
+    if start is None:
+        raise ValueError("Missing vllm serve command")
+    words = [word for word in shlex.split(source[start.start() :] + "\n", comments=True) if word.strip()]
+    index = words.index("--additional-config") + 1
+    config = json.loads(words[index])
+    offload = config["expert_offload_config"]
+    offload["host_sync_backend"] = backend
+    offload["host_sync_library"] = str(library) if backend == "mte" else ""
+    words[index] = json.dumps(config)
+    return source[: start.start()] + shlex.join(words) + "\n"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--npu", type=npu_number, required=True)
+    parser.add_argument("--backend", choices=("both", "callback", "mte"), default="both")
+    parser.add_argument("--test-script", type=Path, default=REPOSITORY_ROOT / "script/test_graph2.sh")
+    parser.add_argument("--requests", type=int, default=3)
+    parser.add_argument("--warmup-requests", type=int, default=1)
+    parser.add_argument("--startup-timeout", type=int, default=1800)
+    parser.add_argument("--request-timeout", type=int, default=300)
+    parser.add_argument("--profile-timeout", type=int, default=120)
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--timing-port", type=int, default=18155)
+    parser.add_argument("--output-dir", type=Path)
+    args = parser.parse_args()
+    if sys.platform != "linux":
+        parser.error("Run inside the Linux NPU container")
+    if min(args.requests, args.warmup_requests, args.startup_timeout, args.request_timeout, args.profile_timeout) < 1:
+        parser.error("Counts/timeouts must be positive")
+    root = (args.output_dir or REPOSITORY_ROOT / "bench_results" / f"moe_host_sync_{uuid4().hex[:8]}").resolve()
+    root.mkdir(parents=True, exist_ok=False)
+    with (
+        (root / "summary.txt").open("w", encoding="utf-8") as file,
+        contextlib.redirect_stdout(SummaryTee(sys.stdout, file)),
+    ):
+        print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
+        try:
+            return run(args, root)
+        except Exception as exc:
+            print(f"FAILED: {type(exc).__name__}: {exc}", flush=True)
+            for log in root.glob("*/inference_python.log"):
+                print(
+                    f"SERVICE LOG TAIL: {log}\n"
+                    + "\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-70:]),
+                    flush=True,
+                )
+            return 1
+
+
+def run(args, root):
+    backends = ("callback", "mte") if args.backend == "both" else (args.backend,)
+    build = select_build_directory(None, False)
+    library = build / "lib/libhost_sync_device.so"
+    if "mte" in backends:
+        commands = [
+            (
+                "build Host extension",
+                [sys.executable, "-m", "pip", "install", "./csrc/host_sync", "--no-build-isolation", "--no-deps"],
+            ),
+            (
+                "configure MTE kernels",
+                [
+                    "cmake",
+                    "-S",
+                    str(REPOSITORY_ROOT / "csrc/host_sync_device"),
+                    "-B",
+                    str(build),
+                    "-DASCEND_CANN_PACKAGE_PATH=/usr/local/Ascend/ascend-toolkit/latest",
+                    *target_cmake_args("ascend950pr_9579"),
+                    "-DCMAKE_BUILD_TYPE=Release",
+                ],
+            ),
+            ("build MTE kernels", ["cmake", "--build", str(build), "-j", "2"]),
+        ]
+        for label, command in commands:
+            if not run_step(label, command, 600):
+                return 1
+    source = args.test_script.read_text(encoding="utf-8")
+    _, command, _, _ = launch_spec(source, "python", args.npu, args.port, args.timing_port)
+    port = int(command[command.index("--port") + 1])
+    if not 1024 <= port <= 65535 or not 1024 <= args.timing_port <= 65535 or port == args.timing_port:
+        raise ValueError("Use distinct serve/timing ports in 1024..65535")
+    reports = {}
+    env = os.environ.copy()
+    env["ASCEND_RT_VISIBLE_DEVICES"] = str(args.npu)
+    print(
+        "REAL MOE: LRC=python in both groups; model/MTP/prefetch configuration inherited from test_graph2.sh",
+        flush=True,
+    )
+    print(
+        "Only graph callback dispatch changes. Eager execution remains unchanged. Timers + profiler enabled.",
+        flush=True,
+    )
+    for backend in backends:
+        directory = root / backend
+        directory.mkdir()
+        run_args = SimpleNamespace(
+            output_dir=directory,
+            profile_run_dir=root / "profile" / backend,
+            npu=args.npu,
+            port=port,
+            timing_port=args.timing_port,
+            requests=args.requests,
+            warmup_requests=args.warmup_requests,
+            max_tokens=5,
+            startup_timeout=args.startup_timeout,
+            request_timeout=args.request_timeout,
+            profile_timeout=args.profile_timeout,
+            strict_profile=False,
+            mstx=True,
+        )
+        print(f"\n=== REAL MOE HOST BACKEND: {backend} ===", flush=True)
+        reports[backend] = inference(run_args, configured_source(source, backend, library), "python", env)
+        if backend == "mte":
+            log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
+            if "[MOE-MTE] first real offload callback completed" not in log:
+                raise RuntimeError("No evidence that real offload callbacks executed through MTE")
+        print(
+            "MOE_RESULT "
+            + json.dumps(
+                {
+                    "host_backend": backend,
+                    "request_mean_us": reports[backend]["request_us"],
+                    "digests": reports[backend]["digests"],
+                    "usage": reports[backend]["usage"],
+                    "profile_status": reports[backend]["profile_status"],
+                }
+            ),
+            flush=True,
+        )
+    if len(reports) == 2:
+        match = reports["callback"]["digests"] == reports["mte"]["digests"]
+        usage_match = reports["callback"]["usage"] == reports["mte"]["usage"]
+        print(f"GENERATED TEXT MATCH: {match}; USAGE MATCH: {usage_match}", flush=True)
+        print(
+            "Diagnostic request mean us: " + json.dumps({key: value["request_us"] for key, value in reports.items()}),
+            flush=True,
+        )
+        if not match or not usage_match:
+            raise RuntimeError("Generated output differs; inspect before claiming correctness or speedup")
+    print("REAL MOE RUN COMPLETE. Limited prompt coverage; diagnostic timings include profiler overhead.", flush=True)
+    print(f"Profiles: {root / 'profile'}; return summary.txt text only.", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

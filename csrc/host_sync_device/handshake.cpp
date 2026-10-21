@@ -74,16 +74,16 @@ extern "C" __global__ __aicore__ void host_sync_wait(GM_ADDR completion, GM_ADDR
   uint64_t code = expected == 0 ? kInvalidGeneration : kPollLimit;
   uint64_t observed = 0;
   uint64_t polls = 0;
-  if (expected != 0) {
-    for (; polls < maxPolls; ++polls) {
+  if (expected != 0 || maxPolls == 0) {
+    for (; maxPolls == 0 || polls < maxPolls; ++polls) {
       Read(local, completionGm);
       observed = words.GetValue(0);
-      if (words.GetValue(1) == expected) {
+      if (words.GetValue(1) == expected && maxPolls != 0) {
         code = kCallbackError;
         ++polls;
         break;
       }
-      if (observed == expected) {
+      if (expected != 0 && observed == expected && words.GetValue(1) != expected) {
         code = kSuccess;
         ++polls;
         break;
@@ -104,6 +104,12 @@ extern "C" void host_sync_publish_launch(void* stream, void* request, void* stat
 
 extern "C" void host_sync_wait_launch(void* stream, void* completion, void* state, uint64_t maxPolls) {
   host_sync_wait<<<1, nullptr, stream>>>(completion, state, maxPolls);
+}
+
+// Inference must never resume on a poll limit or callback failure. The owning
+// Host dispatcher terminates its engine process on failure/stalled generation.
+extern "C" void host_sync_wait_strict_launch(void* stream, void* completion, void* state) {
+  host_sync_wait<<<1, nullptr, stream>>>(completion, state, 0);
 }
 
 // Stage 5 consumer: check the handshake before consuming newly copied data.
