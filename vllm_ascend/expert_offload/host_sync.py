@@ -11,6 +11,20 @@ import traceback
 from pathlib import Path
 
 
+def create_offload_load_stream(npu, backend):
+    """Keep polling-worker H2D off the model's Host submission queue."""
+    if backend == "callback":
+        return npu.Stream()
+    if backend != "mte":
+        raise ValueError("host_sync_backend must be callback or mte")
+    stream_type = getattr(npu, "SyncLaunchStream", None)
+    if stream_type is None:
+        raise RuntimeError("MTE host sync requires torch_npu.npu.SyncLaunchStream; no ordinary-stream fallback")
+    # Sync launch means direct Host submission, not waiting after every copy.
+    # _synchronize_h2d still waits for the actual device transfers to finish.
+    return stream_type()
+
+
 def validate_host_sync_config(config):
     backend = config.get("host_sync_backend", "callback")
     if backend not in ("callback", "mte"):

@@ -20,6 +20,19 @@
 下一轮可只执行 `python -B script/run_moe_host_sync.py --npu 1 --backend mte`，
 继续真实模型联调，不需要重跑 callback 基线。
 
+第二轮诊断已确认：槽位 1 的真实回调完成；槽位 2 为第 1 层预取，工作线程已进入
+`_update_weights`，停在 `_synchronize_h2d()` → `load_stream.synchronize()`。
+主线程停在下一轮输入准备的采样结果 Event 等待。尚无 MTE 请求时延和输出一致性结果。
+
+针对加载流与 Host 提交队列的依赖，本轮仅在 MTE 后端使用 `SyncLaunchStream` 创建权重加载流。
+torch_npu 2.10 的普通流 `synchronize()` 先经 `stream()` 排空提交队列，
+而 SyncLaunchStream 不启用该任务队列，相关 `stream()` 分支也跳过队列排空。
+这样让回调内权重传输直接提交，避免依赖可能正在等待图执行的公共提交队列。
+这是根据 Python 栈和源码确定的修复方向，尚未通过原生栈证明具体等待环，也尚待实机确认。
+仍保留 `copy_` 和 `_synchronize_h2d()`，不会提前发布 done；默认 callback 的普通加载流不变。
+接口缺失时直接报错，不回退到普通流。
+接口语义见 [SyncLaunchStream 源码](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/npu/streams.py)。
+
 ## 接入位置与执行流程
 
 原来的 `host_sync_backend=callback` 是默认路径，继续使用 `_launch_host_func`。
@@ -33,7 +46,8 @@
 5. 回调成功返回后，工作线程更新 done generation，AIV 等待算子放行当前流。
 6. 后续映射 H2D 和专家计算继续执行。
 
-没有改写 LRC 和权重搬运算法。普通 eager 执行仍走原来的直接调用路径；只有图内交接替换。
+没有改写 LRC 和权重搬运算法。普通 eager 回调仍直接调用；MTE 后端的加载流统一使用
+SyncLaunchStream，图内交接使用发布/等待算子。
 每个捕获的回调拥有独立槽位及参数引用，图重放复用该槽位并递增 generation。
 预取和按需任务、不同图尺寸不共用同一个参数槽位。当前预分配 2048 个槽位，其中一个用于初始化。
 

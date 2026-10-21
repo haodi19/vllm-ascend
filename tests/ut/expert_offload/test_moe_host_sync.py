@@ -30,6 +30,36 @@ class MoeHostSyncTests(unittest.TestCase):
         self.module.validate_host_sync_config({})
         self.module.validate_host_sync_config({"host_sync_backend": "callback"})
 
+    def test_callback_keeps_ordinary_load_stream(self):
+        npu = SimpleNamespace(Stream=Mock(return_value="ordinary"))
+        self.assertEqual(self.module.create_offload_load_stream(npu, "callback"), "ordinary")
+        npu.Stream.assert_called_once_with()
+
+    def test_mte_uses_direct_submission_load_stream(self):
+        npu = SimpleNamespace(Stream=Mock(), SyncLaunchStream=Mock(return_value="direct"))
+        self.assertEqual(self.module.create_offload_load_stream(npu, "mte"), "direct")
+        npu.SyncLaunchStream.assert_called_once_with()
+        npu.Stream.assert_not_called()
+
+    def test_missing_sync_stream_cannot_silently_fallback(self):
+        npu = SimpleNamespace(Stream=Mock())
+        with self.assertRaisesRegex(RuntimeError, "SyncLaunchStream"):
+            self.module.create_offload_load_stream(npu, "mte")
+        npu.Stream.assert_not_called()
+
+    def test_manager_initializes_selected_load_stream(self):
+        tree = ast.parse(
+            (self.root / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8")
+        )
+        assignments = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Attribute) and t.attr == "load_stream" for t in n.targets)
+        ]
+        self.assertEqual(len(assignments), 1)
+        self.assertEqual(assignments[0].value.func.id, "create_offload_load_stream")
+
     def test_invalid_configuration(self):
         for config in (
             {"host_sync_backend": "typo"},

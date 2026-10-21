@@ -125,7 +125,8 @@ def run(args, root):
         flush=True,
     )
     print(
-        "Only graph callback dispatch changes. Eager execution remains unchanged. Timers + profiler enabled.",
+        "MTE uses graph polling dispatch and SyncLaunchStream H2D; callback keeps its original load stream. "
+        "Eager callback invocation is unchanged. Timers + profiler enabled.",
         flush=True,
     )
     for backend in backends:
