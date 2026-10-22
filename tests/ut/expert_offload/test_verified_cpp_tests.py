@@ -377,8 +377,18 @@ class TestVerifiedRunner(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 fn(directory, 0)
             (output / "analyse.done").touch()
+            for payload in ("{}", "[]", '[{"name":"unfinished"}'):
+                (output / "trace_view.json").write_text(payload)
+                with self.assertRaises(RuntimeError):
+                    fn(directory, 0)
+            (output / "trace_view.json").write_text('[{"name":"kernel"}]')
             with contextlib.redirect_stdout(io.StringIO()):
                 fn(directory, 0)
+            with self.assertRaisesRegex(RuntimeError, "no moe_offload"):
+                fn(directory, 0, require_mstx=True)
+            (output / "trace_view.json").write_text('[{"name":"moe_offload/update_weights"}]')
+            with contextlib.redirect_stdout(io.StringIO()):
+                fn(directory, 0, require_mstx=True)
 
     def test_inference_window_and_cleanup(self):
         fn = self.module["inference"]

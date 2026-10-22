@@ -268,19 +268,47 @@ def wait_service_ports_free(args):
             time.sleep(0.2)
 
 
-def wait_profile(directory, timeout):
+def validate_profile_trace(path, require_mstx=False):
+    """Read events before claiming export success; a done marker is insufficient."""
+    read = runpy.run_path(str(REPO / "script/analyze_callback_gaps.py"))["events"]
+    count = labels = 0
+    before = path.stat()
+    for event in read(path):
+        if not isinstance(event, dict):
+            raise ValueError(f"Invalid trace event in {path}")
+        count += 1
+        labels += str(event.get("name", "")).startswith("moe_offload/")
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise ValueError(f"Trace still being written: {path}")
+    if not count:
+        raise ValueError(f"Trace contains no events: {path}")
+    if require_mstx and not labels:
+        raise ValueError(f"Trace contains no moe_offload MSTX ranges: {path}")
+    return count, labels
+
+
+def wait_profile(directory, timeout, require_mstx=False):
     """Wait for exported device timelines before terminating the owned worker."""
     deadline = time.monotonic() + timeout
     next_update = 0
+    last_error = "No completed timeline yet"
     while True:
         traces = list(directory.rglob("ASCEND_PROFILER_OUTPUT/trace_view.json"))
         if traces and all(p.stat().st_size and (p.parent / "analyse.done").exists() for p in traces):
-            print(f"PROFILE SAVED: {directory}; exported timelines={len(traces)}", flush=True)
-            return
+            try:
+                for path in traces:
+                    validate_profile_trace(path, require_mstx)
+            except (OSError, ValueError) as exc:
+                last_error = str(exc)
+            else:
+                print(f"PROFILE SAVED: {directory}; exported timelines={len(traces)}", flush=True)
+                return
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"Profile export not confirmed in {directory}; timelines={len(traces)}; "
-                f"analyse.done={len(list(directory.rglob('analyse.done')))}; inspect profiler logs there"
+                f"analyse.done={len(list(directory.rglob('analyse.done')))}; "
+                f"reason={last_error}; inspect profiler logs there"
             )
         if time.monotonic() >= next_update:
             print(
@@ -298,7 +326,7 @@ def finish_profile(opener, args, profile_dir):
     deadline = time.monotonic() + args.profile_timeout
     try:
         request(opener, args.port, "/stop_profile", {}, timeout=args.profile_timeout)
-        wait_profile(profile_dir, max(0, deadline - time.monotonic()))
+        wait_profile(profile_dir, max(0, deadline - time.monotonic()), require_mstx=getattr(args, "mstx", False))
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"PROFILE INCOMPLETE: {type(exc).__name__}: {exc}", flush=True)
         print(f"Existing profile files retained: {profile_dir}", flush=True)
