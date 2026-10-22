@@ -71,6 +71,17 @@ python -B script/run_moe_host_sync.py --read-log bench_results/moe_host_sync_db4
 
 此入口只向控制台输出既有日志中的诊断信息，不构建、不启动服务、不生成结果文件。
 
+补取日志确认启动失败来自新增的 `storage_quant_copy` 校验，发生在热专家预加载；
+两端 dtype 均为 uint8。原错误信息没有列出各项布局值，不能仅凭它确定具体失败条件。
+源码中的 MXFP4 scale 布局包含 reshape/transpose，因此只接受逻辑连续张量过于严格。
+现支持 ND 格式下无重叠、无空洞的转置布局：源、目标物理顺序相同时直接取字节视图；
+不同时在 pinned CPU 张量中按目标 stride 排列，再传输字节。不在 NPU 上新增布局转换。
+仍检查类型、形状、字节数和边界，错误信息补充两端 shape、stride 及目标格式。
+CPU 测试使用真实 uint8 转置 Tensor，覆盖顺序匹配/不匹配及非零槽位偏移，检查相邻槽位不变。
+布局重排产生的 pinned CPU 源存储由 manager 保留，只有 H2D 同步成功后才释放，
+避免异步拷贝仍在读取时临时缓冲区被回收；同步失败时继续保留。
+继续运行带 `--diagnose-load-stages` 的真实模型命令；本改动尚待 NPU 验证。
+
 ## 接入位置与执行流程
 
 原来的 `host_sync_backend=callback` 是默认路径，继续使用 `_launch_host_func`。

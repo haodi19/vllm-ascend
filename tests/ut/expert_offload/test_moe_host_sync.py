@@ -13,8 +13,62 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import torch
+
 
 class MoeHostSyncTests(unittest.TestCase):
+    def test_packed_sources_live_until_successful_h2d_sync(self):
+        tree = ast.parse(
+            (self.root / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8")
+        )
+        method = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_synchronize_h2d")
+        namespace = {}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "h2d_sync", "exec"), namespace)
+        pending = [object()]
+        transport = Mock()
+        manager = SimpleNamespace(
+            _mte_pending_quant_sources=pending, load_stream="load", _get_h2d_transport=lambda: transport
+        )
+        transport.synchronize.side_effect = RuntimeError("incomplete")
+        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+            namespace["_synchronize_h2d"](manager)
+        self.assertEqual(len(pending), 1)
+        transport.synchronize.side_effect = lambda stream: self.assertEqual(len(pending), 1)
+        namespace["_synchronize_h2d"](manager)
+        self.assertEqual(pending, [])
+
+    def test_transposed_quant_storage_matches_tensor_copy(self):
+        class DeviceView:
+            device = SimpleNamespace(type="npu")
+
+            def __init__(self, tensor):
+                self.tensor = tensor
+
+            def __getattr__(self, name):
+                return getattr(self.tensor, name)
+
+        for matching_layout in (False, True):
+            # Real MXFP4 reshape/transpose pattern, with a nonzero slot offset.
+            backing = torch.zeros((3, 4, 6, 2), dtype=torch.uint8)
+            destination = backing[1].transpose(0, 1)
+            source = torch.arange(48, dtype=torch.uint8).reshape(4, 6, 2).transpose(0, 1)
+            if not matching_layout:
+                source = source.contiguous()
+            task_type = make_dataclass("Task", ["source", "destination", "nbytes", "name"])
+            task = task_type(source, DeviceView(destination), 48, "scale")
+
+            def allocate(shape, stride, **kwargs):
+                kwargs["pin_memory"] = False  # CPU-only validation; NPU run uses pinned storage.
+                return torch.empty_strided(shape, stride, **kwargs)
+
+            allocator = Mock(side_effect=allocate)
+            converted = self.module.storage_quant_copy(task, lambda tensor: 2, allocator)
+            converted.destination.copy_(converted.source)
+            self.assertTrue(torch.equal(destination, source))
+            self.assertEqual(backing[0].sum().item(), 0)
+            self.assertEqual(backing[2].sum().item(), 0)
+            self.assertEqual(allocator.call_count, 0 if matching_layout else 1)
+
     def quant_task(self):
         class Storage(bytearray):
             def nbytes(self):
@@ -25,6 +79,7 @@ class MoeHostSyncTests(unittest.TestCase):
                 device=SimpleNamespace(type=device),
                 dtype="float32",
                 shape=(2,),
+                stride=lambda: (1,),
                 is_contiguous=lambda: True,
                 numel=lambda: 2,
                 element_size=lambda: 4,
@@ -52,7 +107,7 @@ class MoeHostSyncTests(unittest.TestCase):
             elif mode == "shape":
                 task.destination.shape = (1, 2)
             elif mode == "stride":
-                task.destination.is_contiguous = lambda: False
+                task.destination.stride = lambda: (2,)
             elif mode == "bytes":
                 task.nbytes = 4
             elif mode == "bounds":

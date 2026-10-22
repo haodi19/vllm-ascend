@@ -113,6 +113,7 @@ class ExpertOffloadManager:
 
         self.offload_config = get_ascend_config().expert_offload_config
         self._host_dispatcher = None
+        self._mte_pending_quant_sources = []
         # The minimum capacity is the conservative global dispatch threshold;
         # actual weight and placement sizes are resolved per MoE layer.
         self.num_device_experts = min(
@@ -2440,6 +2441,9 @@ class ExpertOffloadManager:
                 if getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte':
                     from vllm_ascend.expert_offload.host_sync import storage_quant_copy
                     task = storage_quant_copy(task, torch_npu.get_npu_format)
+                    # CPU layout packing may allocate temporary pinned storage.
+                    # Keep it alive until the asynchronous load completes.
+                    self._mte_pending_quant_sources.append(task.source)
                 tasks.append(task)
         return tasks
 
@@ -2842,6 +2846,9 @@ class ExpertOffloadManager:
     def _synchronize_h2d(self) -> None:
         """Wait for the load stream and retire backend copy descriptors."""
         self._get_h2d_transport().synchronize(self.load_stream)
+        pending = getattr(self, '_mte_pending_quant_sources', None)
+        if pending is not None:
+            pending.clear()
 
     def close(self) -> None:
         """Release H2D backend resources; safe to call more than once."""
@@ -2854,6 +2861,9 @@ class ExpertOffloadManager:
         transport = getattr(self, 'h2d_transport', None)
         if transport is not None:
             transport.synchronize(self.load_stream)
+            pending = getattr(self, '_mte_pending_quant_sources', None)
+            if pending is not None:
+                pending.clear()
             transport.close()
 
     def _build_expert_h2d_tasks(self, layer, layer_idx, eid,

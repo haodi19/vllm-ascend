@@ -12,24 +12,50 @@ from dataclasses import replace
 from pathlib import Path
 
 
-def storage_quant_copy(task, get_format):
-    """Byte-preserving copy for dense ND quantization tensors on MTE path."""
+def dense_strides(shape, strides):
+    expected = 1
+    for stride, size in sorted((stride, size) for size, stride in zip(shape, strides) if size > 1):
+        if stride != expected:
+            return False
+        expected *= size
+    return all(size > 0 for size in shape)
+
+
+def storage_quant_copy(task, get_format, allocate_host=None):
+    """Match Tensor.copy_ semantics for dense ND views, packing on CPU only."""
     source, destination = task.source, task.destination
+    dst_format = get_format(destination)
     if (
         source.device.type != "cpu"
         or destination.device.type != "npu"
         or source.dtype != destination.dtype
         or tuple(source.shape) != tuple(destination.shape)
-        or not source.is_contiguous()
-        or not destination.is_contiguous()
-        or get_format(destination) != 2
+        or not dense_strides(destination.shape, destination.stride())
+        or dst_format != 2
         or source.numel() * source.element_size() != task.nbytes
         or destination.numel() * destination.element_size() != task.nbytes
     ):
         raise RuntimeError(
-            f"MTE quant storage copy requires matching dtype/shape, contiguous CPU->NPU ND tensors: "
-            f"{task.name}; src_dtype={source.dtype}; dst_dtype={destination.dtype}"
+            f"MTE quant storage copy requires matching dtype/shape and dense CPU->NPU ND layout: "
+            f"{task.name}; src_dtype={source.dtype}; dst_dtype={destination.dtype}; "
+            f"src_shape={tuple(source.shape)}; dst_shape={tuple(destination.shape)}; "
+            f"src_stride={source.stride()}; dst_stride={destination.stride()}; dst_format={dst_format}"
         )
+
+    if not dense_strides(source.shape, source.stride()) or any(
+        size > 1 and src_stride != dst_stride
+        for size, src_stride, dst_stride in zip(source.shape, source.stride(), destination.stride())
+    ):
+        if allocate_host is None:
+            # Optional dependency; CPU packing never launches a device kernel.
+            import torch
+
+            allocate_host = torch.empty_strided
+        packed = allocate_host(
+            tuple(destination.shape), tuple(destination.stride()), dtype=source.dtype, device="cpu", pin_memory=True
+        )
+        packed.copy_(source)
+        source = packed
 
     def byte_view(tensor):
         start = tensor.storage_offset() * tensor.element_size()
