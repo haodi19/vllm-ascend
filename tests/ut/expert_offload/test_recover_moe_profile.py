@@ -12,6 +12,26 @@ from unittest.mock import MagicMock, Mock, patch
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_raw_inventory_reports_missing_start_info_without_contents(self):
+        script = Path(__file__).resolve().parents[3] / "script"
+        module = runpy.run_path(str(script / "diagnose_profile_export.py"))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worker = root / "mte/python/test_ascend_pt"
+            worker.mkdir(parents=True)
+            console = io.StringIO()
+            with contextlib.redirect_stdout(console):
+                module["inspect_inputs"](root)
+            self.assertIn("start_info*: 0", console.getvalue())
+            info = worker / "PROF_1/device_0/start_info.0"
+            info.parent.mkdir(parents=True)
+            info.write_text("private metadata", encoding="utf-8")
+            console = io.StringIO()
+            with contextlib.redirect_stdout(console):
+                module["inspect_inputs"](root)
+            self.assertIn("start_info*: 1", console.getvalue())
+            self.assertNotIn("private metadata", console.getvalue())
+
     def test_timeout_kills_owned_process_group(self):
         script = Path(__file__).resolve().parents[3] / "script"
         with patch.object(sys, "path", [str(script), *sys.path]):
@@ -27,7 +47,8 @@ class RecoveryTests(unittest.TestCase):
                 module["run_parser"].__globals__,
                 os=types.SimpleNamespace(name="posix", killpg=kill),
                 signal=types.SimpleNamespace(SIGKILL=9),
-            ),self.assertRaises(module["subprocess"].TimeoutExpired)
+            ),
+            self.assertRaises(module["subprocess"].TimeoutExpired),
         ):
             module["run_parser"](["parser"], io.StringIO(), 1)
         self.assertTrue(launch.call_args.kwargs["start_new_session"])
