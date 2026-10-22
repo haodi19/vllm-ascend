@@ -436,15 +436,20 @@ def _inference(args, source, backend, env, log):
             if profile_status == "complete":
                 analyze = runpy.run_path(str(REPO / "script/analyze_callback_gaps.py"))["analyze"]
                 for index, trace in enumerate(sorted(profile_dir.rglob("trace_view.json"))):
-                    try:
-                        analyze(trace, args.output_dir / f"trace_with_gaps_{backend}_{index}.json")
-                    except (ValueError, OSError) as exc:
-                        print(f"GAP ANALYSIS NOT VERIFIED: {exc}", flush=True)
+                    analyze_gaps_safely(analyze, trace, args.output_dir / f"trace_with_gaps_{backend}_{index}.json")
         return report
     finally:
         with progress(f"{backend} service cleanup and port release; up to 50s"):
             stop_owned_service(child)
             wait_service_ports_free(args)
+
+
+def analyze_gaps_safely(analyze, trace, output):
+    """Keep optional trace postprocessing failures separate from inference results."""
+    try:
+        analyze(trace, output)
+    except Exception as exc:
+        print(f"GAP ANALYSIS NOT VERIFIED: {type(exc).__name__}: {exc}; trace={trace}", flush=True)
 
 
 def inspect_mstx_trace(profile_dir):

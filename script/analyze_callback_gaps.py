@@ -3,6 +3,7 @@
 import argparse
 import collections
 import json
+import math
 from pathlib import Path
 
 MAX_INTERVALS = 1000000
@@ -65,6 +66,23 @@ def analyze(path, output):
             phases[event.get("ph")] += 1
         if event.get("ph") != "X" or "ts" not in event or "dur" not in event:
             continue
+        relevant = name.startswith(("moe_offload/update_weights|", "moe_offload/host_callback|")) or (
+            "MEMCPY_ASYNC" in name.upper()
+        )
+        if not relevant:
+            continue
+        # CANN exports can mix JSON numbers and numeric strings in time fields.
+        for key in ("ts", "dur"):
+            value = event[key]
+            try:
+                if isinstance(value, bool):
+                    raise ValueError("boolean time")
+                number = float(value)
+                if not math.isfinite(number):
+                    raise ValueError("non-finite time")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"Invalid trace {key} for {name!r}: {value!r}") from exc
+            event[key] = number
         if event["dur"] < 0:
             continue
         if name.startswith("moe_offload/update_weights|"):
