@@ -1,8 +1,9 @@
 # MoE 卸载 MTE 交接改造：修改内容与完整执行流程
 
-本文说明截至 2026-10-22 的实现，对应代码基线 `db76c76f`。
-当前可选 MTE 后端已跑通一次真实模型的短请求测试；关闭诊断后的 callback/MTE 同轮对比正在进行，
-尚不能认定已获得性能收益。本文描述当前实现，不把尚未验证的推测写成结论。
+本文说明截至 2026-10-22 的实现。关闭诊断后的 callback/MTE 同轮短请求对比已完成，
+两组生成文本一致；本轮 MTE 请求平均时延增加约 3.31%，尚未获得整体加速证据。
+MTE 本轮设备侧 profile 原始数据缺失，交接时间线仍待重新采集验证。
+本文描述当前实现，不把尚未验证的推测写成结论。
 
 原流程与入图基础见 [CPU/NPU 卸载流程说明](moe_offload_cpu_npu_flow_zh.md)；
 实验命令和联调记录见 [MTE 接入说明](moe_host_sync_integration_zh.md)。
@@ -85,41 +86,103 @@
 generation 是同一交接槽位逐次递增的序号。用序号而不是一个始终为 true 的完成 flag，
 可以让设备区分“上一轮完成”与“这一轮完成”。
 
+**交接槽位是 MTE 新增的任务登记位置**，将三个对象用同一个 slot 编号关联：
+Python 中的函数及参数 `entries[slot]`、Host 控制区、NPU 中的 `states[slot]`。
+例如，同一层的预取和按需交接分别分配槽位；不同捕获图中的交接位置也分别分配。
+下一次重放复用这个槽位，不按请求重新分配。原 callback 模式由 Runtime 管理自己的回调任务，
+没有本项目新增的这张交接槽位表。
+
+**request 区**是“设备通知 CPU 开始任务”的控制内存区域，首字段是 `request_generation`。
+**completion 区**是“CPU 通知设备任务完成或失败”的区域，包含 `done_generation`、
+`error_generation` 和执行状态。这两个名称指内存区域，不是线程，也不是模型请求文本。
+
+NPU 张量 `states` 的形状为 `[2048, 4]`，每个槽位有四个 64 位字段：
+
+| 字段 | 含义 | 写入时机 |
+| --- | --- | --- |
+| `states[slot, 0]` | 当前 generation，即设备本轮期望完成的序号 | 发布算子读取旧值并加一 |
+| `states[slot, 1]` | 等待结果码：0 表示刚发布，1 成功，2 回调失败，3 轮询到限，4 非法序号 | 发布时初始化，等待退出时记录；2/3 用于有界测试等待 |
+| `states[slot, 2]` | 等待算子最后读到的 done 序号 | 等待退出时记录 |
+| `states[slot, 3]` | 本轮等待算子的轮询次数 | 等待退出时记录 |
+
+所以不能说“所有状态都在 CPU 内存”，也不能把 `states` 当成 CPU 要轮询的 flag。
+**跨 CPU/NPU 通知用的 request/done 信号都在注册 Host 内存；NPU 内存中的 `states`
+保存设备自己的期望序号和等待结果。**它不是独立的“CPU 写入、NPU 轮询”的完成信号副本。
+正式推理的严格等待遇到错误不会放行，结果记录也不保证在错误情况下执行，由 Host 监控负责终止进程。
+
+### 2.3 调度对象与新增算子
+
+**Python 类 `MteHostDispatcher`** 是 MTE 交接的管理器，不是线程。其实例持有交接槽位表、
+NPU 状态张量、Host 会话和设备算子动态库。方法 `launch` 在捕获期间登记任务并提交算子；
+方法 `_run` 在 CPU 工作线程上执行已登记的任务。
+**C++ 类 `Session`** 经 pybind 暴露给 Python，负责注册 Host 控制内存、创建工作线程、轮询和发布完成状态。
+
+| 名称及类型 | 功能 | 是否进入真实 MoE 图 |
+| --- | --- | --- |
+| AIV 算子 `host_sync_publish` | 更新 NPU 本轮序号，通过 MTE 写 Host request，通知工作线程 | 是 |
+| AIV 算子 `host_sync_wait` | 通过 MTE 反复读取 Host completion，完成序号匹配才放行当前流 | 是 |
+| AIV 测试算子 `host_sync_consume` | 在独立数据流测试中读取权重、映射、路由并产生校验结果 | 否；真实模型仍使用原专家计算算子 |
+
+C 接口函数 `host_sync_publish_launch`、`host_sync_wait_launch`、`host_sync_wait_strict_launch`
+是 CPU 侧的算子启动包装，不是另外三个设备算子。两个 wait 包装都启动同一个 `host_sync_wait`：
+普通包装传入有限轮询次数用于初始化/测试，strict 包装传入 0 表示推理中不按轮询次数提前退出。
+测试接口函数 `host_sync_consume_launch` 同样只是启动上述测试算子。
+
+### 2.4 轮询替换了什么，仍有哪些开销
+
+MTE 图内卸载交接不再调用 `_launch_host_func`，也不通过该处的报告队列等待、唤醒报告线程来启动工作。
+设备算子写 request 后，已经存在的工作线程直接轮询发现变化；设备算子轮询 done 等待 CPU 完成。
+这正是本次替换报告通知机制、尝试减少通知和唤醒成本的方向。
+
+但“仍调用 Python 回调函数”与“仍使用 ACL 回调机制”是两回事：`_update_weights_guarded`
+仍是登记后调用的任务函数，执行它的是 MTE 工作线程。MSTX 的 `host_callback` 名称沿用旧名称。
+
+当前实现不是完全无系统调用、无锁或无中断的纯忙等：工作线程空闲时调用
+`std::this_thread::yield()`，可能进入操作系统调度；检查槽位使用互斥锁，调用 Python 需要 GIL，
+竞争时可能阻塞；完成任务还调用条件变量的 `notify_all()`。
+设备任务提交、Host 内存分配/注册、权重 H2D 完成同步、监控线程等待等也仍可能使用 Runtime、驱动或系统调用。
+因此只能说替换了卸载交接的报告回调机制，不能宣称整个推理已经没有中断或系统调用，
+更不能把旧版本所有空泡都归因于中断，再认为已被消除。
+
 ## 3. 按八步理解当前完整流程
 
 ### 第一步：初始化加载资源和常驻工作线程
 
-`ExpertOffloadManager` 根据后端配置创建加载流。模型权重准备、热专家预加载完成后，
-`_finalize_offload` 创建 `MteHostDispatcher`，此时还没开始正式的图捕获。
+卸载管理类 `ExpertOffloadManager` 根据后端配置创建加载流。模型权重准备、热专家预加载完成后，
+方法 `_finalize_offload` 创建交接管理类 `MteHostDispatcher` 的实例，此时还没开始正式的图捕获。
 
-Dispatcher 创建 NPU `states` 数组，并通过 Host 扩展创建 `Session`。ACL 后端先使用
-`aclrtMallocHost` 分配 Host 内存，再对其中对齐的区域调用 `aclrtHostRegister`，获得设备别名。
+该 Dispatcher 对象创建 NPU 状态张量 `states`，并通过 Host 扩展创建 C++ 会话类 `Session` 的实例。
+ACL 后端先调用内存分配接口函数 `aclrtMallocHost`，再对其中对齐的区域调用注册接口函数
+`aclrtHostRegister`，获得设备别名。
 因此 `aclrtHostRegister` 在这里负责注册映射，不是单独承担内存分配。
 
-当前预分配 2048 个交接槽位，每槽位 1024 字节：request 在偏移 0，completion 区在偏移 512。
+当前预分配 2048 个交接槽位，每槽位 1024 字节：请求控制区 request 在偏移 0，完成控制区 completion 在偏移 512。
 注册好所有槽位的 Python 入口后，启动一个 C++ 工作线程，它进入对应 ACL context 后开始轮询。
 槽位 0 用于一次初始化握手，其余槽位留给捕获的真实回调；同时启动监控线程。
 
 ### 第二步：捕获图时，为每个回调记录固定的发布／等待节点
 
-捕获执行到外层 `update_weights` 时，CPU 仍会执行 Python：提交路由等数据的 D2H，
-准备参数，然后进入 `_launch_offload_callback`。MTE 分支调用 `MteHostDispatcher.launch`。
+捕获执行到外层方法 `update_weights` 时，CPU 提交线程仍会执行 Python：提交路由等数据的
+D2H（设备到 Host 拷贝），准备参数，然后进入分派方法 `_launch_offload_callback`。
+MTE 分支调用交接管理器的方法 `MteHostDispatcher.launch`。
 
-`launch` 为这个捕获的回调分配一个新交接槽位，将函数与参数引用保存到 `entries[slot]`。
-它在前面的复制、事件任务提交之后读取 `stream.npu_stream`，随后通过 `ctypes` 调用独立动态库的
-`host_sync_publish_launch` 和 `host_sync_wait_strict_launch`，把两个算子提交到同一条当前流中。
+方法 `launch` 为这个捕获的回调分配一个新交接槽位，将函数与参数引用保存到 Python 表项 `entries[slot]`。
+它在前面的复制、事件任务提交之后读取流对象的句柄属性 `stream.npu_stream`，随后通过 Python 外部函数接口模块
+`ctypes` 调用独立动态库的 C 启动函数 `host_sync_publish_launch` 和 `host_sync_wait_strict_launch`，
+把发布和等待两个算子提交到同一条当前流中。
 当前流处于捕获状态，因此这两个算子成为图节点。
 
-按需路径保存 `_update_weights_guarded`；预取路径保存 `_prefetch_host_cb`。
+按需路径保存带错误保护的任务函数 `_update_weights_guarded`；预取路径保存预取任务函数 `_prefetch_host_cb`。
 不同捕获位置分别保留参数，避免预取和按需任务互相覆盖。这里只记录调用入口和参数引用，
 不会把 Python 回调函数编译成 NPU kernel。
 
 ### 第三步：重放图，NPU 先计算本轮路由并回传给 CPU
 
-正式推理重放图时，CPU 不再逐行重跑已捕获的外层 `update_weights`，
+正式推理重放图时，CPU 提交线程不再逐行重跑已捕获的外层方法 `update_weights`，
 也不再为这些图节点分配交接槽位。NPU 按图中的操作和依赖执行。
 
-按需路径先取得本层实际路由结果，再执行已捕获的 `topk_ids_h.copy_`、映射回传等操作。
+按需路径先取得本层实际路由结果，再执行已捕获的张量拷贝方法 `topk_ids_h.copy_`、映射回传等操作；
+其中 Host 张量 `topk_ids_h` 存放回传的专家 ID。
 预取路径先预测下一层可能需要的专家，再回传预测结果，通过原来的事件依赖衔接预取流。
 
 地址固定，内容随每次推理变化。CPU 回调随后读取的是这些固定 Host 缓冲区中的本轮结果。
@@ -127,11 +190,11 @@ Dispatcher 创建 NPU `states` 数组，并通过 Host 扩展创建 `Session`。
 
 ### 第四步：发布算子写入本轮 request，等待算子开始等 done
 
-`host_sync_publish` 读取该槽位 NPU `states` 中的旧序号，加一得到本轮 generation，
+设备发布算子 `host_sync_publish` 读取该槽位 NPU 状态张量 `states` 中的旧序号，加一得到本轮序号 generation，
 写回设备状态，并通过 MTE 把 8 字节 request 写到注册 Host 内存。
 
-紧随其后的 `host_sync_wait` 读取本轮期望序号，不断通过 MTE 读取 Host completion 区，
-直到观察到 `done_generation` 等于本轮序号且没有对应错误，才退出。
+紧随其后的设备等待算子 `host_sync_wait` 读取本轮期望序号，不断通过 MTE 搬运引擎读取 Host 完成控制区 completion，
+直到观察到完成序号字段 `done_generation` 等于本轮序号且没有对应错误，才退出。
 控制区访问使用禁用 L2 缓存的提示，以及 MTE/标量流水间的完成屏障；
 跨 CPU/NPU 的实际可见性此前已在目标机器握手测试中验证，不能仅由缓存提示推导通用保证。
 
@@ -141,25 +204,27 @@ CPU 工作线程独立运行，双方通过内存信号配合。等待 kernel �
 
 ### 第五步：CPU 轮询发现请求，调用原卸载回调
 
-C++ `Session::poll` 逐槽位检查 request。发现非零且尚未完成的 generation 后，
-将状态设为 Running，取得 GIL，调用该槽位绑定的 Python 入口 `MteHostDispatcher._run`。
+C++ 会话方法 `Session::poll` 在前述常驻 CPU 工作线程上逐槽位检查请求区 request。
+发现非零且尚未完成的序号 generation 后，将执行状态设为 Running（处理中），
+取得 Python 解释器锁 GIL，调用该槽位绑定的 Python 调度方法 `MteHostDispatcher._run`。
 
-`_run` 取出 `entries[slot]` 中的函数和参数，执行 `_update_weights_guarded` 或
-`_prefetch_host_cb`，最终进入内层 `_update_weights`。它们仍是 Python 函数，
+方法 `_run` 取出任务表项 `entries[slot]` 中的函数和参数，执行按需任务函数 `_update_weights_guarded` 或
+预取任务函数 `_prefetch_host_cb`，最终进入内层方法 `_update_weights`。它们仍是 Python 函数，
 不是此次改造新写的一套 C++ 专家选择逻辑。
 
-工作线程串行执行这些回调；没有任务时使用 `std::this_thread::yield()` 让出调度机会。
+工作线程串行执行这些回调；没有任务时调用 C++ 调度让出函数 `std::this_thread::yield()`。
 当前没有按层创建线程，也没有为预取、按需分别创建两个计算 worker。
 
 ### 第六步：CPU 选择专家，提交实际权重加载，并等待加载完成
 
-内层 `_update_weights` 沿用原来的缓存逻辑：根据路由判断命中与缺失，按对应路径调用
-`observe`、`choose_victims` 等策略，决定需要加载的专家及缓存槽位，构造 H2D 任务并维护映射。
+内层方法 `_update_weights` 沿用原来的缓存逻辑：根据路由判断命中与缺失，按对应路径调用
+策略方法 `observe`（记录专家使用信息）、`choose_victims`（选择被替换专家），
+决定需要加载的专家及缓存槽位，构造 H2D（Host 到设备）任务并维护映射。
 预取使用预测信息，其策略调用并不必然与按需路径逐项相同；例如当前统计中预取没有 observe 耗时。
 
-`load_submit` 表示 CPU 构造、提交这些搬运任务及相关处理的过程，**不等于传输已经完成**。
+计时段 `load_submit` 表示 CPU 构造、提交这些搬运任务及相关处理的过程，**不等于传输已经完成**。
 实际搬运在加载流上异步执行。权重任务、量化参数任务及必要的 scale 刷新提交后，
-`_synchronize_h2d()` 等待加载流完成；随后才可以允许回调正常返回。
+同步方法 `_synchronize_h2d()` 等待加载流完成；随后才可以允许回调正常返回。
 
 为解决真实模型中的量化参数 Tensor 拷贝阻塞，MTE 路径使用以下适配：
 
@@ -171,19 +236,50 @@ C++ `Session::poll` 逐槽位检查 request。发现非零且尚未完成的 gen
 这保持原 Tensor `copy_` 的逻辑结果，但准备过程可能增加 CPU 开销。它不是跳过 scale，
 也不是把尚未完成的传输标成完成。当前 ND 限制和边界检查仍保留。
 
+**为什么不能直接沿用原来的 Tensor 拷贝路径。**原 callback 版由报告线程在 Runtime 的回调协议下执行任务；
+MTE 版换成了独立工作线程，并且设备流中有一个尚未退出的 AIV 等待算子。
+从 CPU 看似乎只是换了任务入口，但线程上下文、Host 提交队列和设备资源等待条件已经改变。
+
+原来的普通加载流可能先把操作排入 Torch Host 任务队列。MTE 的工作线程需要在设备等待期间把
+H2D 真正提交出去，不能依赖被其他等待占住的提交环节，所以改用直接提交的流类型 `SyncLaunchStream`。
+这解决的是提交方式的兼容要求，不等于已证明原来所有阻塞都由 Host 队列造成。
+
+实际联调中，换流后仍有阻塞。逐项等待日志显示：第一处出问题的预取加载中，
+8 MiB 的 w13 和 4 MiB 的 w2 任务均完成；512 KiB 的 `w13_weight_scale` 任务已提交，
+但等待其完成没有返回。后面的 scale 刷新尚未执行，因此不能归因于刷新操作。
+量化参数使用张量级 `Tensor.copy_`，而权重已有底层 Storage 搬运路径，这使量化拷贝成为明确的排查点。
+
+张量级拷贝要求保持逻辑元素对应关系。即使形状和类型相同，源、目标 stride（物理排列步长）不同，
+也不能简单逐字节复制；后端可能安排额外的布局转换、临时数据处理或同步。
+若其中有工作依赖正被设备等待算子占住的资源或流，就可能形成
+“NPU 等 CPU 完成 → CPU 等拷贝完成 → 拷贝依赖尚不能执行的设备工作”的等待环。
+这是与本次执行模型变化相符的机制解释，**尚未由原生调用栈或设备调度证据证明为这次阻塞的唯一根因**。
+不能据此断言 Tensor 拷贝一定发出了某个具体转换 kernel，或已经确认就是 AIV 资源耗尽。
+
+当前适配函数 `storage_quant_copy` 把必要的布局准备提前放在 CPU：目标 ND 布局满足检查后，
+若源布局不同，就调用 CPU 分配函数 `torch.empty_strided(..., pin_memory=True)` 和 CPU 张量方法
+`packed.copy_(source)`，按目标 stride 重排；随后构造原始字节视图并走 Storage 搬运。
+这样缩小了 H2D 阶段需要后端处理的张量语义范围，也保留了原拷贝的逻辑结果。
+这条路径在目标机器上消除了已复现的阻塞，但不能从“换路径后通过”反推所有底层细节都已证实。
+
+因此，这是 MTE 改变执行条件后引入的兼容性改动，不是原版普遍需要修复，也不是 generation 协议必然要求的步骤。
+其代价包含每任务的布局检查、字节视图构造，以及布局不一致时的 pinned 内存分配和 CPU 重排。
+这些都计入任务准备段 `load_prepare`；现有计时尚不能拆出每一项的独立耗时。
+
 ### 第七步：CPU 发布完成序号，NPU 等待算子退出
 
-Python 回调成功返回后，C++ worker 在 Host completion 区更新成功状态，
-以 release 原子写发布 `done_generation`。注意，done 由 C++ 会话在回调返回后发布，
-不是外层 `update_weights` 在提交时写入。
+Python 任务函数成功返回后，C++ 工作线程在 Host 完成控制区 completion 更新成功状态，
+以 release 内存序的原子写发布完成序号字段 `done_generation`。
+注意，done 由 C++ 会话在回调返回后发布，不是外层方法 `update_weights` 在提交时写入。
 
 NPU 等待算子观察到本轮 done 后记录结果并退出，当前流才继续执行后面的图节点。
-这一步没有“返回 `_launch_host_func`”：MTE 分支没有调用它。
+这一步没有“返回回调提交函数 `_launch_host_func`”：MTE 分支没有调用它。
 返回链是 Python 回调 → Dispatcher → C++ worker；设备侧则独立从等待节点继续。
 
 ### 第八步：映射写回，继续专家计算或结束预取
 
-按需路径接着执行已捕获的 `log2phy.copy_(log2phy_h, ...)`，把专家逻辑 ID 到物理权重槽位的
+按需路径接着执行已捕获的张量拷贝方法 `log2phy.copy_(log2phy_h, ...)`，其中 `log2phy_h`
+是 Host 映射张量，`log2phy` 是 NPU 映射张量；该操作把专家逻辑 ID 到物理权重槽位的
 映射写回 NPU，随后按原事件、预测和计算依赖继续运行。专家计算使用本轮映射和已加载权重。
 
 预取路径接着写回下一层映射，并记录预取完成事件。后续按需流程按原逻辑与该事件衔接，
@@ -249,7 +345,45 @@ MTE 版由新增 worker 轮询 request，提交线程不参与这项轮询；监
 改变的是中间的通知、执行回调的线程及设备等待方式，同时包含前述加载流和量化参数适配。
 两版的预取交接都发生在预取流，前后由原事件连接到计算流；MTE 预取与按需共用同一个 CPU worker。
 
-## 5. 一个具体例子
+## 5. 精简流程与调用链
+
+初始化时，交接管理对象 `MteHostDispatcher` 创建 Host 会话、控制内存、NPU 状态张量以及一个常驻 CPU 工作线程。
+捕获时，CPU 提交线程把任务函数及参数登记到交接槽位，在当前设备流中记录发布和等待两个 AIV 算子。
+重放时，NPU 先回传路由，再由发布算子递增 `states` 中的本轮序号，并将序号写到 Host request。
+CPU 工作线程轮询发现新序号，执行登记的卸载函数，选择专家、提交 H2D 并等待实际完成；
+之后把相同序号写到 Host completion 的 done 字段。设备等待算子通过 MTE 读到匹配的 done 后退出，
+当前流才能写回映射并继续。两端始终各自执行，通过内存序号交接，不是 NPU 开始执行 Python。
+
+捕获期间的提交链如下；箭头表示同一提交线程上的函数调用：
+
+```text
+CPU 提交线程
+  按需：外层方法 update_weights
+    → 分派方法 _launch_offload_callback
+    → 管理器方法 MteHostDispatcher.launch(stream, _update_weights_guarded, args)
+      → 登记 entries[slot]，计算 Host 控制区及 NPU states 地址
+      → C 启动函数 host_sync_publish_launch → 将发布算子记录进当前图
+      → C 启动函数 host_sync_wait_strict_launch → 将等待算子记录进当前图
+    → 继续提交映射 H2D 等后续图节点
+```
+
+预取也经分派方法进入 `launch`，但登记的是预取任务函数 `_prefetch_host_cb`，使用预取流及相应参数。
+下面是图重放后，由工作线程独立触发的执行链；不是 `launch` 同步调用了这些函数：
+
+```text
+NPU 发布算子：写 request_generation=g
+  ↓ 共享内存可见，工作线程轮询发现
+CPU 工作线程：C++ Session::run → Session::poll
+  → 捕获前注册的槽位入口 lambda
+  → Python 方法 MteHostDispatcher._run(slot)
+  → 按需 _update_weights_guarded / 预取 _prefetch_host_cb
+  → 内层 _update_weights → 提交权重 → _synchronize_h2d 等待加载完成
+  → 逐层返回到 Session::poll → 写 done_generation=g
+  ↓ 设备算子通过 MTE 轮询读到
+NPU 等待算子：退出 → 当前流执行映射 H2D 及后续任务
+```
+
+## 6. 一个具体例子
 
 假设当前图中的某个预取回调绑定交接槽位 2，上次完成序号是 6。
 本次预测下一层需要专家 139，且它不在 NPU 缓存中，策略决定放入权重槽位 20。
@@ -261,7 +395,7 @@ NPU 先回传预测结果，再由发布算子写 `request[2]=7`。CPU worker �
 这里交接槽位 2、专家 ID 139、权重槽位 20 各有不同用途。下一次重放仍可使用交接槽位 2，
 但预测专家和最终权重槽位都可以变化；图固定的是操作与缓冲区地址，不是专家选择结果。
 
-## 6. 故障处理、诊断与资源释放
+## 7. 故障处理、诊断与资源释放
 
 默认推理使用严格等待：不能因为轮询次数达到某个上限就继续使用旧权重。
 回调抛异常，或原 guarded 回调记录了失败，Dispatcher 会终止当前引擎进程。
@@ -275,7 +409,7 @@ BEGIN、SUBMITTED、COMPLETE，定位第一个未完成的操作。它会改变�
 正常关闭时先同步设备，确保图不再访问控制地址，再停止监控线程、结束设备访问租约、
 停止 worker、注销 Host 映射并释放内存。不能在图仍等待或访问控制区时先释放它。
 
-## 7. 已验证结果与当前边界
+## 8. 已验证结果与当前边界
 
 独立测试已经覆盖 Host worker、注册内存、MTE 握手、图重放，以及实际路由/权重/映射传输链路。
 真实模型最初卡在第 1 层预取；分阶段诊断证明大权重拷贝完成，随后 scale Tensor 拷贝无法完成。
@@ -285,11 +419,34 @@ BEGIN、SUBMITTED、COMPLETE，定位第一个未完成的操作。它会改变�
 这说明当前短请求的数据流已跑通，但尚未从原生栈或设备调度证据证明原 Tensor 拷贝阻塞的完整底层原因。
 同样，不能仅凭这一次短请求推广到全部输入、模型和设备。
 
-本次 MTE 请求均值 3365.015 ms，旧 callback 基线 3348.679 ms，尚无整体加速证据。
-load_prepare 变长，需要进一步区分布局准备、检查和其他因素；当前同轮对比正在运行，
-先保留最终实现，取得数据后再决定是否优化。比较的是完整 MTE 方案，不是纯同步原语的孤立耗时。
+上述早期 MTE 请求均值 3365.015 ms，旧 callback 基线 3348.679 ms，尚无整体加速证据。
+随后 `moe_host_sync_01` 的同轮对比关闭诊断，两组各预热 3 次、测量 10 次：生成文本一致，
+各 1700 次计时调用无错误；callback 请求均值 3357.783 ms，MTE 为 3468.949 ms，增加约 3.31%。
+按需 `load_prepare` 均值从 137.670 μs 增至 742.821 μs，不能把增量全部归为某个未单独计时的子操作。
+该轮 callback 时间线可读，MTE 缺少 start/end 信息及标准位置的设备原始 data，不能据此比较交接空泡。
+比较的是完整 MTE 方案，不是纯同步原语的孤立耗时。
 
-## 8. 对照代码阅读
+## 9. 图捕获与模型请求的关系
+
+图的生命周期属于模型执行器，不属于单个用户请求。当前模型执行器的方法 `capture_model`
+进入图捕获流程，通常在服务初始化、模型加载及预热阶段按配置准备图；图包装层也可能在首次遇到
+某种执行规格时捕获。具体时机由运行版本与图配置决定，不是每收到一个请求都先捕获一次。
+
+当前脚本配置 `FULL_DECODE_ONLY` 和捕获尺寸 `[1, 2, 3]`，表示准备相应 Decode 执行规格的图，
+不是分别为第 1、2、3 个请求捕获。图缓存还可能区分其他执行描述信息，不能据三个尺寸断言只有三张图。
+Prefill、MTP 草稿步骤、未匹配规格的操作是否入图由各自配置决定；例如本脚本的 MTP 配置有
+`enforce_eager=true`，不能把整个请求理解成一张统一重放的图。
+
+一个请求包含多个模型执行步骤：Prefill 处理输入，后续 Decode/推测验证继续产生 token。
+符合已捕获图规格的步骤直接重放已有图；同一张图可跨多个请求复用。
+MTP 一步可以涉及多行 token，不能简单认为一个 token 就对应一次 replay。
+
+例如服务已准备好某个三行输入的 Decode 图，请求 A 的验证步骤和之后请求 B 的兼容步骤都能重放它。
+每次重放仍使用原交接槽位与地址，但路由数据变化，generation 递增；只有新捕获的图节点才经
+`MteHostDispatcher.launch` 分配新的交接槽位。重放不重新执行这个 Python 方法，
+但 CPU 工作线程仍需每次执行内层卸载任务。
+
+## 10. 对照代码阅读
 
 | 文件 | 主要内容 |
 | --- | --- |
