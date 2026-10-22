@@ -5,12 +5,44 @@ import io
 import runpy
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, Mock, patch
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_timeout_kills_owned_process_group(self):
+        script = Path(__file__).resolve().parents[3] / "script"
+        with patch.object(sys, "path", [str(script), *sys.path]):
+            module = runpy.run_path(str(script / "recover_moe_profile.py"))
+        child = MagicMock()
+        child.__enter__.return_value = child
+        child.pid = 123
+        child.wait.side_effect = [module["subprocess"].TimeoutExpired("parser", 1), 0]
+        kill = Mock()
+        with (
+            patch.object(module["subprocess"], "Popen", return_value=child) as launch,
+            patch.dict(
+                module["run_parser"].__globals__,
+                os=types.SimpleNamespace(name="posix", killpg=kill),
+                signal=types.SimpleNamespace(SIGKILL=9),
+            ),self.assertRaises(module["subprocess"].TimeoutExpired)
+        ):
+            module["run_parser"](["parser"], io.StringIO(), 1)
+        self.assertTrue(launch.call_args.kwargs["start_new_session"])
+        kill.assert_called_once_with(123, 9)
+
+    def test_diagnostic_excerpt_includes_exception(self):
+        script = Path(__file__).resolve().parents[3] / "script"
+        module = runpy.run_path(str(script / "diagnose_profile_export.py"))
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "parser.log"
+            log.write_text("start\nTraceback:\nfile.py line 1\nValueError: synthetic\nend", encoding="utf-8")
+            before = log.read_bytes()
+            self.assertIn("ValueError: synthetic", module["excerpt"](log))
+            self.assertEqual(log.read_bytes(), before)
+
     def test_reparse_copy_preserves_original_and_checks_labels(self):
         script = Path(__file__).resolve().parents[3] / "script"
         with patch.object(sys, "path", [str(script), *sys.path]):
@@ -27,7 +59,7 @@ class RecoveryTests(unittest.TestCase):
                 old.mkdir()
                 (old / "trace_view.json").write_text("broken")
 
-                def reparse(command, valid=valid, **kwargs):
+                def reparse(command, stream, timeout, valid=valid):
                     target = Path(command[-1]) / "test_ascend_pt"
                     self.assertEqual((target / "FRAMEWORK/torch.op_range").read_bytes(), b"raw data")
                     exported = target / "ASCEND_PROFILER_OUTPUT"
@@ -38,7 +70,7 @@ class RecoveryTests(unittest.TestCase):
 
                 with (
                     patch.object(sys, "argv", ["recover", str(source), "--output-dir", str(output)]),
-                    patch.object(module["subprocess"], "run", side_effect=reparse),
+                    patch.dict(module["main"].__globals__, run_parser=reparse),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
                     self.assertEqual(module["main"](), 0 if valid else 1)

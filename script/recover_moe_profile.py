@@ -1,12 +1,34 @@
 """在新目录离线重新解析已有采集；保留原始文件，不启动模型。"""
 
 import argparse
+import contextlib
+import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
 
 from run_verified_cpp_tests import validate_profile_trace
+
+
+def run_parser(command, stream, timeout):
+    """Isolate Linux parser children so a timeout cannot leave them running."""
+    with subprocess.Popen(
+        command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=os.name == "posix"
+    ) as child:
+        try:
+            code = child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if os.name == "posix":
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(child.pid, signal.SIGKILL)
+            else:
+                child.kill()
+            child.wait()
+            raise
+        if code:
+            raise subprocess.CalledProcessError(code, command)
 
 
 def main():
@@ -40,7 +62,7 @@ def main():
         ]
         try:
             with log.open("w", encoding="utf-8") as stream:
-                subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, timeout=args.timeout, check=True)
+                run_parser(command, stream, args.timeout)
             trace = target / "ASCEND_PROFILER_OUTPUT/trace_view.json"
             count, labels = validate_profile_trace(trace, require_mstx=True)
             print(f"可视化有效：events={count}; MSTX={labels}; 导入目录={target}", flush=True)
