@@ -399,6 +399,7 @@ class MoeHostSyncTests(unittest.TestCase):
         new = json.loads(after[after.index("--additional-config") + 1])["expert_offload_config"]
         self.assertEqual(new.pop("host_sync_backend"), "mte")
         self.assertEqual(new.pop("host_sync_library"), "/tmp/libhost_sync_device.so")
+        self.assertFalse(new.pop("host_sync_diagnose_load"))
         self.assertEqual(new, old)
         self.assertFalse(any(not word.strip() for word in after))
 

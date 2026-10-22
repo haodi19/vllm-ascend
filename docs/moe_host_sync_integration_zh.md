@@ -82,6 +82,29 @@ CPU 测试使用真实 uint8 转置 Tensor，覆盖顺序匹配/不匹配及非�
 避免异步拷贝仍在读取时临时缓冲区被回收；同步失败时继续保留。
 继续运行带 `--diagnose-load-stages` 的真实模型命令；本改动尚待 NPU 验证。
 
+## 首次真实推理通过及下一步
+
+绿区 `moe_host_sync_ecf9e013` 已完成预热 1 次、测量 3 次，510 次回调
+（预取 252、按需 258），errors/dropped/MSTX marker errors 均为 0。
+生成文本摘要和 token 用量与此前 callback 基线一致，仅代表本次短输入覆盖。
+停止 profile 耗时约 21 秒，导出成功，位于该结果目录的 `profile/mte/python/`。
+辅助 gap 分析失败不代表 profile 丢失；解析器现补充根数组和 BOM 支持，
+对象格式仍保留头部长度限制，实际导出格式兼容性需下一轮确认。
+
+请求均值为 3365.015 ms，旧 callback 基线为 3348.679 ms，约高 0.49%，尚无整体加速证据。
+预取/按需的 load_prepare 均值分别为 183.799/878.153 us，旧基线为 33.421/135.052 us；
+新增布局处理是需要关注的候选开销，但跨轮差异不能直接归因为某一个步骤。
+该次开启前 8 批诊断屏障，屏障日志出现在预热中，不能声称所有测量请求都被额外屏障拖慢。
+
+下一轮保持实现不变，关闭诊断，从冷启动同时复测两组并保存 profile：
+
+```bash
+python -B script/run_moe_host_sync.py --npu 1 --requests 10 --warmup-requests 3
+```
+
+脚本显式关闭两组的加载诊断开关，避免测试脚本中残留配置。仍输出 summary.txt。
+本轮对比的是当前完整 MTE 方案（含兼容性修改），不是单独测量交接原语的纯收益。
+
 ## 接入位置与执行流程
 
 原来的 `host_sync_backend=callback` 是默认路径，继续使用 `_launch_host_func`。

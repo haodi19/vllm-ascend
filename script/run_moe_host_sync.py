@@ -28,8 +28,7 @@ def configured_source(source, backend, library, diagnose_load=False):
     offload = config["expert_offload_config"]
     offload["host_sync_backend"] = backend
     offload["host_sync_library"] = str(library) if backend == "mte" else ""
-    if diagnose_load:
-        offload["host_sync_diagnose_load"] = backend == "mte"
+    offload["host_sync_diagnose_load"] = bool(diagnose_load and backend == "mte")
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 

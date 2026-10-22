@@ -11,16 +11,23 @@ MAX_INTERVALS = 1000000
 def events(path):
     """流式读取 traceEvents 数组，避免将数 GB 的时间线全部载入内存。"""
     decoder = json.JSONDecoder()
-    with path.open(encoding="utf-8") as source:
-        buf = ""
-        while '"traceEvents"' not in buf:
+    with path.open(encoding="utf-8-sig") as source:
+        buf = source.read(65536).lstrip()
+        while not buf:
             chunk = source.read(65536)
             if not chunk:
-                raise ValueError("找不到 traceEvents 数组")
-            buf += chunk
-            if len(buf) > 1024 * 1024:
-                raise ValueError("traceEvents 不在文件头 1MB 内")
-        buf = buf[buf.index('"traceEvents"') + len('"traceEvents"') :]
+                raise ValueError("时间线为空")
+            buf = chunk.lstrip()
+        # CANN exports may use a root array instead of a traceEvents object.
+        if not buf.startswith("["):
+            while '"traceEvents"' not in buf:
+                chunk = source.read(65536)
+                if not chunk:
+                    raise ValueError("找不到 traceEvents 数组")
+                buf += chunk
+                if len(buf) > 1024 * 1024:
+                    raise ValueError("traceEvents 不在文件头 1MB 内")
+            buf = buf[buf.index('"traceEvents"') + len('"traceEvents"') :]
         while "[" not in buf:
             chunk = source.read(65536)
             if not chunk:
