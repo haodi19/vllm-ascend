@@ -299,6 +299,7 @@ class TestMstx(unittest.TestCase):
             )
             kwargs = npu.profiler._ExperimentalConfig.call_args.kwargs
             self.assertEqual(kwargs.get("mstx", False), enabled)
+            self.assertEqual(kwargs["data_simplification"], not enabled)
 
 
 if __name__ == "__main__":

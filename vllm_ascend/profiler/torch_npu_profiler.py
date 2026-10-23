@@ -57,7 +57,9 @@ class TorchNPUProfilerWrapper(WorkerProfiler):
             aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
             l2_cache=False,
             op_attr=False,
-            data_simplification=True,
+            # Retain intermediate CANN exports/logs for offload timeline diagnosis.
+            # A failed final JSON export must not erase useful recovery inputs.
+            data_simplification=not mstx_options.get("mstx", False),
             record_op_args=False,
             gc_detect_threshold=None,
             **mstx_options,

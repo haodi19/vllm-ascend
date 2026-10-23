@@ -76,6 +76,10 @@ class RecoveryTests(unittest.TestCase):
                 raw = worker / "FRAMEWORK"
                 raw.mkdir(parents=True)
                 (raw / "torch.op_range").write_bytes(b"raw data")
+                device = worker / "PROF_1/device_0"
+                (device / "data").mkdir(parents=True)
+                (device / "data/task").write_bytes(b"device data")
+                (device / "start_info.0").write_bytes(b"start")
                 old = worker / "ASCEND_PROFILER_OUTPUT"
                 old.mkdir()
                 (old / "trace_view.json").write_text("broken")
@@ -91,7 +95,7 @@ class RecoveryTests(unittest.TestCase):
 
                 with (
                     patch.object(sys, "argv", ["recover", str(source), "--output-dir", str(output)]),
-                    patch.dict(module["main"].__globals__, run_parser=reparse),
+                    patch.dict(module["main"].__globals__, run_parser=reparse, require_space=Mock()),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
                     self.assertEqual(module["main"](), 0 if valid else 1)

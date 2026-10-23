@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from profile_storage import require_space
 from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, run_step
 from run_host_sync_stage2 import target_cmake_args
 from run_host_sync_stage3 import select_build_directory
@@ -88,6 +89,8 @@ def main():
     if min(args.requests, args.warmup_requests, args.startup_timeout, args.request_timeout, args.profile_timeout) < 1:
         parser.error("Counts/timeouts must be positive")
     root = (args.output_dir or REPOSITORY_ROOT / "bench_results" / f"moe_host_sync_{uuid4().hex[:8]}").resolve()
+    require_space(root)
+    require_space(REPOSITORY_ROOT, minimum_gib=2)
     root.mkdir(parents=True, exist_ok=False)
     with (
         (root / "summary.txt").open("w", encoding="utf-8") as file,

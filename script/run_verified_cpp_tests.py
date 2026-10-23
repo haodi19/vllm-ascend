@@ -410,7 +410,11 @@ def inference(args, source, backend, env):
 
 
 def _inference(args, source, backend, env, log):
+    # Lazy import also supports the standalone runpy-based CPU tests.
+    from profile_storage import require_space
+
     profile_dir = args.profile_run_dir / backend
+    require_space(profile_dir)
     prefix, command, model, _ = launch_spec(
         source, backend, args.npu, args.port, args.timing_port, profile_dir, mstx=getattr(args, "mstx", False)
     )
@@ -459,6 +463,7 @@ def _inference(args, source, backend, env, log):
         with progress(f"{backend} warmup: {args.warmup_requests} requests"):
             for _ in range(args.warmup_requests):
                 completion()
+        require_space(profile_dir)
         request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
         requests = []
         try:

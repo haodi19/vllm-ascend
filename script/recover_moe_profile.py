@@ -9,6 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from profile_storage import GIB, PROFILE_RESERVE_GIB, require_raw_data, require_space
 from run_verified_cpp_tests import validate_profile_trace
 
 
@@ -44,6 +45,15 @@ def main():
     workers = sorted(source.rglob("*_ascend_pt"))
     if not workers:
         parser.error("未找到 *_ascend_pt 采集目录")
+    for worker in workers:
+        require_raw_data(worker)
+    copy_bytes = sum(
+        entry.stat().st_size
+        for worker in workers
+        for entry in worker.rglob("*")
+        if entry.is_file() and not {"ASCEND_PROFILER_OUTPUT", "logs"}.intersection(entry.relative_to(worker).parts)
+    )
+    require_space(output, minimum_gib=PROFILE_RESERVE_GIB + copy_bytes / GIB)
     output.mkdir(parents=True, exist_ok=False)
     failures = 0
     for worker in workers:

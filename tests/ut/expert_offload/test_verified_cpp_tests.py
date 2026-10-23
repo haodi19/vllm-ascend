@@ -159,6 +159,20 @@ class TestCallbackTimings(unittest.TestCase):
 
 
 class TestVerifiedRunner(unittest.TestCase):
+    def setUp(self):
+        self.storage = types.SimpleNamespace(require_space=Mock())
+        mocked = patch.dict(sys.modules, profile_storage=self.storage)
+        mocked.start()
+        self.addCleanup(mocked.stop)
+
+    def test_full_disk_prevents_model_startup(self):
+        self.storage.require_space.side_effect = RuntimeError("disk full")
+        fn = self.module["_inference"]
+        with patch.dict(fn.__globals__, subprocess=Mock()) as scope:
+            with self.assertRaisesRegex(RuntimeError, "disk full"):
+                fn(types.SimpleNamespace(profile_run_dir=Path("unused")), "", "python", {}, None)
+            scope["subprocess"].Popen.assert_not_called()
+
     @classmethod
     def setUpClass(cls):
         cls.module = runpy.run_path(str(REPO / "script/run_verified_cpp_tests.py"))
