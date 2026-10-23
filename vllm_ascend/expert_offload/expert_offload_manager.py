@@ -577,6 +577,9 @@ class ExpertOffloadManager:
         # (single-card) keeps the full ntotal, global==local.
         use_shard = self.offload_config.shard_per_rank
         nalloc = (ntotal // max(1, self.ep_size)) if use_shard else ntotal
+        prepacked = (
+            getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte'
+            and getattr(self.offload_config, 'host_sync_quant_copy', 'storage') == 'prepacked')
         attr_specs = [
             ("scale_cpu_buffers", "w13_weight_scale"),
             ("scale_cpu_buffers", "w2_weight_scale"),
@@ -590,14 +593,17 @@ class ExpertOffloadManager:
                 continue
             dev_tensor = getattr(layer, attr_name)
             dtype = dev_tensor.dtype
+            physical_stride = None
             if "scale_bias" in attr_name:
                 per_expert_shape = tuple(dev_tensor.shape[1:])
             elif dtype.itemsize == 1:
                 from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
                     apply_mxfp4_weight_scale_layout)
                 dtype = torch.uint8
-                per_expert_shape = tuple(
-                    apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8)).shape)
+                scale_layout = apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8))
+                per_expert_shape = tuple(scale_layout.shape)
+                if prepacked:
+                    physical_stride = tuple(scale_layout.stride())
             else:
                 per_expert_shape = (dev_tensor[0].numel(),)
             buffer_dict: dict = getattr(self, buffer_dict_name)
@@ -607,9 +613,15 @@ class ExpertOffloadManager:
             while len(buffers) <= layer_moe_idx:
                 buffers.append([])
             for _ in range(nalloc):
-                buffers[layer_moe_idx].append(
-                    self._allocate_expert_host_tensor(
-                        per_expert_shape, dtype))
+                buffer = self._allocate_expert_host_tensor(per_expert_shape, dtype)
+                if physical_stride is not None:
+                    from vllm_ascend.expert_offload.host_sync import dense_strides
+                    if not dense_strides(per_expert_shape, physical_stride):
+                        raise RuntimeError("Prepacked scale requires a dense, non-overlapping layout")
+                    # Loader writes the same logical scale values directly into
+                    # the device's physical order. No duplicate expert cache.
+                    buffer = buffer.as_strided(per_expert_shape, physical_stride)
+                buffers[layer_moe_idx].append(buffer)
 
     def _finalize_offload(self, model):
         """Post-weight-loading finalization.
@@ -2439,12 +2451,13 @@ class ExpertOffloadManager:
                     name=f"{attr_name}[L{layer_idx},E{eid}->S{slot}]",
                 )
                 if (getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte'
-                        and getattr(self.offload_config, 'host_sync_quant_copy', 'storage') == 'storage'):
+                        and getattr(self.offload_config, 'host_sync_quant_copy', 'storage') != 'tensor'):
                     from vllm_ascend.expert_offload.host_sync import storage_quant_copy
                     with callback_stage(self, "quant_adapter"):
                         task = storage_quant_copy(
                             task, torch_npu.get_npu_format,
-                            stage=lambda name: callback_stage(self, name))
+                            stage=lambda name: callback_stage(self, name),
+                            allow_pack=getattr(self.offload_config, 'host_sync_quant_copy', 'storage') != 'prepacked')
                     # CPU layout packing may allocate temporary pinned storage.
                     # Keep it alive until the asynchronous load completes.
                     self._mte_pending_quant_sources.append(task.source)

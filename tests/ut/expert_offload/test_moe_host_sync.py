@@ -18,6 +18,91 @@ import torch
 
 
 class MoeHostSyncTests(unittest.TestCase):
+    def test_prepacked_loader_matches_original_values_without_runtime_pack(self):
+        tree = ast.parse(
+            (self.root / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8")
+        )
+        names = {"_init_layer_scale_buffers", "_copy_scale_assembled", "_copy_scale_direct"}
+        methods = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name in names]
+        for node in methods:
+            node.decorator_list = []
+        namespace = {"torch": torch}
+        exec(compile(ast.Module(body=methods, type_ignores=[]), "loader", "exec"), namespace)
+        layout_tree = ast.parse(
+            (self.root / "vllm_ascend/quantization/methods/w4a8_mxfp4.py").read_text(encoding="utf-8")
+        )
+        layout = next(
+            node
+            for node in layout_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "apply_mxfp4_weight_scale_layout"
+        )
+        exec(compile(ast.Module(body=[layout], type_ignores=[]), "layout", "exec"), namespace)
+        task_type = make_dataclass("Task", ["source", "destination", "nbytes", "name"])
+
+        class DeviceView:
+            device = SimpleNamespace(type="npu")
+
+            def __init__(self, tensor):
+                self.tensor = tensor
+
+            def __getattr__(self, name):
+                return getattr(self.tensor, name)
+
+        modules = {
+            "vllm_ascend.quantization.methods.w4a8_mxfp4": SimpleNamespace(
+                apply_mxfp4_weight_scale_layout=namespace[layout.name]
+            ),
+            "vllm_ascend.expert_offload.host_sync": self.module,
+        }
+        with patch.dict(sys.modules, modules):
+            for n, k in ((6, 8), (4096, 128), (4096, 64)):
+                layer = SimpleNamespace(
+                    w13_weight_scale=torch.empty((1, n, k), dtype=torch.uint8),
+                    w2_weight_scale=torch.empty((1, n, k), dtype=torch.uint8),
+                )
+                managers = []
+                for mode in ("storage", "prepacked"):
+                    manager = SimpleNamespace(
+                        offload_config=SimpleNamespace(
+                            shard_per_rank=False, host_sync_backend="mte", host_sync_quant_copy=mode
+                        ),
+                        scale_cpu_buffers={},
+                        offset_cpu_buffers={},
+                        scale_bias_cpu_buffers={},
+                        ep_size=1,
+                        _allocate_expert_host_tensor=lambda shape, dtype: torch.empty(shape, dtype=dtype),
+                    )
+                    namespace["_init_layer_scale_buffers"](manager, layer, 0, 2)
+                    managers.append(manager)
+                values = (torch.arange(n * k) % 251).to(torch.uint8).reshape(n, k)
+                for manager in managers:
+                    for expert in range(2):
+                        namespace["_copy_scale_assembled"](
+                            manager.scale_cpu_buffers["w13_weight_scale"][0][expert], values[: n // 2], values[n // 2 :]
+                        )
+                        namespace["_copy_scale_direct"](manager.scale_cpu_buffers["w2_weight_scale"][0][expert], values)
+                for name in ("w13_weight_scale", "w2_weight_scale"):
+                    original = managers[0].scale_cpu_buffers[name][0][0]
+                    packed = managers[1].scale_cpu_buffers[name][0][0]
+                    self.assertTrue(torch.equal(original, packed))
+                    self.assertEqual(original.untyped_storage().nbytes(), packed.untyped_storage().nbytes())
+                    backing = torch.zeros((2, n, k), dtype=torch.uint8)
+                    dst = namespace[layout.name](backing[1])
+                    allocator = Mock(side_effect=AssertionError("runtime packing forbidden"))
+                    task = task_type(packed, DeviceView(dst), packed.numel(), name)
+                    copy = self.module.storage_quant_copy(task, lambda _: 2, allocator, allow_pack=False)
+                    copy.destination.copy_(copy.source)
+                    self.assertTrue(torch.equal(dst, original))
+                    self.assertEqual(backing[0].count_nonzero().item(), 0)
+                    allocator.assert_not_called()
+                    with self.assertRaisesRegex(RuntimeError, "Prepacked quant layout mismatch"):
+                        self.module.storage_quant_copy(
+                            task_type(original, DeviceView(dst), original.numel(), name),
+                            lambda _: 2,
+                            allocator,
+                            allow_pack=False,
+                        )
+
     def test_quant_tensor_mode_bypasses_only_storage_adapter(self):
         tree = ast.parse(
             (self.root / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8")
@@ -32,7 +117,13 @@ class MoeHostSyncTests(unittest.TestCase):
             "callback_stage": lambda *args: contextlib.nullcontext(),
         }
         exec(compile(ast.Module(body=[method], type_ignores=[]), "quant_tasks", "exec"), namespace)
-        for backend, mode, adapter_calls in (("callback", "storage", 0), ("mte", "storage", 1), ("mte", "tensor", 0)):
+        for backend, mode, adapter_calls in (
+            ("callback", "storage", 0),
+            ("callback", "prepacked", 0),
+            ("mte", "storage", 1),
+            ("mte", "tensor", 0),
+            ("mte", "prepacked", 1),
+        ):
             with self.subTest(backend=backend, mode=mode):
                 source = torch.arange(12).reshape(3, 4)
                 destination = torch.zeros((1, 3, 4), dtype=source.dtype)
@@ -50,13 +141,15 @@ class MoeHostSyncTests(unittest.TestCase):
                 ):
                     tasks = namespace[method.name](manager, SimpleNamespace(scale=destination), 0, 0, 0)
                 self.assertEqual(adapter.call_count, adapter_calls)
+                if adapter_calls:
+                    self.assertEqual(adapter.call_args.kwargs["allow_pack"], mode != "prepacked")
                 self.assertEqual(len(manager._mte_pending_quant_sources), adapter_calls)
                 self.assertEqual(len(tasks), 1)
                 self.assertTrue(torch.equal(tasks[0].source, source))
                 self.assertEqual(tasks[0].destination.data_ptr(), destination.data_ptr())
 
     def test_quant_copy_config_validation(self):
-        for mode in ("storage", "tensor"):
+        for mode in ("storage", "tensor", "prepacked"):
             self.module.validate_host_sync_config({"host_sync_quant_copy": mode})
         with self.assertRaisesRegex(ValueError, "host_sync_quant_copy"):
             self.module.validate_host_sync_config({"host_sync_quant_copy": "invalid"})

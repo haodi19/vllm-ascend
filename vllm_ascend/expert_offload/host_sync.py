@@ -22,7 +22,7 @@ def dense_strides(shape, strides):
     return all(size > 0 for size in shape)
 
 
-def storage_quant_copy(task, get_format, allocate_host=None, stage=None):
+def storage_quant_copy(task, get_format, allocate_host=None, stage=None, allow_pack=True):
     """Match Tensor.copy_ semantics for dense ND views, packing on CPU only."""
     source, destination = task.source, task.destination
     mark = stage if stage is not None else lambda name: nullcontext()
@@ -49,6 +49,11 @@ def storage_quant_copy(task, get_format, allocate_host=None, stage=None):
         size > 1 and src_stride != dst_stride
         for size, src_stride, dst_stride in zip(source.shape, source.stride(), destination.stride())
     ):
+        if not allow_pack:
+            raise RuntimeError(
+                f"Prepacked quant layout mismatch: {task.name}; "
+                f"source={source.stride()} destination={destination.stride()}; refusing runtime packing"
+            )
         if allocate_host is None:
             # Optional dependency; CPU packing never launches a device kernel.
             import torch
@@ -93,8 +98,8 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
-    if config.get("host_sync_quant_copy", "storage") not in ("storage", "tensor"):
-        raise ValueError("host_sync_quant_copy must be storage or tensor")
+    if config.get("host_sync_quant_copy", "storage") not in ("storage", "tensor", "prepacked"):
+        raise ValueError("host_sync_quant_copy must be storage, tensor or prepacked")
     if not isinstance(config.get("host_sync_diagnose_load", False), bool):
         raise ValueError("host_sync_diagnose_load must be boolean")
     backend = config.get("host_sync_backend", "callback")

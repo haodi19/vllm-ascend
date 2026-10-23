@@ -1015,6 +1015,8 @@ class ExpertOffloadConfig:
         "host_sync_diagnose_load": False,
         # Experimental MTE quant copy: storage preserves the validated workaround;
         # tensor restores original Tensor.copy_ without CPU layout packing.
+        # prepacked stores MXFP scale buffers in device order during loading;
+        # runtime uses Storage copy and rejects layouts needing another pack.
         "host_sync_quant_copy": "storage",
         "host_sync_library": "",
         "cache_recent_window": 32,

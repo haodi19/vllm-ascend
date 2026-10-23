@@ -1,5 +1,45 @@
 # MTE 可视化与量化拷贝复核
 
+## 最新修复：加载时建立设备布局，运行时禁止重排
+
+`moe_debug_01` 的真实模型实验已复现 Tensor 模式阻塞：第 0 层完成，
+第 1 层预取中 w13、w2 原始权重分别搬运完成，随后 512 KiB 的 w13 scale
+在 Tensor.copy_ 返回后停在加载流同步。不是 profiler 停止问题，发生在预热阶段。
+
+源码检查补充了此前遗漏的路径：torch_npu v2.10.0 的
+`copy_h2d_baseformat_opapi` 对非连续目标创建连续临时 NPU 张量，先执行 H2D，
+再经 `copy_d2d_baseformat_opapi` 调用 `aclnnInplaceCopy` 写入目标。
+因此该 Tensor.copy_ 不是单纯的 MEMCPY，而可能包含设备计算与临时内存管理。
+参考：[torch_npu v2.10.0 CopyKernelOpApi.cpp](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp)。
+用户安装的是开发构建，公开版本不是该二进制源码的精确快照。
+日志与源码支持优先移除这条运行期设备布局拷贝路径，但尚不能确认具体是算子资源、
+图调度还是内部事件造成阻塞；不能把其中一种推测写成已证实的底层死锁原因。
+
+修复选项 `--quant-copy prepacked` 在 CPU scale 分配时使用 NPU 目标的 stride，
+沿用原加载函数写入逻辑值。仅改变同一块 pinned 内存的视图，不增加第二份专家缓存。
+原来的 `_copy_scale_assembled` 和 `_copy_scale_direct` 已执行 MXFP reshape/transpose，
+现在直接写入正确物理位置；无需在推理回调中再反复分配和重排。
+初次注册和后注册的 MTP 层都经过相同的缓冲区分配入口。
+
+推理阶段仍走已跑通的 Storage 字节搬运，保持 H2D 完成等待与 MTE generation 协议。
+`allow_pack=False` 禁止静默回退：如果源、目标布局不匹配，立即报错，不在热点里偷偷重排。
+该选项针对当前 MXFP uint8 scale；其他量化布局如需重排会明确拒绝，不能当作所有模型通用修复。
+回调路径、原 `storage` 路径和实验 `tensor` 路径均保留。
+
+CPU 回归检查覆盖真实 `(64,4096,2)`、`(32,4096,2)` 布局，
+w1/w3 拼接、w2 加载、与旧缓冲区逻辑数值相等、字节搬运后数值正确、相邻槽位不被覆盖、
+不增加存储字节数、运行时禁止重排与布局不匹配失败。真实 NPU 验收仍需绿区执行。
+
+下一轮直接验收修复，不开启会改变执行顺序的逐项同步诊断：
+
+```bash
+python -B script/run_moe_host_sync.py --npu 4 --backend both --quant-copy prepacked --requests 1 --warmup-requests 1 --profile-timeout 300 --output-dir bench_results/moe_prepacked_01
+```
+
+观察 MTE 能否完成预热和推理、两组输出摘要和 token 用量是否一致、
+MTE 的 `quant_allocate/quant_pack` 调用次数是否为 0，以及 profile 是否完整。
+单次请求只用于快速验收，不能据此宣称稳定的性能收益。
+
 ## 当前证据与边界
 
 2026-10-23 返回的 `moe_load_detail_01` 诊断显示输出盘剩余 **0.00 GiB**；

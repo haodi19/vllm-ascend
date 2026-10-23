@@ -66,9 +66,9 @@ def main():
     parser.add_argument("--backend", choices=("both", "callback", "mte"), default="both")
     parser.add_argument(
         "--quant-copy",
-        choices=("storage", "tensor"),
+        choices=("storage", "tensor", "prepacked"),
         default="storage",
-        help="MTE only: tensor bypasses CPU packing and restores original Tensor.copy_ for diagnosis",
+        help="MTE: storage packs per load; tensor uses original copy_; prepacked uses loader-prepared scale layout",
     )
     parser.add_argument(
         "--diagnose-load-stages",
