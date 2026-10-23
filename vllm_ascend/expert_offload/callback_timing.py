@@ -16,6 +16,15 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MAX_SAMPLES = 50000
 GAP_METRICS = ("gap_mapping", "gap_missing", "gap_hit_stats", "gap_cache_stats", "gap_slots", "gap_debug")
+LOAD_METRICS = (
+    "quant_adapter",
+    "quant_get_format",
+    "quant_allocate",
+    "quant_pack",
+    "quant_source_view",
+    "quant_destination_view",
+    "quant_task_replace",
+)
 DRAIN_SECONDS = 30
 METRICS = (
     "total",
@@ -170,6 +179,8 @@ class CallbackTimings:
 
     @contextmanager
     def stage(self, name):
+        if name in LOAD_METRICS:
+            self.local.values[name + "_calls"] += 1
         range_id = self.range_start(name)
         begin = self.clock()
         try:
@@ -189,7 +200,9 @@ class CallbackTimings:
                     call_id = self.call_id
             if not enabled:
                 return fn(args)
-            values = dict.fromkeys((*METRICS, *GAP_METRICS, "loads"), 0)
+            values = dict.fromkeys(
+                (*METRICS, *GAP_METRICS, *LOAD_METRICS, *(key + "_calls" for key in LOAD_METRICS), "loads"), 0
+            )
             self.local.values = values
             if self.mstx is not None and not getattr(self.local, "outer_context", None):
                 kind = "prefetch" if args[5] else "reactive"
@@ -251,6 +264,17 @@ class CallbackTimings:
                     metrics={key: summarize([r[1][key] / 1000 for r in records]) for key in METRICS},
                     gap_metrics=(
                         {key: summarize([r[1][key] / 1000 for r in records]) for key in GAP_METRICS}
+                        if self.mstx is not None
+                        else {}
+                    ),
+                    load_details=(
+                        {
+                            key: dict(
+                                **summarize([r[1][key] / 1000 for r in records]),
+                                calls=sum(r[1][key + "_calls"] for r in records),
+                            )
+                            for key in LOAD_METRICS
+                        }
                         if self.mstx is not None
                         else {}
                     ),

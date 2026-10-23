@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,10 +22,12 @@ def dense_strides(shape, strides):
     return all(size > 0 for size in shape)
 
 
-def storage_quant_copy(task, get_format, allocate_host=None):
+def storage_quant_copy(task, get_format, allocate_host=None, stage=None):
     """Match Tensor.copy_ semantics for dense ND views, packing on CPU only."""
     source, destination = task.source, task.destination
-    dst_format = get_format(destination)
+    mark = stage if stage is not None else lambda name: nullcontext()
+    with mark("quant_get_format"):
+        dst_format = get_format(destination)
     if (
         source.device.type != "cpu"
         or destination.device.type != "npu"
@@ -51,10 +54,12 @@ def storage_quant_copy(task, get_format, allocate_host=None):
             import torch
 
             allocate_host = torch.empty_strided
-        packed = allocate_host(
-            tuple(destination.shape), tuple(destination.stride()), dtype=source.dtype, device="cpu", pin_memory=True
-        )
-        packed.copy_(source)
+        with mark("quant_allocate"):
+            packed = allocate_host(
+                tuple(destination.shape), tuple(destination.stride()), dtype=source.dtype, device="cpu", pin_memory=True
+            )
+        with mark("quant_pack"):
+            packed.copy_(source)
         source = packed
 
     def byte_view(tensor):
@@ -64,7 +69,13 @@ def storage_quant_copy(task, get_format, allocate_host=None):
             raise RuntimeError(f"MTE quant storage copy exceeds storage: {task.name}")
         return storage[start : start + task.nbytes]
 
-    return replace(task, source=byte_view(source), destination=byte_view(destination))
+    with mark("quant_source_view"):
+        source_view = byte_view(source)
+    with mark("quant_destination_view"):
+        destination_view = byte_view(destination)
+    with mark("quant_task_replace"):
+        result = replace(task, source=source_view, destination=destination_view)
+    return result
 
 
 def create_offload_load_stream(npu, backend):

@@ -363,6 +363,23 @@ def print_inference_report(backend, report, requests):
                 ),
                 flush=True,
             )
+        detail = group.get("load_details", {})
+        if any(item["calls"] for item in detail.values()):
+            print("LOAD DETAILS: us per callback; quant_adapter contains the other quant stages", flush=True)
+            for name, item in detail.items():
+                print(
+                    f"{name:26} mean_us={item['mean']:.3f} p95_us={item['p95']:.3f} "
+                    f"max_us={item['max']:.3f} calls={item['calls']}",
+                    flush=True,
+                )
+            adapter = detail["quant_adapter"]["mean"]
+            children = sum(item["mean"] for key, item in detail.items() if key != "quant_adapter")
+            print(
+                f"quant_adapter_residual_mean_us={adapter - children:.3f}; "
+                f"prepare_outside_adapter_mean_us={group['metrics']['load_prepare']['mean'] - adapter:.3f}; "
+                "residuals include checks, Python and instrumentation overhead",
+                flush=True,
+            )
         gap = group.get("gap_metrics", {})
         if gap:
             measured_sum = sum(item["mean"] for item in gap.values())

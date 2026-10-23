@@ -2440,7 +2440,10 @@ class ExpertOffloadManager:
                 )
                 if getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte':
                     from vllm_ascend.expert_offload.host_sync import storage_quant_copy
-                    task = storage_quant_copy(task, torch_npu.get_npu_format)
+                    with callback_stage(self, "quant_adapter"):
+                        task = storage_quant_copy(
+                            task, torch_npu.get_npu_format,
+                            stage=lambda name: callback_stage(self, name))
                     # CPU layout packing may allocate temporary pinned storage.
                     # Keep it alive until the asynchronous load completes.
                     self._mte_pending_quant_sources.append(task.source)

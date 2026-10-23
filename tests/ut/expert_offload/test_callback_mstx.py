@@ -35,6 +35,35 @@ class FakeMstx:
 
 
 class TestMstx(unittest.TestCase):
+    def test_load_detail_nested_timing_and_counts(self):
+        now = [0]
+        collector = TIMING["CallbackTimings"]("python", clock=lambda: now[0], mstx=FakeMstx())
+        manager = SimpleNamespace(_callback_timing=collector)
+
+        def update(args):
+            for _ in range(2):
+                with TIMING["callback_stage"](manager, "quant_adapter"):
+                    now[0] += 1000
+                    with TIMING["callback_stage"](manager, "quant_allocate"):
+                        now[0] += 2000
+                    with TIMING["callback_stage"](manager, "quant_pack"):
+                        now[0] += 5000
+
+        collector.start()
+        collector.wrap_update(update)(self.args())
+        report = collector.stop()
+        details = report["groups"][0]["load_details"]
+        self.assertEqual(details["quant_adapter"]["mean"], 16)
+        self.assertEqual(details["quant_pack"]["mean"], 10)
+        self.assertEqual(details["quant_allocate"]["mean"], 4)
+        self.assertEqual(details["quant_allocate"]["calls"], 2)
+        self.assertEqual(details["quant_get_format"]["calls"], 0)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            RUNNER["print_inference_report"]("python", report, [(1000, {}, "digest")])
+        self.assertIn("LOAD DETAILS", output.getvalue())
+        self.assertIn("quant_adapter_residual_mean_us=2.000", output.getvalue())
+
     def test_outer_callback_context_and_snapshot(self):
         mstx = FakeMstx()
         collector = TIMING["CallbackTimings"]("cpp", mstx=mstx)

@@ -2,6 +2,7 @@
 """CPU checks for optional MoE dispatch without NPU imports."""
 
 import ast
+import contextlib
 import importlib.util
 import io
 import json
@@ -62,12 +63,23 @@ class MoeHostSyncTests(unittest.TestCase):
                 return torch.empty_strided(shape, stride, **kwargs)
 
             allocator = Mock(side_effect=allocate)
-            converted = self.module.storage_quant_copy(task, lambda tensor: 2, allocator)
+            stages = []
+
+            @contextlib.contextmanager
+            def stage(name, stages=stages):
+                stages.append(name)
+                yield
+
+            converted = self.module.storage_quant_copy(task, lambda tensor: 2, allocator, stage=stage)
             converted.destination.copy_(converted.source)
             self.assertTrue(torch.equal(destination, source))
             self.assertEqual(backing[0].sum().item(), 0)
             self.assertEqual(backing[2].sum().item(), 0)
             self.assertEqual(allocator.call_count, 0 if matching_layout else 1)
+            self.assertEqual(stages.count("quant_pack"), 0 if matching_layout else 1)
+            self.assertEqual(stages.count("quant_allocate"), allocator.call_count)
+            self.assertEqual(stages.count("quant_source_view"), 1)
+            self.assertEqual(stages.count("quant_destination_view"), 1)
 
     def quant_task(self):
         class Storage(bytearray):
