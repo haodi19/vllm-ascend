@@ -93,6 +93,8 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    if config.get("host_sync_quant_copy", "storage") not in ("storage", "tensor"):
+        raise ValueError("host_sync_quant_copy must be storage or tensor")
     if not isinstance(config.get("host_sync_diagnose_load", False), bool):
         raise ValueError("host_sync_diagnose_load must be boolean")
     backend = config.get("host_sync_backend", "callback")
@@ -225,6 +227,15 @@ class MteHostDispatcher:
         checkpoint("prior_stream_work", lambda: None)
         transport = self.manager._get_h2d_transport()
         for index, task in enumerate(tasks):
+            if batch == 1:
+                for side in ("source", "destination"):
+                    tensor = getattr(task, side, None)
+                    if tensor is not None and hasattr(tensor, "shape"):
+                        print(
+                            f"[MOE-MTE LOAD] copy[{index}] {side}: dtype={tensor.dtype} "
+                            f"shape={tuple(tensor.shape)} stride={tensor.stride()} device={tensor.device}",
+                            flush=True,
+                        )
             checkpoint(
                 f"copy[{index}] name={task.name} bytes={task.nbytes}", lambda task=task: transport.copy_batch([task])
             )

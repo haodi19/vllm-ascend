@@ -19,7 +19,7 @@ from run_host_sync_stage3 import select_build_directory
 from run_verified_cpp_tests import SummaryTee, inference, launch_spec
 
 
-def configured_source(source, backend, library, diagnose_load=False):
+def configured_source(source, backend, library, diagnose_load=False, quant_copy="storage"):
     start = re.search(r"(?m)^vllm\s+serve\s+", source)
     if start is None:
         raise ValueError("Missing vllm serve command")
@@ -30,6 +30,7 @@ def configured_source(source, backend, library, diagnose_load=False):
     offload["host_sync_backend"] = backend
     offload["host_sync_library"] = str(library) if backend == "mte" else ""
     offload["host_sync_diagnose_load"] = bool(diagnose_load and backend == "mte")
+    offload["host_sync_quant_copy"] = quant_copy if backend == "mte" else "storage"
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -63,6 +64,12 @@ def main():
     parser.add_argument("--npu", type=npu_number)
     parser.add_argument("--read-log", type=Path, help="Print existing log diagnostics only; no build or model startup")
     parser.add_argument("--backend", choices=("both", "callback", "mte"), default="both")
+    parser.add_argument(
+        "--quant-copy",
+        choices=("storage", "tensor"),
+        default="storage",
+        help="MTE only: tensor bypasses CPU packing and restores original Tensor.copy_ for diagnosis",
+    )
     parser.add_argument(
         "--diagnose-load-stages",
         action="store_true",
@@ -175,8 +182,12 @@ def run(args, root):
         print(f"\n=== REAL MOE HOST BACKEND: {backend} ===", flush=True)
         if args.diagnose_load_stages:
             print("DIAGNOSTIC LOAD BARRIERS ENABLED: timings are not a performance comparison", flush=True)
+        print(f"QUANT COPY: {'original tensor' if backend == 'callback' else args.quant_copy}", flush=True)
         reports[backend] = inference(
-            run_args, configured_source(source, backend, library, args.diagnose_load_stages), "python", env
+            run_args,
+            configured_source(source, backend, library, args.diagnose_load_stages, args.quant_copy),
+            "python",
+            env,
         )
         if backend == "mte":
             log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")

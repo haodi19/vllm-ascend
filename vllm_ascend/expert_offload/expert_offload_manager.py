@@ -2438,7 +2438,8 @@ class ExpertOffloadManager:
                     nbytes=nbytes,
                     name=f"{attr_name}[L{layer_idx},E{eid}->S{slot}]",
                 )
-                if getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte':
+                if (getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte'
+                        and getattr(self.offload_config, 'host_sync_quant_copy', 'storage') == 'storage'):
                     from vllm_ascend.expert_offload.host_sync import storage_quant_copy
                     with callback_stage(self, "quant_adapter"):
                         task = storage_quant_copy(

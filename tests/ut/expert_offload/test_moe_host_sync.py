@@ -18,6 +18,49 @@ import torch
 
 
 class MoeHostSyncTests(unittest.TestCase):
+    def test_quant_tensor_mode_bypasses_only_storage_adapter(self):
+        tree = ast.parse(
+            (self.root / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8")
+        )
+        method = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_build_quant_attr_h2d_tasks"
+        )
+        task_type = make_dataclass("Task", ["source", "destination", "nbytes", "name"])
+        namespace = {
+            "H2DCopyTask": task_type,
+            "torch_npu": Mock(),
+            "callback_stage": lambda *args: contextlib.nullcontext(),
+        }
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "quant_tasks", "exec"), namespace)
+        for backend, mode, adapter_calls in (("callback", "storage", 0), ("mte", "storage", 1), ("mte", "tensor", 0)):
+            with self.subTest(backend=backend, mode=mode):
+                source = torch.arange(12).reshape(3, 4)
+                destination = torch.zeros((1, 3, 4), dtype=source.dtype)
+                manager = SimpleNamespace(
+                    scale_cpu_buffers={"scale": [[source]]},
+                    offset_cpu_buffers={},
+                    scale_bias_cpu_buffers={},
+                    _shard_local=lambda eid: 0,
+                    offload_config=SimpleNamespace(host_sync_backend=backend, host_sync_quant_copy=mode),
+                    _mte_pending_quant_sources=[],
+                )
+                adapter = Mock(side_effect=lambda task, *args, **kwargs: task)
+                with patch.dict(
+                    sys.modules, {"vllm_ascend.expert_offload.host_sync": SimpleNamespace(storage_quant_copy=adapter)}
+                ):
+                    tasks = namespace[method.name](manager, SimpleNamespace(scale=destination), 0, 0, 0)
+                self.assertEqual(adapter.call_count, adapter_calls)
+                self.assertEqual(len(manager._mte_pending_quant_sources), adapter_calls)
+                self.assertEqual(len(tasks), 1)
+                self.assertTrue(torch.equal(tasks[0].source, source))
+                self.assertEqual(tasks[0].destination.data_ptr(), destination.data_ptr())
+
+    def test_quant_copy_config_validation(self):
+        for mode in ("storage", "tensor"):
+            self.module.validate_host_sync_config({"host_sync_quant_copy": mode})
+        with self.assertRaisesRegex(ValueError, "host_sync_quant_copy"):
+            self.module.validate_host_sync_config({"host_sync_quant_copy": "invalid"})
+
     def test_packed_sources_live_until_successful_h2d_sync(self):
         tree = ast.parse(
             (self.root / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8")
@@ -412,8 +455,17 @@ class MoeHostSyncTests(unittest.TestCase):
         self.assertEqual(new.pop("host_sync_backend"), "mte")
         self.assertEqual(new.pop("host_sync_library"), "/tmp/libhost_sync_device.so")
         self.assertFalse(new.pop("host_sync_diagnose_load"))
+        self.assertEqual(new.pop("host_sync_quant_copy"), "storage")
         self.assertEqual(new, old)
         self.assertFalse(any(not word.strip() for word in after))
+
+    def test_runner_tensor_option_only_affects_mte(self):
+        source = (self.root / "script/test_graph2.sh").read_text(encoding="utf-8")
+        for backend, expected in (("callback", "storage"), ("mte", "tensor")):
+            updated = self.runner.configured_source(source, backend, "/tmp/lib.so", quant_copy="tensor")
+            _, command, _, _ = self.runner.launch_spec(updated, "python", 1, None, 18155)
+            config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
+            self.assertEqual(config["host_sync_quant_copy"], expected)
 
 
 if __name__ == "__main__":

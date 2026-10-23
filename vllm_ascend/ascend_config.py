@@ -1013,6 +1013,9 @@ class ExpertOffloadConfig:
         # Opt-in single-card graph handoff. Default preserves ACL callbacks.
         "host_sync_backend": "callback",
         "host_sync_diagnose_load": False,
+        # Experimental MTE quant copy: storage preserves the validated workaround;
+        # tensor restores original Tensor.copy_ without CPU layout packing.
+        "host_sync_quant_copy": "storage",
         "host_sync_library": "",
         "cache_recent_window": 32,
         "cache_ema_beta": 0.9,

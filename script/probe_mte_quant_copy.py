@@ -14,6 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAX_POLLS = 1000000
+ND_FORMAT = 2
 CASES = (
     ("no_wait", "tensor", "different"),
     ("wait", "tensor", "same"),
@@ -48,7 +49,13 @@ def child(args):
     pointer = int(compute.npu_stream)
     # Same reshape/transpose structure as w4a8_mxfp4; 512 KiB, not actual model data.
     backing = torch.zeros((2, 512, 512, 2), dtype=torch.uint8, device="npu")
+    # Four-dimensional allocation defaults to NCHW on this torch_npu build.
+    # The production Storage adapter explicitly requires ND; test that format
+    # rather than relaxing its safety checks to make the probe pass.
+    backing = torch_npu.npu_format_cast(backing, ND_FORMAT)
     destination = backing[1].transpose(0, 1)
+    if torch_npu.get_npu_format(destination) != ND_FORMAT:
+        raise RuntimeError(f"Probe requires ND, got {torch_npu.get_npu_format(destination)}")
     strides = destination.stride() if args.layout == "same" else (1024, 2, 1)
     source = torch.empty_strided(destination.shape, strides, dtype=torch.uint8, pin_memory=True)
     expected = (torch.arange(source.numel(), dtype=torch.int64) % 251).to(torch.uint8).reshape(source.shape)
@@ -99,36 +106,46 @@ def child(args):
             wait(pointer, alias + info["done_offset"], state.data_ptr(), MAX_POLLS)
 
     graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph, stream=compute):
-        submit()
-    compute.synchronize()
-    if calls:
-        raise RuntimeError("Capture unexpectedly executed callback")
-    for generation in range(1, 4):
-        finished.clear()
-        source.copy_((expected.to(torch.int16) + generation).remainder(251).to(torch.uint8))
-        with torch.npu.stream(compute):
-            graph.replay()
+    try:
+        with torch.npu.graph(graph, stream=compute):
+            submit()
         compute.synchronize()
-        if not finished.wait(15) or errors:
-            raise RuntimeError(f"Worker failed or stalled: {errors}")
-        if args.handoff == "wait":
-            check_state(state.cpu().tolist(), generation)
-        # Callback's event precedes native completion publication by a few instructions.
-        deadline = time.monotonic() + 5
-        while session.snapshot(0)["done_generation"] != generation:
-            if time.monotonic() > deadline:
-                raise RuntimeError("Native worker did not publish completion")
-            time.sleep(0.001)
-        if not torch.equal(destination.cpu(), source):
-            raise RuntimeError("Copied values differ")
-        if torch.count_nonzero(backing[0].cpu()).item():
-            raise RuntimeError("Adjacent slot overwritten")
+        if calls:
+            raise RuntimeError("Capture unexpectedly executed callback")
+        for generation in range(1, 4):
+            finished.clear()
+            source.copy_((expected.to(torch.int16) + generation).remainder(251).to(torch.uint8))
+            with torch.npu.stream(compute):
+                graph.replay()
+            compute.synchronize()
+            if not finished.wait(15) or errors:
+                raise RuntimeError(f"Worker failed or stalled: {errors}")
+            if args.handoff == "wait":
+                check_state(state.cpu().tolist(), generation)
+            # Callback event precedes native completion publication slightly.
+            deadline = time.monotonic() + 5
+            while session.snapshot(0)["done_generation"] != generation:
+                if time.monotonic() > deadline:
+                    raise RuntimeError("Native worker did not publish completion")
+                time.sleep(0.001)
+            if not torch.equal(destination.cpu(), source):
+                raise RuntimeError("Copied values differ")
+            if torch.count_nonzero(backing[0].cpu()).item():
+                raise RuntimeError("Adjacent slot overwritten")
+    finally:
+        cleanup_session(compute, transfer, graph, session)
+    print("PROBE PASS: 3 graph replays, values and adjacent slot verified", flush=True)
+
+
+def cleanup_session(compute, transfer, graph, session):
+    # Do not release registered memory before all device users have finished.
+    # A stuck synchronization remains bounded by the parent process timeout.
+    compute.synchronize()
+    transfer.synchronize()
     graph.reset()
     session.end_device_access(stream_synchronized=True)
     session.stop()
     session.close()
-    print("PROBE PASS: 3 graph replays, values and adjacent slot verified", flush=True)
 
 
 def main():

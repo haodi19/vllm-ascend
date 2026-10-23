@@ -44,6 +44,30 @@ AIV 等待有轮询上限；达到上限后拷贝才完成也判失败，不能�
 若四组全通过，应回到真实模型的 shape/dtype/流依赖重现，不能继续声称该兼容处理必需。
 若第 1 组也失败，应先排查基本 Tensor 拷贝、设备状态和测试条件。
 
+### 首次隔离结果与真实模型复核
+
+首次返回的前三组均通过，包括不同布局 Tensor 拷贝与 AIV 等待共存。
+因此不能将“布局不同 + AIV 等待”直接认定为必然卡死原因。
+第四组尚未执行拷贝：测试的四维目标默认分配成 NCHW，被只接受 ND 的 Storage 适配器拒绝。
+脚本已改成显式 ND 格式，并在异常路径先同步设备用户再释放交接内存。
+原前三组的结论限定于当时的 NCHW 合成数据，不能当作实际模型的完整验证。
+
+真实模型运行器新增实验选项 `--quant-copy tensor`：仅 MTE 组绕过 `storage_quant_copy`，
+保留原 Tensor 任务，不分配重排临时张量，交给原 `TorchCopyH2DTransport.copy_batch` 提交。
+MTE 同步协议、SyncLaunchStream、权重主体拷贝和 scale_refresh 保持原样。
+默认仍为 `storage`，回调组不受此选项影响。
+
+下一轮直接验证真实模型，不必等待合成测试重新通过才启动：
+
+```bash
+python -B script/run_moe_host_sync.py --npu 4 --backend both --quant-copy tensor --diagnose-load-stages --requests 1 --warmup-requests 1 --profile-timeout 300 --output-dir bench_results/moe_quant_tensor_01
+```
+
+该轮逐项同步前八批真实加载，记录第一批张量的 dtype/shape/stride，定位提交或同步阻塞点；
+它用于正确性和兼容性排查，不作为性能对比。运行器会比较回调组与 MTE 组的输出摘要和 token 用量。
+若完整通过，说明当前实际配置可以不走我们新增的 CPU 重排，但仍需去掉诊断同步后验证正常执行。
+若卡住，返回 summary.txt 内的首次卡点及诊断栈，再按真实张量布局与流依赖继续定位。
+
 ## 绿区执行
 
 先释放空间或选用有空间的挂载盘，查看容量（不删除文件）：
