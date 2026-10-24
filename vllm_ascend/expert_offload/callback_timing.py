@@ -63,7 +63,12 @@ def summarize(values):
 def callback_stage(manager, name):
     """Fine-grained diagnostics only inside an active MSTX callback window."""
     collector = getattr(manager, "_callback_timing", None)
-    if collector is None or collector.mstx is None or getattr(collector.local, "values", None) is None:
+    if (
+        collector is None
+        or not collector.window_mstx_enabled
+        or collector.mstx is None
+        or getattr(collector.local, "values", None) is None
+    ):
         return nullcontext()
     return collector.stage(name)
 
@@ -80,6 +85,7 @@ class CallbackTimings:
         self.backend = backend
         self.clock = clock
         self.mstx = mstx
+        self.window_mstx_enabled = False
         self.marker_errors = 0
         self.call_id = 0
         self.local = threading.local()
@@ -87,20 +93,26 @@ class CallbackTimings:
         self.active = False
         self.inflight = 0
         self.samples = []
+        self.prefill_samples = []
         self.errors = self.dropped = 0
         self.server = None
 
-    def start(self):
+    def start(self, mstx_enabled=True):
+        """Open a window; disable detailed markers for a timers-only comparison."""
+        if not isinstance(mstx_enabled, bool):
+            raise ValueError("mstx_enabled must be a JSON boolean")
         with self.condition:
             if self.active or self.inflight:
                 raise ValueError("A measurement window is already active or draining")
             self.samples.clear()
+            self.prefill_samples.clear()
             self.errors = self.dropped = 0
             self.marker_errors = 0
+            self.window_mstx_enabled = mstx_enabled and self.mstx is not None
             self.active = True
 
     def range_start(self, name):
-        if self.mstx is None:
+        if not self.window_mstx_enabled or self.mstx is None:
             return None
         try:
             # No stream argument: measure CPU execution/waiting, not NPU work.
@@ -152,7 +164,7 @@ class CallbackTimings:
         @functools.wraps(fn)
         def measured(args):
             with self.condition:
-                enabled = self.active and self.mstx is not None
+                enabled = self.active and self.window_mstx_enabled and self.mstx is not None
                 if enabled:
                     self.inflight += 1
                     self.call_id += 1
@@ -189,6 +201,42 @@ class CallbackTimings:
             self.local.values[name] += self.clock() - begin
             self.range_end(range_id)
 
+    def wrap_prefill(self, fn):
+        """Measure full-expert loading separately from decode callbacks."""
+
+        @functools.wraps(fn)
+        def measured(layer_idx, *args, **kwargs):
+            with self.condition:
+                enabled = self.active
+                if enabled:
+                    self.inflight += 1
+            if not enabled:
+                return fn(layer_idx, *args, **kwargs)
+            previous = getattr(self.local, "context", None)
+            self.local.context = f"backend={self.backend}|layer={layer_idx}|kind=prefill"
+            range_id = self.range_start("prefill_load_layer")
+            begin = self.clock()
+            success = False
+            try:
+                result = fn(layer_idx, *args, **kwargs)
+                success = True
+                return result
+            finally:
+                elapsed = self.clock() - begin
+                self.range_end(range_id)
+                self.local.context = previous
+                with self.condition:
+                    if not success:
+                        self.errors += 1
+                    elif len(self.prefill_samples) >= MAX_SAMPLES:
+                        self.dropped += 1
+                    else:
+                        self.prefill_samples.append((int(layer_idx), elapsed))
+                    self.inflight -= 1
+                    self.condition.notify_all()
+
+        return measured
+
     def wrap_update(self, fn):
         @functools.wraps(fn)
         def measured(args):
@@ -204,7 +252,7 @@ class CallbackTimings:
                 (*METRICS, *GAP_METRICS, *LOAD_METRICS, *(key + "_calls" for key in LOAD_METRICS), "loads"), 0
             )
             self.local.values = values
-            if self.mstx is not None and not getattr(self.local, "outer_context", None):
+            if self.window_mstx_enabled and not getattr(self.local, "outer_context", None):
                 kind = "prefetch" if args[5] else "reactive"
                 self.local.context = (
                     f"backend={self.backend}|layer={args[3]}|kind={kind}|rows={args[0].shape[0]}|call={call_id}"
@@ -247,7 +295,9 @@ class CallbackTimings:
             if not self.condition.wait_for(lambda: self.inflight == 0, timeout=DRAIN_SECONDS):
                 raise ValueError("Timed out draining callbacks; results are incomplete")
             samples = list(self.samples)
+            prefill_samples = list(self.prefill_samples)
             errors, dropped = self.errors, self.dropped
+            mstx_enabled = self.window_mstx_enabled
         groups = {}
         for key, layer, values in samples:
             group = groups.setdefault(key, [])
@@ -264,7 +314,7 @@ class CallbackTimings:
                     metrics={key: summarize([r[1][key] / 1000 for r in records]) for key in METRICS},
                     gap_metrics=(
                         {key: summarize([r[1][key] / 1000 for r in records]) for key in GAP_METRICS}
-                        if self.mstx is not None
+                        if mstx_enabled
                         else {}
                     ),
                     load_details=(
@@ -275,7 +325,7 @@ class CallbackTimings:
                             )
                             for key in LOAD_METRICS
                         }
-                        if self.mstx is not None
+                        if mstx_enabled
                         else {}
                     ),
                 )
@@ -287,8 +337,15 @@ class CallbackTimings:
             dropped=dropped,
             groups=reports,
             units="us",
-            mstx_enabled=self.mstx is not None,
+            mstx_enabled=mstx_enabled,
+            mstx_configured=self.mstx is not None,
             mstx_errors=self.marker_errors,
+            prefill_load=dict(
+                count=len(prefill_samples),
+                sum_us=sum(value for _, value in prefill_samples) / 1000,
+                layers=sorted({layer for layer, _ in prefill_samples}),
+                per_call_us=summarize([value / 1000 for _, value in prefill_samples]) if prefill_samples else None,
+            ),
         )
 
     def serve(self, port):
@@ -320,6 +377,8 @@ class CallbackTimings:
                         transport="torch",
                         load_backend="python",
                         mstx_enabled=collector.mstx is not None,
+                        mstx_configured=collector.mstx is not None,
+                        window_mstx_enabled=collector.window_mstx_enabled,
                     ),
                 )
 
@@ -327,9 +386,14 @@ class CallbackTimings:
                 try:
                     # Consume the control request body before closing HTTP/1.0;
                     # unread bytes can cause a TCP reset instead of a response.
-                    self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                    body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                     if self.path == "/start":
-                        collector.start()
+                        options = json.loads(body) if body else {}
+                        if not isinstance(options, dict):
+                            raise ValueError("Start options must be a JSON object")
+                        if set(options) - {"mstx_enabled"}:
+                            raise ValueError("Unknown start option")
+                        collector.start(mstx_enabled=options.get("mstx_enabled", True))
                         self.respond(200, {"started": True})
                     elif self.path == "/stop":
                         self.respond(200, collector.stop())
@@ -379,5 +443,7 @@ def install_callback_timing(manager, port):
     transport = manager._get_h2d_transport()
     transport.copy_batch = collector.wrap("copy_submit", transport.copy_batch)
     manager._update_weights = collector.wrap_update(manager._update_weights)
+    if hasattr(manager, "_prefill_load_layer"):
+        manager._prefill_load_layer = collector.wrap_prefill(manager._prefill_load_layer)
     collector.serve(port)
     manager._callback_timing = collector

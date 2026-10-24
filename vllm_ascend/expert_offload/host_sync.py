@@ -135,8 +135,10 @@ class MteHostDispatcher:
         import torch_npu
         import vllm_ascend_host_sync as hs
 
-        if not torch_npu.__version__.startswith("2.10.") or hs.API_VERSION < 2:
-            raise RuntimeError("MTE MoE integration requires torch_npu 2.10 and Host extension API >= 2")
+        if not torch_npu.__version__.startswith("2.10.") or hs.API_VERSION < 3:
+            raise RuntimeError(
+                "MTE MoE integration requires torch_npu 2.10 and Host extension API >= 3; rebuild csrc/host_sync"
+            )
         if not torch.npu.get_device_name().startswith("Ascend950"):
             raise RuntimeError("MTE MoE integration currently supports Ascend950 only")
         self.manager, self.torch = manager, torch
@@ -165,6 +167,7 @@ class MteHostDispatcher:
         self.stride, self.done_offset = info["slot_stride"], info["done_offset"]
         for slot in range(self.SLOT_CAPACITY):
             self.session.register_task(slot, lambda slot=slot: self._run(slot))
+        self.session.set_poll_slot_count(1)
         self.session.start()
         self.alias = self.session.begin_device_access()
         self.entries[0] = (lambda args: None, None)
@@ -290,6 +293,9 @@ class MteHostDispatcher:
         slot = self.next_slot
         self.entries[slot] = (callback, args)
         self.next_slot += 1
+        # Enable the slot before the device can publish to it. Never shrink:
+        # all previously captured graph slots may be replayed in the future.
+        self.session.set_poll_slot_count(self.next_slot)
         # torch_npu 2.10's npu_stream property calls NPUStream::stream(), which
         # drains its Host submission queue. Read it HERE, after preceding copy_
         # and event submissions; never cache it across model operations.

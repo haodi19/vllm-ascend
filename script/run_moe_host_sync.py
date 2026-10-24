@@ -59,6 +59,42 @@ def failure_excerpt(text):
     return "\n".join(lines[index] for index in sorted(selected))
 
 
+def compare_weight_timings(reports):
+    """Compare like-for-like transfer stages, separately from HTTP latency."""
+    left, right = (reports[key]["weight_timing"] for key in ("callback", "mte"))
+    if left["digests"] != right["digests"] or left["usage"] != right["usage"]:
+        raise RuntimeError("CPU-timed weight comparison produced different outputs/usage")
+    groups = [{(row["kind"], row["token_rows"]): row for row in report["groups"]} for report in (left, right)]
+    print("\n=== WEIGHT STAGE COMPARISON: CPU timers only; profiler/MSTX OFF ===", flush=True)
+    print("Units: us per callback; synchronize is residual waiting, not the full DMA duration.", flush=True)
+    for key in sorted(groups[0].keys() | groups[1].keys()):
+        if any(key not in group for group in groups):
+            print(f"kind={key[0]} rows={key[1]}: missing in one backend; not comparable", flush=True)
+            continue
+        before, after = (group[key] for group in groups)
+        loads = [row["count"] * row["loads"]["mean"] for row in (before, after)]
+        matched = before["count"] == after["count"] and abs(loads[0] - loads[1]) < 1e-6
+        print(
+            f"kind={key[0]} rows={key[1]} callbacks={before['count']}/{after['count']} "
+            f"total_loaded_experts={loads[0]:.0f}/{loads[1]:.0f}; count/load match={matched}",
+            flush=True,
+        )
+        print(f"{'metric':26} {'callback_us':>12} {'mte_us':>12} {'delta_us':>12} {'change':>10}", flush=True)
+        for metric in ("load_prepare", "copy_submit", "scale_refresh", "load_submit", "synchronize", "load_and_wait"):
+            values = [
+                sum(row["metrics"][name]["mean"] for name in ("load_submit", "synchronize"))
+                if metric == "load_and_wait"
+                else row["metrics"][metric]["mean"]
+                for row in (before, after)
+            ]
+            delta = values[1] - values[0]
+            change = f"{100 * delta / values[0]:+.1f}%" if values[0] else "n/a"
+            print(f"{metric:26} {values[0]:12.3f} {values[1]:12.3f} {delta:12.3f} {change:>10}", flush=True)
+        if not matched:
+            print("WARNING: workload counts differ; mean deltas alone do not establish a speedup.", flush=True)
+    print("load_and_wait = load_submit + synchronize; do not add load_prepare/copy_submit again.", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number)
@@ -77,6 +113,18 @@ def main():
     )
     parser.add_argument("--test-script", type=Path, default=REPOSITORY_ROOT / "script/test_graph2.sh")
     parser.add_argument("--requests", type=int, default=3)
+    parser.add_argument(
+        "--timing-requests",
+        type=int,
+        default=3,
+        help="Weight-stage timing requests before profiling, with MSTX disabled; 0 skips this window",
+    )
+    parser.add_argument(
+        "--latency-requests",
+        type=int,
+        default=0,
+        help="Additional requests before profiling, with timer collection inactive",
+    )
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=300)
@@ -95,6 +143,8 @@ def main():
         parser.error("Run inside the Linux NPU container")
     if min(args.requests, args.warmup_requests, args.startup_timeout, args.request_timeout, args.profile_timeout) < 1:
         parser.error("Counts/timeouts must be positive")
+    if min(args.latency_requests, args.timing_requests) < 0:
+        parser.error("--latency-requests and --timing-requests must be non-negative")
     root = (args.output_dir or REPOSITORY_ROOT / "bench_results" / f"moe_host_sync_{uuid4().hex[:8]}").resolve()
     require_space(root)
     require_space(REPOSITORY_ROOT, minimum_gib=2)
@@ -171,6 +221,8 @@ def run(args, root):
             port=port,
             timing_port=args.timing_port,
             requests=args.requests,
+            latency_requests=args.latency_requests,
+            timing_requests=args.timing_requests,
             warmup_requests=args.warmup_requests,
             max_tokens=5,
             startup_timeout=args.startup_timeout,
@@ -218,6 +270,20 @@ def run(args, root):
         )
         if not match or not usage_match:
             raise RuntimeError("Generated output differs; inspect before claiming correctness or speedup")
+        if args.timing_requests:
+            compare_weight_timings(reports)
+        if args.latency_requests:
+            left, right = (reports[key]["plain_latency"] for key in ("callback", "mte"))
+            plain_match = left["digests"] == right["digests"] and left["usage"] == right["usage"]
+            print(f"UNPROFILED OUTPUT/USAGE MATCH: {plain_match}", flush=True)
+            before, after = left["request_ms"]["mean"], right["request_ms"]["mean"]
+            print(
+                f"UNPROFILED REQUEST MEAN ms: callback={before:.3f}; mte={after:.3f}; "
+                f"change={(after / before - 1) * 100:.2f}% (negative=faster)",
+                flush=True,
+            )
+            if not plain_match:
+                raise RuntimeError("Unprofiled request outputs differ")
     print("REAL MOE RUN COMPLETE. Limited prompt coverage; diagnostic timings include profiler overhead.", flush=True)
     print(f"Profiles: {root / 'profile'}; return summary.txt text only.", flush=True)
     return 0

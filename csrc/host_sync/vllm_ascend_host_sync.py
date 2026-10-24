@@ -28,6 +28,18 @@ class Session:
     def start(self, timeout_ms=5000):
         self._native.start(timeout_ms)
 
+    def set_poll_slot_count(self, count):
+        """Poll slots ``[0, count)``; after start this prefix may only grow.
+
+        The default is the entire allocation. Device producers must extend
+        this prefix before publishing requests into newly enabled slots.
+        """
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            raise ValueError("poll slot count must be a positive integer")
+        if API_VERSION < 3:
+            raise RuntimeError("Polling slot bounds require Host extension API >= 3; rebuild csrc/host_sync")
+        self._native.set_poll_slot_count(count)
+
     def submit_for_test(self, slot, generation):
         """Simulate the device producer on Host; never mix with device producers."""
         self._check_slot(slot)

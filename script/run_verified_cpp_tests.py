@@ -337,7 +337,7 @@ def finish_profile(opener, args, profile_dir):
     return "complete"
 
 
-def print_inference_report(backend, report, requests):
+def print_inference_report(backend, report, requests, measurement="TIMERS + PROFILER"):
     if report.get("mstx_enabled"):
         print(f"MSTX {backend}: enabled=True; marker_errors={report.get('mstx_errors', 0)}", flush=True)
     if report["errors"] or report["dropped"] or not report["count"]:
@@ -345,6 +345,10 @@ def print_inference_report(backend, report, requests):
             f"Incomplete callback timing: count={report['count']} errors={report['errors']} dropped={report['dropped']}"
         )
     print(f"INFERENCE {backend}: callbacks={report['count']}; errors=0; dropped=0", flush=True)
+    if "prefill_load" in report:
+        print(
+            "PREFILL FULL-EXPERT LOAD (separate from update_weights): " + json.dumps(report["prefill_load"]), flush=True
+        )
     for group in report["groups"]:
         print(
             f"\nkind={group['kind']} token_rows={group['token_rows']} callbacks={group['count']} "
@@ -392,7 +396,7 @@ def print_inference_report(backend, report, requests):
                     flush=True,
                 )
     stats = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))["summarize"]
-    print(f"Request wall time (ms, TIMERS + PROFILER): {stats([r[0] / 1000 for r in requests])}", flush=True)
+    print(f"Request wall time (ms, {measurement}): {stats([r[0] / 1000 for r in requests])}", flush=True)
     print(f"Request usage: {[r[1] for r in requests]}", flush=True)
     report["request_us"] = statistics.mean(r[0] for r in requests)
     report["usage"] = [r[1] for r in requests]
@@ -463,6 +467,37 @@ def _inference(args, source, backend, env, log):
         with progress(f"{backend} warmup: {args.warmup_requests} requests"):
             for _ in range(args.warmup_requests):
                 completion()
+        plain = None
+        latency_requests = getattr(args, "latency_requests", 0)
+        if latency_requests:
+            # The timer collector is still inactive and start_profile has not
+            # been called. Keep this measurement separate from diagnostic data.
+            with progress(f"{backend} latency requests: {latency_requests}; profiler/timer windows OFF"):
+                plain_samples = [completion() for _ in range(latency_requests)]
+            summarize = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))["summarize"]
+            plain = {
+                "request_ms": summarize([sample[0] / 1000 for sample in plain_samples]),
+                "samples_ms": [sample[0] / 1000 for sample in plain_samples],
+                "digests": [sample[2] for sample in plain_samples],
+                "usage": [sample[1] for sample in plain_samples],
+            }
+            print("LATENCY WITHOUT ACTIVE PROFILER/TIMERS " + json.dumps(plain), flush=True)
+        weight_timing = None
+        timing_requests = getattr(args, "timing_requests", 0)
+        if timing_requests:
+            # Same wrappers and transfer operations in both backends, without
+            # the additional nested MSTX markers on the MTE quant-copy path.
+            timed_samples = []
+            request(opener, args.timing_port, "/start", {"mstx_enabled": False})
+            try:
+                with progress(f"{backend} weight timing: {timing_requests} requests; profiler/MSTX OFF"):
+                    timed_samples = [completion() for _ in range(timing_requests)]
+            finally:
+                weight_timing = request(opener, args.timing_port, "/stop", {}, timeout=40)
+            if weight_timing.get("mstx_enabled") is not False:
+                raise RuntimeError("Worker did not disable MSTX for weight timing; update worker code")
+            print("\n=== WEIGHT TIMING: CPU timers only; no active profiler/MSTX ===", flush=True)
+            print_inference_report(backend, weight_timing, timed_samples, measurement="CPU TIMERS ONLY")
         require_space(profile_dir)
         request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
         requests = []
@@ -481,6 +516,10 @@ def _inference(args, source, backend, env, log):
             finally:
                 profile_status = finish_profile(opener, args, profile_dir)
         report["profile_status"] = profile_status
+        if plain is not None:
+            report["plain_latency"] = plain
+        if weight_timing is not None:
+            report["weight_timing"] = weight_timing
         if getattr(args, "mstx", False):
             report["mstx_trace_occurrences"] = inspect_mstx_trace(profile_dir)
             if profile_status == "complete":

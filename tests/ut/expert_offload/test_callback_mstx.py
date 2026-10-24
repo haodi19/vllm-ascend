@@ -2,6 +2,7 @@
 
 import ast
 import contextlib
+import http.client
 import io
 import json
 import runpy
@@ -35,6 +36,115 @@ class FakeMstx:
 
 
 class TestMstx(unittest.TestCase):
+    def test_timers_only_window_preserves_main_metrics_and_restores_mstx(self):
+        now = [0]
+        mstx = FakeMstx()
+        collector = TIMING["CallbackTimings"]("python", clock=lambda: now[0], mstx=mstx)
+        manager = SimpleNamespace(_callback_timing=collector)
+
+        def advance(ns):
+            now[0] += ns
+
+        def prepare():
+            with TIMING["callback_stage"](manager, "quant_adapter"):
+                advance(3000)
+
+        prepare = collector.wrap("load_prepare", prepare)
+        copy = collector.wrap("copy_submit", lambda: advance(5000))
+        refresh = collector.wrap("scale_refresh", lambda: advance(1000))
+        load = collector.wrap("load_submit", lambda: (prepare(), copy(), refresh()))
+        synchronize = collector.wrap("synchronize", lambda: advance(2000))
+        observe = collector.wrap("observe", lambda: advance(1000))
+        choose = collector.wrap("choose_victims", lambda: advance(1000))
+        update = collector.wrap_update(lambda args: (observe(), choose(), load(), synchronize()))
+
+        def callback(args):
+            with TIMING["callback_boundary_stage"](manager, "prefetch_snapshot"):
+                return update(args)
+
+        call = collector.wrap_callback(callback)
+        prefill = collector.wrap_prefill(lambda layer: advance(4000))
+        collector.start(mstx_enabled=False)
+        call(self.args())
+        prefill(1)
+        report = collector.stop()
+        self.assertFalse(report["mstx_enabled"])
+        self.assertTrue(report["mstx_configured"])
+        self.assertEqual(report["count"], 1)
+        self.assertEqual(report["prefill_load"]["sum_us"], 4)
+        self.assertEqual(mstx.events, [])
+        self.assertIsNone(getattr(collector.local, "outer_context", None))
+        self.assertEqual(collector.inflight, 0)
+        group = report["groups"][0]
+        expected = dict(
+            total=13,
+            observe=1,
+            choose_victims=1,
+            load_submit=9,
+            load_prepare=3,
+            copy_submit=5,
+            scale_refresh=1,
+            synchronize=2,
+            outer=9,
+            host_without_sync=11,
+        )
+        for key, value in expected.items():
+            self.assertEqual(group["metrics"][key]["mean"], value, key)
+        self.assertEqual(group["load_details"], {})
+        self.assertEqual(group["gap_metrics"], {})
+
+        collector.start()
+        call(self.args())
+        restored = collector.stop()
+        self.assertTrue(restored["mstx_enabled"])
+        self.assertEqual(restored["count"], 1)
+        self.assertEqual(restored["groups"][0]["load_details"]["quant_adapter"]["calls"], 1)
+        self.assertIn("moe_offload/host_callback", mstx.events[0][2])
+
+    def test_start_options_http_validation_and_window_state(self):
+        collector = TIMING["CallbackTimings"]("python", mstx=FakeMstx())
+        collector.serve(0)
+        self.addCleanup(collector.close)
+
+        def request(method, path, body=None):
+            connection = http.client.HTTPConnection(*collector.server.server_address, timeout=5)
+            try:
+                connection.request(method, path, body=body)
+                response = connection.getresponse()
+                return response.status, json.loads(response.read())
+            finally:
+                connection.close()
+
+        for body in (
+            '{"mstx_enabled":"false"}',
+            '{"mstx_enabled":0}',
+            '{"mstx_enabled":null}',
+            "[]",
+            "{",
+            '{"unknown":true}',
+        ):
+            status, payload = request("POST", "/start", body)
+            self.assertEqual(status, 409, body)
+            self.assertIn("error", payload)
+            self.assertFalse(collector.active)
+        self.assertEqual(request("POST", "/start", '{"mstx_enabled":false}')[0], 200)
+        status, payload = request("GET", "/status")
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["mstx_enabled"])
+        self.assertTrue(payload["mstx_configured"])
+        self.assertFalse(payload["window_mstx_enabled"])
+        collector.wrap_update(lambda args: None)(self.args())
+        self.assertEqual(request("POST", "/start", "{}")[0], 409)
+        self.assertFalse(collector.window_mstx_enabled)
+        self.assertEqual(len(collector.samples), 1)
+        status, report = request("POST", "/stop", "{}")
+        self.assertEqual(status, 200)
+        self.assertFalse(report["mstx_enabled"])
+        self.assertEqual(report["count"], 1)
+        self.assertEqual(request("POST", "/start", "{}")[0], 200)
+        self.assertTrue(collector.window_mstx_enabled)
+        self.assertEqual(request("POST", "/stop", "{}")[0], 200)
+
     def test_load_detail_nested_timing_and_counts(self):
         now = [0]
         collector = TIMING["CallbackTimings"]("python", clock=lambda: now[0], mstx=FakeMstx())

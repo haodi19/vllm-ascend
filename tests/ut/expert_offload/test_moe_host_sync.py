@@ -375,6 +375,7 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.SLOT_CAPACITY = 4
         obj.alias, obj.stride, obj.done_offset, obj.state_base = 10000, 1024, 512, 20000
         obj.publish, obj.wait = Mock(), Mock()
+        obj.session = Mock()
         obj.manager, obj.completed = SimpleNamespace(_cb_failures=0), 0
         obj.active_callback = None
         return obj
@@ -390,10 +391,11 @@ class MoeHostSyncTests(unittest.TestCase):
 
         obj.publish.side_effect = lambda *args: calls.append("publish")
         obj.wait.side_effect = lambda *args: calls.append("wait")
+        obj.session.set_poll_slot_count.side_effect = lambda count: calls.append(f"enable:{count}")
         callback = Mock()
         for value in ("prefetch", "demand"):
             obj.launch(Stream(), callback, value)
-        self.assertEqual(calls, ["drain", "publish", "wait"] * 2)
+        self.assertEqual(calls, ["enable:2", "drain", "publish", "wait", "enable:3", "drain", "publish", "wait"])
         self.assertEqual(obj.entries[1:3], [(callback, "prefetch"), (callback, "demand")])
         obj.publish.assert_called_with(55, 12048, 20064)
         obj.wait.assert_called_with(55, 12560, 20064)
@@ -559,6 +561,79 @@ class MoeHostSyncTests(unittest.TestCase):
             _, command, _, _ = self.runner.launch_spec(updated, "python", 1, None, 18155)
             config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
             self.assertEqual(config["host_sync_quant_copy"], expected)
+
+    @staticmethod
+    def weight_comparison_reports():
+        reports = {}
+        for backend, means in (
+            ("callback", (20, 30, 5, 60, 100)),
+            ("mte", (10, 20, 5, 40, 80)),
+        ):
+            reports[backend] = {
+                "weight_timing": {
+                    "digests": ["same-output"],
+                    "usage": [{"prompt_tokens": 5, "completion_tokens": 5}],
+                    "groups": [
+                        {
+                            "kind": "reactive",
+                            "token_rows": 1,
+                            "count": 3,
+                            "loads": {"mean": 2},
+                            "metrics": {
+                                name: {"mean": mean}
+                                for name, mean in zip(
+                                    ("load_prepare", "copy_submit", "scale_refresh", "load_submit", "synchronize"),
+                                    means,
+                                )
+                            },
+                        }
+                    ],
+                }
+            }
+        return reports
+
+    def test_weight_comparison_reports_stage_delta_without_double_counting(self):
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            self.runner.compare_weight_timings(self.weight_comparison_reports())
+        output = captured.getvalue()
+        self.assertIn("count/load match=True", output)
+        self.assertIn("total_loaded_experts=6/6", output)
+        rows = {
+            words[0]: words[1:]
+            for line in output.splitlines()
+            if len(words := line.split()) == 5 and words[0] in ("load_prepare", "load_and_wait")
+        }
+        self.assertEqual(rows["load_prepare"], ["20.000", "10.000", "-10.000", "-50.0%"])
+        self.assertEqual(rows["load_and_wait"], ["160.000", "120.000", "-40.000", "-25.0%"])
+        self.assertIn("do not add load_prepare/copy_submit again", output)
+
+    def test_weight_comparison_flags_different_counts_loads_or_missing_group(self):
+        for count, loads in ((4, 1.5), (3, 3)):
+            with self.subTest(count=count, loads=loads):
+                reports = self.weight_comparison_reports()
+                row = reports["mte"]["weight_timing"]["groups"][0]
+                row["count"], row["loads"]["mean"] = count, loads
+                captured = io.StringIO()
+                with contextlib.redirect_stdout(captured):
+                    self.runner.compare_weight_timings(reports)
+                self.assertIn("count/load match=False", captured.getvalue())
+                self.assertIn("do not establish a speedup", captured.getvalue())
+        reports = self.weight_comparison_reports()
+        reports["mte"]["weight_timing"]["groups"] = []
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            self.runner.compare_weight_timings(reports)
+        self.assertIn("missing in one backend; not comparable", captured.getvalue())
+        self.assertNotIn("delta_us", captured.getvalue())
+
+    def test_weight_comparison_rejects_different_output_or_usage(self):
+        for key, value in (("digests", ["different-output"]), ("usage", [{"completion_tokens": 4}])):
+            with self.subTest(key=key):
+                reports = self.weight_comparison_reports()
+                reports["mte"]["weight_timing"][key] = value
+                with self.assertRaisesRegex(RuntimeError, "different outputs/usage"):
+                    self.runner.compare_weight_timings(reports)
 
 
 if __name__ == "__main__":

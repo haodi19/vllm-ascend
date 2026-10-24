@@ -22,6 +22,7 @@ class HostSyncSessionTests(unittest.TestCase):
         info = session.info()
         self.assertEqual(info["backend"], "cpu")
         self.assertEqual(info["slots"], 3)
+        self.assertEqual(info["poll_slot_count"], 3)
         self.assertEqual(info["state"], "created")
         self.assertGreater(info["host_address"], 0)
         self.assertGreater(info["slot_stride"], 0)
@@ -32,6 +33,98 @@ class HostSyncSessionTests(unittest.TestCase):
             self.assertEqual(snapshot["done_generation"], 0)
             self.assertEqual(snapshot["error_generation"], 0)
             self.assertEqual(snapshot["status"], 0)
+
+    def test_poll_slot_count_validation_and_lifecycle(self):
+        session = self.make_session(slots=3)
+        for count in (0, -1, True, 1.5, "1", 4):
+            with self.assertRaises(ValueError):
+                session.set_poll_slot_count(count)
+        session.set_poll_slot_count(1)
+        self.assertEqual(session.info()["poll_slot_count"], 1)
+        session.set_poll_slot_count(3)
+        session.set_poll_slot_count(1)
+        session.register_task(0, lambda: None)
+        session.start()
+        session.set_poll_slot_count(2)
+        session.set_poll_slot_count(2)
+        with self.assertRaisesRegex(RuntimeError, "cannot decrease"):
+            session.set_poll_slot_count(1)
+        session.stop()
+        with self.assertRaises(RuntimeError):
+            session.set_poll_slot_count(3)
+        session.close()
+        with self.assertRaises(RuntimeError):
+            session.set_poll_slot_count(3)
+
+    def test_poll_slot_count_growth_keeps_old_slots_replayable(self):
+        session = self.make_session(slots=4)
+        calls = [0] * 4
+
+        def callback(slot):
+            calls[slot] += 1
+
+        for slot in range(4):
+            session.register_task(slot, lambda slot=slot: callback(slot))
+        session.set_poll_slot_count(1)
+        session.start()
+        for slot in range(4):
+            if slot:
+                with self.assertRaisesRegex(RuntimeError, "extend poll slot count"):
+                    session.submit_for_test(slot, 1)
+                self.assertEqual(session.snapshot(slot)["request_generation"], 0)
+            session.set_poll_slot_count(slot + 1)
+            session.submit_for_test(slot, 1)
+            self.assertEqual(session.wait(slot, 1)["done_generation"], 1)
+        # Graphs captured before the bound grew must still complete later.
+        for slot in reversed(range(4)):
+            session.submit_for_test(slot, 2)
+            self.assertEqual(session.wait(slot, 2)["done_generation"], 2)
+        self.assertEqual(calls, [2] * 4)
+
+    def test_poll_slot_count_cannot_hide_outstanding_task_or_change_while_stopping(self):
+        session = self.make_session(slots=3)
+        entered, release = threading.Event(), threading.Event()
+
+        def callback():
+            entered.set()
+            if not release.wait(5):
+                raise RuntimeError("test did not release callback")
+
+        session.register_task(1, callback)
+        session.set_poll_slot_count(2)
+        session.start()
+        session.submit_for_test(1, 1)
+        try:
+            self.assertTrue(entered.wait(2))
+            with self.assertRaisesRegex(RuntimeError, "cannot decrease"):
+                session.set_poll_slot_count(1)
+            with self.assertRaises(TimeoutError):
+                session.stop(timeout_ms=20)
+            with self.assertRaises(RuntimeError):
+                session.set_poll_slot_count(3)
+        finally:
+            release.set()
+        session.stop()
+        self.assertEqual(session.snapshot(1)["done_generation"], 1)
+
+    def test_callback_cannot_change_poll_slot_count(self):
+        session = self.make_session(slots=2)
+        rejected = []
+
+        def callback():
+            try:
+                session.set_poll_slot_count(2)
+            except RuntimeError as error:
+                rejected.append(str(error))
+
+        session.register_task(0, callback)
+        session.set_poll_slot_count(1)
+        session.start()
+        session.submit_for_test(0, 1)
+        session.wait(0, 1)
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("cannot be called from a callback", rejected[0])
+        self.assertEqual(session.info()["poll_slot_count"], 1)
 
     def test_cpu_backend_cannot_grant_device_access(self):
         session = self.make_session()

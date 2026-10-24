@@ -27,7 +27,7 @@ class WaitTimeout : public std::runtime_error {
 class Session {
  public:
   Session(size_t slots, const std::string& backend, int device_id, const std::string& acl_library)
-      : slots_(slots), backend_(backend), device_id_(device_id) {
+      : slots_(slots), backend_(backend), device_id_(device_id), poll_slot_count_(slots) {
     if (slots == 0 || slots > kMaxSlots) {
       throw std::invalid_argument("slots must be in [1, 4096]");
     }
@@ -102,6 +102,24 @@ class Session {
     }
   }
 
+  // Producers must extend this prefix before publishing a request in a new
+  // slot. Once started, never hide old slots: captured graphs can reuse them.
+  void set_poll_slot_count(size_t count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    reject_worker_call("set_poll_slot_count");
+    if (count == 0 || count > slots_) {
+      throw std::invalid_argument("poll slot count must be in [1, slots]");
+    }
+    if (state_ != "created" && state_ != "running") {
+      throw std::runtime_error("poll slot count may change only before start or while running");
+    }
+    if (state_ == "running" && count < poll_slot_count_.load(std::memory_order_acquire)) {
+      throw std::runtime_error("poll slot count cannot decrease after start()");
+    }
+    poll_slot_count_.store(count, std::memory_order_release);
+  }
+
   // Test producer only. No device kernels may access this session concurrently.
   void submit_for_test(size_t slot, uint64_t generation) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -109,6 +127,9 @@ class Session {
     reject_worker_call("submit_for_test");
     check_slot(slot);
     if (state_ != "running") throw std::runtime_error("session is not running");
+    if (slot >= poll_slot_count_.load(std::memory_order_acquire)) {
+      throw std::runtime_error("extend poll slot count before submitting this slot");
+    }
     if (device_access_) throw std::runtime_error("device producer owns the session; Host test submission is disabled");
     if (!callbacks_[slot]) throw std::runtime_error("slot has no registered callback");
     auto& signal = signals_[slot];
@@ -174,6 +195,7 @@ class Session {
     result["backend"] = backend_;
     result["device_id"] = device_id_;
     result["slots"] = slots_;
+    result["poll_slot_count"] = poll_slot_count_.load(std::memory_order_acquire);
     result["state"] = state_;
     result["protocol_version"] = kProtocolVersion;
     result["slot_stride"] = sizeof(Slot);
@@ -340,7 +362,10 @@ class Session {
   void poll() {
     while (!stop_requested_.load(std::memory_order_acquire)) {
       bool did_work = false;
-      for (size_t slot = 0; slot < slots_; ++slot) {
+      // Only scan the producer-enabled prefix. New slots become visible on
+      // the next sweep; existing slots remain visible for all graph replays.
+      const size_t count = poll_slot_count_.load(std::memory_order_acquire);
+      for (size_t slot = 0; slot < count; ++slot) {
         uint64_t generation;
         {
           std::lock_guard<std::mutex> lock(mutex_);
@@ -395,6 +420,7 @@ class Session {
   std::condition_variable changed_;
   std::thread worker_;
   std::thread::id worker_id_;
+  std::atomic<size_t> poll_slot_count_;
   std::atomic<bool> stop_requested_{false};
   std::string state_ = "created";
   std::string startup_error_;
@@ -406,13 +432,14 @@ class Session {
 }  // namespace host_sync
 
 PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
-  module.attr("API_VERSION") = 2;
+  module.attr("API_VERSION") = 3;
   py::register_exception<host_sync::WaitTimeout>(module, "WaitTimeout", PyExc_TimeoutError);
   py::class_<host_sync::Session>(module, "_Session")
       .def(py::init<size_t, const std::string&, int, const std::string&>(), py::arg("slots"), py::arg("backend"),
            py::arg("device_id"), py::arg("acl_library"))
       .def("register_task", &host_sync::Session::register_task)
       .def("start", &host_sync::Session::start, py::arg("timeout_ms") = 5000)
+      .def("set_poll_slot_count", &host_sync::Session::set_poll_slot_count, py::arg("count"))
       .def("submit_for_test", &host_sync::Session::submit_for_test)
       .def("wait", &host_sync::Session::wait, py::arg("slot"), py::arg("generation"), py::arg("timeout_ms") = 5000)
       .def("snapshot", &host_sync::Session::snapshot)

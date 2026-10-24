@@ -17,6 +17,33 @@ REPO = Path(__file__).resolve().parents[3]
 
 
 class TestCallbackTimings(unittest.TestCase):
+    def test_prefill_is_separate_and_excludes_warmup(self):
+        now = [0]
+        collector = self.module["CallbackTimings"]("python", clock=lambda: now[0])
+
+        def load(layer, fail=False):
+            now[0] += 100000
+            if fail:
+                raise RuntimeError("load failed")
+            return layer
+
+        call = collector.wrap_prefill(load)
+        self.assertEqual(call(0), 0)
+        collector.start()
+        self.assertEqual(call(1), 1)
+        self.assertEqual(call(2), 2)
+        result = collector.stop()
+        self.assertEqual(result["count"], 0)
+        self.assertEqual(result["prefill_load"]["count"], 2)
+        self.assertEqual(result["prefill_load"]["sum_us"], 200)
+        self.assertEqual(result["prefill_load"]["layers"], [1, 2])
+        collector.start()
+        with self.assertRaisesRegex(RuntimeError, "load failed"):
+            call(0, fail=True)
+        result = collector.stop()
+        self.assertEqual(result["errors"], 1)
+        self.assertEqual(result["prefill_load"]["count"], 0)
+
     @classmethod
     def setUpClass(cls):
         cls.module = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))
@@ -413,6 +440,7 @@ class TestVerifiedRunner(unittest.TestCase):
             startup_timeout=20,
             request_timeout=10,
             warmup_requests=2,
+            latency_requests=2,
             requests=3,
             max_tokens=5,
             profile_run_dir=Path("profiles/test"),
@@ -452,7 +480,7 @@ class TestVerifiedRunner(unittest.TestCase):
             [
                 "/health",
                 "/status",
-                *["/v1/completions"] * 2,
+                *["/v1/completions"] * 4,
                 "/start_profile",
                 "/start",
                 *["/v1/completions"] * 3,
@@ -463,7 +491,115 @@ class TestVerifiedRunner(unittest.TestCase):
         cleanup.assert_called_once_with(process)
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertEqual(len(result["digests"]), 3)
+        self.assertEqual(len(result["plain_latency"]["samples_ms"]), 2)
+        self.assertEqual(len(result["plain_latency"]["digests"]), 2)
         self.assertIn("INFERENCE cpp: callbacks=5", captured.getvalue())
+
+    @contextlib.contextmanager
+    def weight_window_fixture(self, *, fail_request=False, worker_mstx=False):
+        fn = self.module["inference"]
+        args = types.SimpleNamespace(
+            npu=4,
+            port=8155,
+            timing_port=18155,
+            startup_timeout=20,
+            request_timeout=10,
+            warmup_requests=1,
+            timing_requests=2,
+            requests=1,
+            max_tokens=5,
+            profile_run_dir=Path("profiles/test"),
+            profile_timeout=10,
+        )
+        events = []
+        phase = "warmup"
+
+        def request(opener, port, path, payload=None, timeout=None):
+            nonlocal phase
+            events.append((path, payload))
+            if path == "/status":
+                return dict(backend="python", load_backend="python")
+            if path == "/start":
+                phase = "timed" if payload.get("mstx_enabled") is False else "profiled"
+            if path == "/v1/completions":
+                if phase == "timed" and fail_request:
+                    raise RuntimeError("weight request failed")
+                return dict(choices=[{"text": phase}], usage={"completion_tokens": 5})
+            if path == "/stop":
+                return dict(
+                    count=2 if phase == "timed" else 3,
+                    errors=0,
+                    dropped=0,
+                    groups=[],
+                    mstx_enabled=worker_mstx if phase == "timed" else True,
+                )
+            return {}
+
+        process = Mock()
+        process.poll.return_value = None
+        cleanup = Mock()
+        with (
+            patch.dict(
+                fn.__globals__,
+                {"request": request, "assert_port_free": Mock(), "stop_owned_service": cleanup, "wait_profile": Mock()},
+            ),
+            patch("subprocess.Popen", return_value=process),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            yield fn, args, events, process, cleanup
+
+    def test_cpu_weight_window_precedes_and_is_separate_from_profile(self):
+        with self.weight_window_fixture() as (fn, args, events, process, cleanup):
+            result = fn(args, self.source, "python", {})
+        self.assertEqual(
+            [path for path, _ in events],
+            [
+                "/health",
+                "/status",
+                "/v1/completions",
+                "/start",
+                "/v1/completions",
+                "/v1/completions",
+                "/stop",
+                "/start_profile",
+                "/start",
+                "/v1/completions",
+                "/stop",
+                "/stop_profile",
+            ],
+        )
+        self.assertEqual([payload for path, payload in events if path == "/start"], [{"mstx_enabled": False}, {}])
+        self.assertEqual(result["count"], 3)
+        self.assertEqual(result["weight_timing"]["count"], 2)
+        self.assertTrue(result["mstx_enabled"])
+        self.assertFalse(result["weight_timing"]["mstx_enabled"])
+        digest = self.module["hashlib"].sha256
+        self.assertEqual(result["digests"], [digest(b"profiled").hexdigest()])
+        self.assertEqual(result["weight_timing"]["digests"], [digest(b"timed").hexdigest()] * 2)
+        self.assertEqual(len(result["usage"]), 1)
+        self.assertEqual(len(result["weight_timing"]["usage"]), 2)
+        cleanup.assert_called_once_with(process)
+
+    def test_failed_weight_request_stops_timing_and_cleans_service_before_profile(self):
+        with (
+            self.weight_window_fixture(fail_request=True) as (fn, args, events, process, cleanup),
+            self.assertRaisesRegex(RuntimeError, "weight request failed"),
+        ):
+            fn(args, self.source, "python", {})
+        self.assertEqual(events[-1][0], "/stop")
+        self.assertNotIn("/start_profile", [path for path, _ in events])
+        cleanup.assert_called_once_with(process)
+
+    def test_worker_must_confirm_mstx_was_disabled_for_weight_window(self):
+        for worker_mstx in (True, None):
+            with self.subTest(worker_mstx=worker_mstx):
+                with (
+                    self.weight_window_fixture(worker_mstx=worker_mstx) as (fn, args, events, process, cleanup),
+                    self.assertRaisesRegex(RuntimeError, "did not disable MSTX"),
+                ):
+                    fn(args, self.source, "python", {})
+                self.assertNotIn("/start_profile", [path for path, _ in events])
+                cleanup.assert_called_once_with(process)
 
     def test_request_failure_still_cleans_up_owned_service(self):
         fn = self.module["inference"]

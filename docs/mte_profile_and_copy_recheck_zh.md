@@ -1,6 +1,83 @@
 # MTE 可视化与量化拷贝复核
 
-## 最新修复：加载时建立设备布局，运行时禁止重排
+## 最新结果：优先比较搬权重分项
+
+2026-10-23 的 `moe_debug_02` 使用 `prepacked`，两组均完成预热、推理和 profile 导出，
+输出摘要及 token 用量一致。两组各记录 84 次预取、86 次按需加载，分别加载 80、455 个专家。
+MTE 的 Decode `quant_allocate/quant_pack` 均为 0：此前在每次 Decode 搬运时分配和重排 scale
+的操作已消除。本次结果只覆盖该请求与配置，不代表所有模型输入已经验收。
+
+下表单位为微秒，表示每次内层 `_update_weights` 的均值，**包含计时器及 profiler/MSTX 扰动**。
+
+| 搬权重阶段 | 预取 callback | 预取 MTE | 按需 callback | 按需 MTE |
+| --- | ---: | ---: | ---: | ---: |
+| `load_prepare`：组织搬运任务 | 38.330 | 99.944 | 161.466 | 493.653 |
+| `copy_submit`：提交拷贝 | 45.651 | 60.750 | 198.414 | 245.665 |
+| `scale_refresh` | 1.455 | 1.662 | 5.778 | 6.124 |
+| `load_submit`：上述提交阶段总计 | 96.542 | 172.279 | 409.704 | 783.613 |
+| `synchronize`：提交之后的剩余等待 | 226.527 | 191.056 | 1148.227 | 1040.040 |
+| `load_submit + synchronize` | 323.069 | 363.335 | 1557.931 | 1823.653 |
+
+当前不能宣布搬权重提速：虽然剩余等待减少，但准备与提交增加更多，二者合计预取增加约 12.5%，
+按需增加约 17.1%。`synchronize` 不是完整 H2D 时间；提交过程中设备已经可能在搬运，
+只看它下降会遗漏等待向提交阶段移动的情况。`load_submit` 已包含前三项，不能再次相加。
+MTE 使用 `SyncLaunchStream` 直接提交加载任务，回调版保留普通加载流；两者 CPU 提交方式不同，
+也会影响工作落在 `copy_submit` 还是后续等待中的比例。不能将 `copy_submit` 增长直接解释成
+NPU 上 MEMCPY 本体变慢，需要同时查看合计值与设备 MEMCPY 时间块。
+
+`load_prepare` 的 MTE 专用适配器占预取 53.526、按需 282.379 微秒，
+包含格式与布局检查、Storage 视图创建、任务对象替换。它在 `prepacked` 下不再重排数据，
+但仍有这些准备步骤。适配器的 residual 还包含嵌套计时与标记开销，不能称为纯 Python 计算时间。
+本次 MTE 比 callback 多 5350 个 MSTX 区间，正好对应 1070 次量化任务各 5 个额外子区间；
+这也是为什么下一轮必须把分项计时和可视化分开。
+
+### 与 MTE 修改的关系
+
+量化 scale 原本就有非连续布局，原回调版通过 Tensor 拷贝处理。
+MTE 改变了交接方式及加载流的提交方式，原 Tensor 路径在新组合下曾卡在 scale 拷贝后的同步，
+这是迁移中的兼容性问题；仍未证实底层究竟是哪条 runtime 锁、事件或设备资源依赖。
+为绕过该路径而加入的 Storage 适配及早期 CPU 重排是我们新增的开销，不能归咎于原版。
+`prepacked` 已去掉 Decode 热路径重排，剩余准备开销与计时扰动需要分开判断。
+
+另一个待测边界是 Prefill 全专家加载：本配置阈值为 `24 / 6 = 4` 个 token，
+5-token prompt 可能走 `_prefill_load_layer`，是否发生取决于实际送入该层的 token 数。
+该函数不在 Decode `_update_weights` 统计中。其池仍为连续布局，而预打包 CPU scale 是 Decode 布局，
+仍可能在 Tensor 拷贝中整理数据。因此新增独立的 `prefill_load_layer` 标记与 `prefill_load` 汇总，
+不把这部分混入 Decode 搬运指标。本轮不改变 Prefill 数据布局。
+
+### 本轮改动与执行
+
+1. 原生 Host worker 只扫描已启用的交接槽位，避免每轮固定扫描全部 2048 个槽位。
+   启用范围在设备发布任务前扩大，图重放可能用到的旧槽位始终保留。
+   这是交接路径的改进，不等于已经证明 `load_submit` 会因此下降。
+2. 新增 CPU 分项计时窗口：profiler 未启动，MSTX 与细分诊断标记关闭，
+   仍测 `load_prepare/copy_submit/scale_refresh/load_submit/synchronize`。
+   它依然包含基础计时器开销，不能当作零扰动测量。
+3. 之后单独采集一轮完整 profile，原细分 MSTX 保留。回调版与 MTE 版顺序执行，
+   汇总表同时列出回调次数、加载专家数与各项差值；负差值表示 MTE 更快。
+
+同步代码后，在绿区执行一次即可；脚本会重建 Host 扩展 API 3 并顺序运行两组：
+
+```bash
+python -B script/run_moe_host_sync.py --npu 4 --backend both --quant-copy prepacked --timing-requests 3 --requests 1 --warmup-requests 1 --profile-timeout 300 --output-dir bench_results/moe_weight_03
+```
+
+`--timing-requests 3` 是无 profiler/MSTX 的搬权重分项测量请求数；
+`--requests 1` 是后续可视化采集请求数。两者不是预取层数或 MTP token 数。
+返回 `bench_results/moe_weight_03/summary.txt` 的文本即可。
+主要看 `WEIGHT STAGE COMPARISON`；可视化保存在该目录的 `profile/callback/python` 和
+`profile/mte/python` 下。可选的 `--latency-requests` 仅用于额外的整请求测量，默认关闭。
+
+若先检查现有设备时间线，不启动模型、不写文件：
+
+```bash
+python -B script/summarize_mte_timeline.py bench_results/moe_debug_02/profile
+```
+
+它按设备进程 metadata 识别真正的 Ascend Hardware 事件，输出交接算子及设备累计耗时。
+设备事件可重叠，AIV 等待也是设备事件；这些时间不能直接全部相加当作请求关键路径。
+
+## 前一轮修复：加载时建立设备布局，运行时禁止重排
 
 `moe_debug_01` 的真实模型实验已复现 Tensor 模式阻塞：第 0 层完成，
 第 1 层预取中 w13、w2 原始权重分别搬运完成，随后 512 KiB 的 w13 scale
@@ -28,9 +105,9 @@
 
 CPU 回归检查覆盖真实 `(64,4096,2)`、`(32,4096,2)` 布局，
 w1/w3 拼接、w2 加载、与旧缓冲区逻辑数值相等、字节搬运后数值正确、相邻槽位不被覆盖、
-不增加存储字节数、运行时禁止重排与布局不匹配失败。真实 NPU 验收仍需绿区执行。
+不增加存储字节数、运行时禁止重排与布局不匹配失败。后续绿区结果见本文开头。
 
-下一轮直接验收修复，不开启会改变执行顺序的逐项同步诊断：
+最初验收命令如下，不开启会改变执行顺序的逐项同步诊断；新一轮使用本文开头的分项比较命令：
 
 ```bash
 python -B script/run_moe_host_sync.py --npu 4 --backend both --quant-copy prepacked --requests 1 --warmup-requests 1 --profile-timeout 300 --output-dir bench_results/moe_prepacked_01

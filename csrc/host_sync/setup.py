@@ -8,7 +8,7 @@ from setuptools import setup
 
 setup(
     name="vllm-ascend-host-sync",
-    version="0.2.0",
+    version="0.3.0",
     py_modules=["vllm_ascend_host_sync"],
     ext_modules=[
         Pybind11Extension(
