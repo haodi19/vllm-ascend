@@ -1013,6 +1013,9 @@ class ExpertOffloadConfig:
         # Opt-in single-card graph handoff. Default preserves ACL callbacks.
         "host_sync_backend": "callback",
         "host_sync_diagnose_load": False,
+        # Diagnostic ablation only: retain MTE demand dispatch/load stream but
+        # restore ACL callbacks for prefetch. False keeps the normal backend.
+        "host_sync_prefetch_callback": False,
         # Experimental MTE quant copy: storage preserves the validated workaround;
         # tensor restores original Tensor.copy_ without CPU layout packing.
         # prepacked stores MXFP scale buffers in device order during loading;

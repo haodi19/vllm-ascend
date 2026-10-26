@@ -3137,7 +3137,16 @@ class ExpertOffloadManager:
 
     def _launch_offload_callback(self, stream, callback, args):
         dispatcher = getattr(self, '_host_dispatcher', None)
-        if dispatcher is None:
+        prefetch_callback = (
+            dispatcher is not None
+            and getattr(self.offload_config, 'host_sync_prefetch_callback', False)
+            and len(args) >= 6 and args[5] is True)
+        if dispatcher is None or prefetch_callback:
+            if prefetch_callback:
+                subscribed = get_subscribed_compute_streams()
+                if stream not in subscribed:
+                    torch_npu.npu._subscribe_report(stream)
+                    subscribed.add(stream)
             torch_npu.npu._launch_host_func(stream, callback, args)
         else:
             dispatcher.launch(stream, callback, args)

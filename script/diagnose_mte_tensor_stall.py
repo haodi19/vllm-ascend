@@ -61,6 +61,44 @@ def selected_stacks(text, worker_tid):
     return "\n".join(selected[:16]) if selected else text[:16000]
 
 
+def memory_context():
+    """Read container-visible limits; unavailable files are not fatal."""
+    result = {}
+    for name in ("memory.current", "memory.max", "memory.events"):
+        try:
+            result[name] = (Path("/sys/fs/cgroup") / name).read_text().strip().replace("\n", "; ")
+        except OSError:
+            result[name] = "unavailable (possibly cgroup v1 or a different mount)"
+    return result
+
+
+def kernel_exit_evidence(run_dir, emit):
+    pids = set()
+    for path in run_dir.glob("*/inference_python.log"):
+        pids.update(re.findall(r"EngineCore[^\n]*?pid=(\d+)", path.read_text(encoding="utf-8", errors="replace")))
+    emit(f"ENGINE PIDS: {sorted(pids)}; 只读取这些 PID 对应的内核日志")
+    if not pids:
+        return
+    try:
+        result = subprocess.run(
+            ["dmesg", "-T"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        emit(f"KERNEL LOG UNAVAILABLE: {exc}")
+        return
+    if result.returncode:
+        emit(f"KERNEL LOG UNAVAILABLE: {result.stderr.strip()[:400]}")
+        return
+    pattern = re.compile(r"\b(?:" + "|".join(sorted(pids)) + r")\b")
+    matches = [line for line in result.stdout.splitlines() if pattern.search(line)]
+    emit("\n".join(matches[-30:]) if matches else "内核日志未找到相应 PID；不能据此排除 OOM 或外部终止")
+
+
 def descendant(pid, ancestor):
     """Only attach to an engine spawned by this invocation, never other jobs."""
     seen = set()
@@ -124,6 +162,12 @@ def main():
     parser.add_argument("--npu", type=int)
     parser.add_argument("--read-log", type=Path, help="只读现有实验目录或日志，输出首个错误；不启动模型、不需要 gdb")
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--prefetch-handoff",
+        choices=("mte", "callback"),
+        default="mte",
+        help="Only change prefetch handoff; keep MTE demand, direct load stream and original Tensor copy",
+    )
     parser.add_argument("--profile", type=Path, help="可选：先从已有 MTE profile 分析纯设备时钟的交接间隔")
     args = parser.parse_args()
     if args.read_log:
@@ -151,6 +195,8 @@ def main():
         "mte",
         "--quant-copy",
         "tensor",
+        "--prefetch-handoff",
+        args.prefetch_handoff,
         "--diagnose-load-stages",
         "--requests",
         "1",
@@ -172,6 +218,8 @@ def main():
 
         emit(f"SUMMARY FILE: {root / 'diagnosis.txt'}")
         emit("复现 MTE + 原始 Tensor 拷贝。关闭重排/Storage 适配；仅诊断，不能作为性能结果。")
+        emit(f"预取交接={args.prefetch_handoff}; 按需交接=mte; 加载流=SyncLaunchStream")
+        emit(f"CONTAINER MEMORY BEFORE: {memory_context()}")
         if args.profile:
             # Lazy optional analyzer; no Torch/NPU imports in the supervisor.
             from diagnose_moe_transfer_gaps import load_trace, report_device_pipeline
@@ -226,6 +274,8 @@ def main():
                 emit("\n".join(text.splitlines()[-35:]))
                 if child.returncode:
                     read_failures(root, emit)
+                    emit(f"CONTAINER MEMORY AFTER: {memory_context()}; cgroup 计数变化不单独证明本进程被 OOM 杀死")
+                    kernel_exit_evidence(run_dir, emit)
                 if not captured:
                     emit("没有触发抓栈：若推理通过，本轮未复现原阻塞；若失败，先查看上面的启动错误。")
                 return child.returncode

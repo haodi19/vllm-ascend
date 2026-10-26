@@ -378,6 +378,7 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.session = Mock()
         obj.manager, obj.completed = SimpleNamespace(_cb_failures=0), 0
         obj.active_callback = None
+        obj.load_checkpoint = None
         return obj
 
     def test_capture_slots_and_submission_order(self):
@@ -530,7 +531,7 @@ class MoeHostSyncTests(unittest.TestCase):
         original = Mock()
         namespace = {"torch_npu": SimpleNamespace(npu=SimpleNamespace(_launch_host_func=original))}
         exec(compile(ast.Module(body=[method], type_ignores=[]), "dispatch", "exec"), namespace)
-        launch, manager = namespace["_launch_offload_callback"], SimpleNamespace()
+        launch, manager = namespace["_launch_offload_callback"], SimpleNamespace(offload_config=SimpleNamespace())
         launch(manager, "stream", "fn", "args")
         original.assert_called_once_with("stream", "fn", "args")
         manager._host_dispatcher = Mock()
@@ -551,8 +552,51 @@ class MoeHostSyncTests(unittest.TestCase):
         self.assertEqual(new.pop("host_sync_library"), "/tmp/libhost_sync_device.so")
         self.assertFalse(new.pop("host_sync_diagnose_load"))
         self.assertEqual(new.pop("host_sync_quant_copy"), "storage")
+        self.assertFalse(new.pop("host_sync_prefetch_callback"))
         self.assertEqual(new, old)
         self.assertFalse(any(not word.strip() for word in after))
+
+    def test_prefetch_ablation_keeps_demand_mte_and_subscribes_once(self):
+        tree = ast.parse(
+            (self.root / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8")
+        )
+        method = next(
+            n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "_launch_offload_callback"
+        )
+        npu, subscribed = SimpleNamespace(_launch_host_func=Mock(), _subscribe_report=Mock()), set()
+        namespace = {"torch_npu": SimpleNamespace(npu=npu), "get_subscribed_compute_streams": lambda: subscribed}
+        exec(compile(ast.Module(body=[method], type_ignores=[]), "dispatch", "exec"), namespace)
+        manager = SimpleNamespace(
+            _host_dispatcher=Mock(), offload_config=SimpleNamespace(host_sync_prefetch_callback=True)
+        )
+        launch = namespace["_launch_offload_callback"]
+        prefetch = (None, None, None, 1, None, True)
+        demand = (None, None, None, 1, None, False, None, None, None)
+        launch(manager, "prefetch_stream", "fn", prefetch)
+        launch(manager, "prefetch_stream", "fn", prefetch)
+        launch(manager, "main_stream", "fn", demand)
+        npu._subscribe_report.assert_called_once_with("prefetch_stream")
+        self.assertEqual(npu._launch_host_func.call_count, 2)
+        manager._host_dispatcher.launch.assert_called_once_with("main_stream", "fn", demand)
+
+    def test_prefetch_ablation_rejects_invalid_configuration(self):
+        for config in ({"host_sync_prefetch_callback": "true"}, {"host_sync_prefetch_callback": True}):
+            with self.assertRaises(ValueError):
+                self.module.validate_host_sync_config(config)
+
+    def test_report_thread_load_stall_emits_native_marker(self):
+        obj = self.dispatcher()
+        obj.next_slot = 1
+        obj.stopping = Mock()
+        obj.stopping.wait.side_effect = [False, True]
+        obj.load_checkpoint = (0, "scale_copy", 12345, 0)
+        obj._fatal = Mock()
+        with patch.object(self.module.time, "monotonic", return_value=11), patch("builtins.print") as output:
+            obj._watch()
+        text = "\n".join(str(call.args[0]) for call in output.call_args_list)
+        self.assertIn("worker_tid=12345", text)
+        self.assertIn("scale_copy", text)
+        obj._fatal.assert_not_called()
 
     def test_runner_tensor_option_only_affects_mte(self):
         source = (self.root / "script/test_graph2.sh").read_text(encoding="utf-8")

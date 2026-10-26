@@ -19,7 +19,7 @@ from run_host_sync_stage3 import select_build_directory
 from run_verified_cpp_tests import SummaryTee, inference, launch_spec
 
 
-def configured_source(source, backend, library, diagnose_load=False, quant_copy="storage"):
+def configured_source(source, backend, library, diagnose_load=False, quant_copy="storage", prefetch_callback=False):
     start = re.search(r"(?m)^vllm\s+serve\s+", source)
     if start is None:
         raise ValueError("Missing vllm serve command")
@@ -31,6 +31,7 @@ def configured_source(source, backend, library, diagnose_load=False, quant_copy=
     offload["host_sync_library"] = str(library) if backend == "mte" else ""
     offload["host_sync_diagnose_load"] = bool(diagnose_load and backend == "mte")
     offload["host_sync_quant_copy"] = quant_copy if backend == "mte" else "storage"
+    offload["host_sync_prefetch_callback"] = bool(prefetch_callback and backend == "mte")
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -118,6 +119,12 @@ def main():
     parser.add_argument("--npu", type=npu_number)
     parser.add_argument("--read-log", type=Path, help="Print existing log diagnostics only; no build or model startup")
     parser.add_argument("--backend", choices=("both", "callback", "mte"), default="both")
+    parser.add_argument(
+        "--prefetch-handoff",
+        choices=("mte", "callback"),
+        default="mte",
+        help="Diagnostic MTE ablation: change only prefetch handoff; keep demand and copy configuration",
+    )
     parser.add_argument(
         "--quant-copy",
         choices=("storage", "tensor", "prepacked"),
@@ -253,9 +260,20 @@ def run(args, root):
         if args.diagnose_load_stages:
             print("DIAGNOSTIC LOAD BARRIERS ENABLED: timings are not a performance comparison", flush=True)
         print(f"QUANT COPY: {'original tensor' if backend == 'callback' else args.quant_copy}", flush=True)
+        print(
+            f"PREFETCH HANDOFF: {args.prefetch_handoff if backend == 'mte' else 'callback'}; DEMAND HANDOFF: {backend}",
+            flush=True,
+        )
         reports[backend] = inference(
             run_args,
-            configured_source(source, backend, library, args.diagnose_load_stages, args.quant_copy),
+            configured_source(
+                source,
+                backend,
+                library,
+                args.diagnose_load_stages,
+                args.quant_copy,
+                args.prefetch_handoff == "callback",
+            ),
             "python",
             env,
         )

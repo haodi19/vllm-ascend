@@ -191,6 +191,10 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    if not isinstance(config.get("host_sync_prefetch_callback", False), bool):
+        raise ValueError("host_sync_prefetch_callback must be boolean")
+    if config.get("host_sync_prefetch_callback", False) and config.get("host_sync_backend", "callback") != "mte":
+        raise ValueError("host_sync_prefetch_callback requires the mte backend")
     if config.get("host_sync_quant_copy", "storage") not in ("storage", "tensor", "prepacked"):
         raise ValueError("host_sync_quant_copy must be storage, tensor or prepacked")
     if not isinstance(config.get("host_sync_diagnose_load", False), bool):
@@ -248,6 +252,7 @@ class MteHostDispatcher:
         self.completed = 0
         self.load_diagnostic_batches = 0
         self.active_callback = None
+        self.load_checkpoint = None
         self.closed = False
         self.stopping = threading.Event()
         self.states = torch.zeros((self.SLOT_CAPACITY, 4), dtype=torch.int64, device="npu")
@@ -311,7 +316,7 @@ class MteHostDispatcher:
         is not a performance measurement. Limit output to eight batches.
         """
         enabled = getattr(self.manager.offload_config, "host_sync_diagnose_load", False)
-        if not enabled or self.active_callback is None or not tasks or self.load_diagnostic_batches >= 8:
+        if not enabled or not tasks or self.load_diagnostic_batches >= 8:
             return False
         self.load_diagnostic_batches += 1
         batch = self.load_diagnostic_batches
@@ -320,10 +325,14 @@ class MteHostDispatcher:
         def checkpoint(label, operation):
             prefix = f"[MOE-MTE LOAD] batch={batch} layer={layer_idx} {label}"
             print(f"{prefix} BEGIN", flush=True)
-            operation()
-            print(f"{prefix} SUBMITTED", flush=True)
-            stream.synchronize()
-            print(f"{prefix} COMPLETE", flush=True)
+            self.load_checkpoint = (time.monotonic(), prefix, threading.get_native_id(), threading.get_ident())
+            try:
+                operation()
+                print(f"{prefix} SUBMITTED", flush=True)
+                stream.synchronize()
+                print(f"{prefix} COMPLETE", flush=True)
+            finally:
+                self.load_checkpoint = None
 
         checkpoint("prior_stream_work", lambda: None)
         transport = self.manager._get_h2d_transport()
@@ -410,6 +419,18 @@ class MteHostDispatcher:
         while not self.stopping.wait(1):
             try:
                 now = time.monotonic()
+                checkpoint = self.load_checkpoint
+                if checkpoint is not None:
+                    since, label, native_id, ident = checkpoint
+                    if now - since > self.STALL_SECONDS:
+                        self._fatal(f"load checkpoint stalled: {label}")
+                    if not diagnosed and now - since > self.DIAGNOSTIC_SECONDS:
+                        print(f"[MOE-MTE LOAD STALL] {label}", file=sys.stderr, flush=True)
+                        print(f"[MOE-MTE NATIVE] pid={os.getpid()} worker_tid={native_id}", file=sys.stderr, flush=True)
+                        frame = sys._current_frames().get(ident)
+                        if frame is not None:
+                            print("".join(traceback.format_stack(frame, limit=20)), file=sys.stderr, flush=True)
+                        diagnosed = True
                 for slot in range(1, self.next_slot):
                     state = self.session.snapshot(slot)
                     generation = state["request_generation"]
