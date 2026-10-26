@@ -635,6 +635,16 @@ class MoeHostSyncTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "different outputs/usage"):
                     self.runner.compare_weight_timings(reports)
 
+    def test_prefill_comparison_keeps_full_expert_loads_separate(self):
+        reports = self.weight_comparison_reports()
+        for backend, total in (("callback", 100000), ("mte", 150000)):
+            reports[backend]["weight_timing"]["prefill_load"] = dict(count=2, sum_us=total)
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            self.runner.compare_weight_timings(reports)
+        self.assertIn("PREFILL ms/layer: callback=50.000; mte=75.000; delta=+25.000", captured.getvalue())
+        self.assertIn("separate from Decode below", captured.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,24 @@ def compare_weight_timings(reports):
         raise RuntimeError("CPU-timed weight comparison produced different outputs/usage")
     groups = [{(row["kind"], row["token_rows"]): row for row in report["groups"]} for report in (left, right)]
     print("\n=== WEIGHT STAGE COMPARISON: CPU timers only; profiler/MSTX OFF ===", flush=True)
+    prefill = [report.get("prefill_load") for report in (left, right)]
+    if all(row is not None for row in prefill):
+        counts = [row["count"] for row in prefill]
+        print(f"PREFILL full-expert loads: callback={counts[0]}; mte={counts[1]}", flush=True)
+        if all(counts):
+            means = [row["sum_us"] / row["count"] / 1000 for row in prefill]
+            print(
+                f"PREFILL ms/layer: callback={means[0]:.3f}; mte={means[1]:.3f}; "
+                f"delta={means[1] - means[0]:+.3f}; count match={counts[0] == counts[1]}",
+                flush=True,
+            )
+            if left["usage"]:
+                totals = [row["sum_us"] / len(left["usage"]) / 1000 for row in prefill]
+                print(
+                    f"PREFILL accumulated ms/request: callback={totals[0]:.3f}; mte={totals[1]:.3f}; "
+                    f"delta={totals[1] - totals[0]:+.3f} (separate from Decode below)",
+                    flush=True,
+                )
     print("Units: us per callback; synchronize is residual waiting, not the full DMA duration.", flush=True)
     for key in sorted(groups[0].keys() | groups[1].keys()):
         if any(key not in group for group in groups):

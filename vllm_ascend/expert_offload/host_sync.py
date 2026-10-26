@@ -22,6 +22,23 @@ def dense_strides(shape, strides):
     return all(size > 0 for size in shape)
 
 
+def allocate_prepacked_scale_pool(reference, num_experts, device):
+    """Keep each Prefill expert in the same physical scale order as Decode.
+
+    Allocate a flat backing so a four-dimensional view does not select NCHW
+    storage implicitly. Only metadata changes; no runtime layout conversion or
+    second weight cache is allocated.
+    """
+    import torch
+
+    shape, strides = tuple(reference.shape[1:]), tuple(reference.stride()[1:])
+    if reference.dtype != torch.uint8 or not shape or num_experts < 1 or not dense_strides(shape, strides):
+        raise ValueError("Prepacked Prefill scales require uint8 dense expert layouts and positive expert count")
+    expert_elements = reference[0].numel()
+    backing = torch.empty(num_experts * expert_elements, dtype=reference.dtype, device=device)
+    return backing.as_strided((num_experts, *shape), (expert_elements, *strides))
+
+
 def storage_quant_copy(task, get_format, allocate_host=None, stage=None, allow_pack=True):
     """Match Tensor.copy_ semantics for dense ND views, packing on CPU only."""
     source, destination = task.source, task.destination

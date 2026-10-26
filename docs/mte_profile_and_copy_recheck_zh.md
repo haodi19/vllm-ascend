@@ -1,5 +1,57 @@
 # MTE 可视化与量化拷贝复核
 
+## 2026-10-26：无 profiler/MSTX 的结果与 Prefill 布局修复
+
+`moe_debug_03` 的两组各完成 3 个 CPU 分项计时请求和 1 个可视化请求。
+两组输出及 token 用量一致，计时无 errors/dropped，profile 均完整导出，未再次触发拷贝阻塞。
+同一 CPU 计时窗口中，两组均为 252 次预取、258 次按需更新，分别加载 236、1294 个专家，
+因此以下分项具有相同调用量及加载量。单位为微秒/次更新：
+
+| 指标 | 预取 callback | 预取 MTE | 按需 callback | 按需 MTE |
+| --- | ---: | ---: | ---: | ---: |
+| `load_prepare` | 39.830 | 70.355 | 147.757 | 287.223 |
+| `copy_submit` | 38.691 | 65.669 | 139.143 | 234.946 |
+| `load_submit` | 83.726 | 141.439 | 308.839 | 536.724 |
+| `synchronize` | 237.579 | 190.334 | 1153.032 | 1003.585 |
+| `load_submit + synchronize` | 321.305 | 331.772 | 1461.871 | 1540.309 |
+
+关闭 profiler/MSTX 后，准备与提交的新增耗时仍存在，不是纯打点假象。
+合计预取增加 3.3%，按需增加 5.4%，不能仅凭等待下降宣布搬运提速。
+后续可视化窗口的平均加载量与此窗口不同，不能用两窗口时延直接相减估算 profiler 开销。
+
+Prefill 的全专家加载也是搬权重，需单独看：两组均调用 129 次、每请求 43 层。
+每层均值从 **66.597 ms 增至 109.052 ms**，每请求累计从 **2863.692 ms 增至 4689.251 ms**，
+增加约 1825.559 ms。作为交叉检查，整请求均值增加约 1903.326 ms，主要增量落在
+Prefill 搬权重阶段，不能归咎于 Decode 的几十微秒交接差距。
+
+### 本轮实际修改
+
+上一轮只让 CPU scale 按 Decode 目标布局预打包，Prefill 目标池仍由普通 `torch.empty(shape)`
+连续分配。这会使非连续的 CPU scale 在 Prefill `Tensor.copy_` 中再次面对布局差异。
+这是预打包方案遗漏的消费路径；本次计时证实该阶段显著退化，但尚不能把新增时间全部精确归因于某一个底层转换算子。
+
+本轮仅对 `mte + prepacked` 的 uint8 w13/w2 scale 修正两点：
+
+1. Prefill 池使用一维底座分配，再建立与 Decode 每专家 stride 相同的视图；
+   内存字节数不增加，不建立第二份 CPU 权重缓存。
+2. Prefill 初始化和推理加载均使用已校验的 Storage 字节拷贝，禁止运行期自动重排。
+   shape、dtype、ND 格式、stride 或字节范围不匹配时明确报错，保留异步提交后的原同步等待。
+
+原回调、`storage`、`tensor` 路径以及非 uint8 scale 不变；Decode 搬运逻辑本轮不变。
+CPU 回归覆盖两种真实 scale 形状、逻辑值、目标槽位偏移、相邻槽位、存储大小及不兼容布局拒绝。
+设备端 GMM 对新 Prefill 视图的实际兼容性和性能仍需真实模型验证，不能以 CPU 字节拷贝测试代替。
+
+同步代码后运行两组真实模型，由脚本自动构建、比对输出、分别计时及采集 profile：
+
+```bash
+python -B script/run_moe_host_sync.py --npu 4 --backend both --quant-copy prepacked --timing-requests 3 --requests 1 --warmup-requests 1 --profile-timeout 300 --output-dir bench_results_tmp/moe_debug_04
+```
+
+返回 `bench_results_tmp/moe_debug_04/summary.txt` 文本。重点比较新增的
+`PREFILL ms/layer`、`PREFILL accumulated ms/request` 与后面的 Decode 搬权重表。
+可视化中查看 `prefill_load_layer` 的主机时间块及对应 MEMCPY，Decode 仍查看
+`update_weights/load_prepare/copy_submit/synchronize`；两阶段不要混为同一组样本。
+
 ## 最新结果：优先比较搬权重分项
 
 2026-10-23 的 `moe_debug_02` 使用 `prepacked`，两组均完成预热、推理和 profile 导出，

@@ -1437,8 +1437,16 @@ class ExpertOffloadManager:
                 continue
             src_t = getattr(pool_layer, src)
             dtype = dtype_override if dtype_override is not None else src_t.dtype
-            getattr(self, tgt).append(torch.empty(
-                (ntotal,) + tuple(src_t.shape[1:]), dtype=dtype, device=dev))
+            if (getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte'
+                    and getattr(self.offload_config, 'host_sync_quant_copy', 'storage') == 'prepacked'
+                    and src in ('w13_weight_scale', 'w2_weight_scale')
+                    and dtype == torch.uint8):
+                from vllm_ascend.expert_offload.host_sync import allocate_prepacked_scale_pool
+                pool = allocate_prepacked_scale_pool(src_t, ntotal, dev)
+            else:
+                pool = torch.empty(
+                    (ntotal,) + tuple(src_t.shape[1:]), dtype=dtype, device=dev)
+            getattr(self, tgt).append(pool)
 
     def _cast_prefill_pool_format(self, dev, dt):
         """Cast prefill-pool weight tensors to the on-device (kernel) format.
@@ -1547,13 +1555,22 @@ class ExpertOffloadManager:
                 source = self._shared_h2d_source(
                     layer_idx, source_eid, attr_name)
                 nbytes = dst.numel() * dst.element_size()
-            tasks.append(H2DCopyTask(
+            task = H2DCopyTask(
                 source=source,
                 destination=dst,
                 nbytes=nbytes,
                 name=(f"prefill-{attr_name}[L{layer_idx},E{source_eid}"
                       f"->P{pool_slot}:E{destination_eid}]"),
-            ))
+            )
+            if (getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte'
+                    and getattr(self.offload_config, 'host_sync_quant_copy', 'storage') == 'prepacked'
+                    and attr_name in ('w13_weight_scale', 'w2_weight_scale')
+                    and dst.dtype == torch.uint8):
+                from vllm_ascend.expert_offload.host_sync import storage_quant_copy
+                # The pool now shares the prepacked CPU/Decode physical order.
+                # Fail on a mismatch instead of silently repacking every expert.
+                task = storage_quant_copy(task, torch_npu.get_npu_format, allow_pack=False)
+            tasks.append(task)
         return tasks
 
     def _refresh_prefill_fp32_scale(self, pool_slot: int,
