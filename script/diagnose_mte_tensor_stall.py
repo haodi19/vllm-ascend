@@ -20,6 +20,8 @@ MARKER = re.compile(r"\[MOE-MTE NATIVE\] pid=(\d+) worker_tid=(\d+)")
 def startup_excerpt(text):
     """Keep engine first-cause errors, not just the downstream API traceback."""
     lines = text.splitlines()
+    if len(lines) <= 600:
+        return "\n".join(f"{i + 1}: {line}" for i, line in enumerate(lines))
     selected = set(range(max(0, len(lines) - 20), len(lines)))
     roots = [
         i for i, line in enumerate(lines) if "Traceback (most recent call last)" in line and "APIServer" not in line
@@ -126,6 +128,10 @@ def main():
     args = parser.parse_args()
     if args.read_log:
         read_failures(args.read_log)
+        if args.profile:
+            from diagnose_moe_transfer_gaps import compare_callback_cycles
+
+            compare_callback_cycles(args.profile)
         return 0
     if sys.platform != "linux" or args.npu is None or args.npu < 0:
         parser.error("请在 Linux 容器中指定物理 NPU 编号")

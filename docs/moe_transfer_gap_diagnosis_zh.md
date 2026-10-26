@@ -129,3 +129,21 @@ python -B script/diagnose_mte_tensor_stall.py --read-log bench_results_tmp/mte_n
 
 该命令不调用 gdb、不启动模型、不写文件。监督脚本后续运行失败也会自动保留首错，
 不再只输出 API 进程的最终失败包装栈。
+
+### 对照问题尚未闭合
+
+MTE 间隔中存在计算覆盖，只说明该区间的组成，尚未解释为什么回调版同方向间隔更短。
+不能据此将 MTE 的新增间隔视为合理开销或宣布该问题解决。后续仍以回调版为基线，
+追查 MTE 修改是否改变预取完成位置、主流计算推进及按需回调开始时机。
+
+只读对照将三个相邻 CPU 区间串起来：上层按需结束、下一层预取、该层按需。
+分别统计前间隔、预取本体、后间隔、按需本体，以及到按需开始/结束的累计时间。
+三元组按层号、token 行数组合和样本数量对齐；不将跨设备时钟差混入该对照。
+短日志不再按错误关键词过滤，避免漏掉无 traceback 或无错误关键词的原生失败。
+
+```bash
+python -B script/diagnose_mte_tensor_stall.py --read-log bench_results_tmp/mte_native_6ce42b09 --profile bench_results_tmp/moe_debug_04/profile
+```
+
+该命令合并输出完整短启动日志和已有两组 profile 的 CPU 区间对照，不占用 NPU。
+旧 profile 对照仅适用于旧版本，不能与本次原始 Tensor 复现作为同一配置的实验数据混合。

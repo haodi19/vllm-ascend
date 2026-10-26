@@ -16,6 +16,13 @@ def event(name, tid, start, end):
 
 
 class NativeDiagnosisTests(unittest.TestCase):
+    def test_short_log_preserves_unclassified_middle_failure(self):
+        lines = [f"line {i}" for i in range(246)]
+        lines[100] = "native abort without an ERROR keyword"
+        output = NATIVE["startup_excerpt"]("\n".join(lines))
+        self.assertEqual(len(output.splitlines()), 246)
+        self.assertIn("101: native abort", output)
+
     def test_first_engine_error_survives_api_tail(self):
         text = (
             "(EngineCore pid=2) Traceback (most recent call last):\n"

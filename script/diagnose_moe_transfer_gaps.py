@@ -87,6 +87,80 @@ def pair_callbacks(callbacks):
     return pairs, skipped
 
 
+def callback_cycles(callbacks):
+    """Three adjacent CPU ranges; no cross-device timestamp subtraction."""
+    groups = collections.defaultdict(list)
+    for event in callbacks:
+        groups[event["pid"]].append(event)
+    result = []
+    for events in groups.values():
+        events.sort(key=lambda e: e["start"])
+        for previous, prefetch, reactive in zip(events, events[1:], events[2:]):
+            fields = [e["fields"] for e in (previous, prefetch, reactive)]
+            if [f.get("kind") for f in fields] != ["reactive", "prefetch", "reactive"]:
+                continue
+            try:
+                layers = [int(f["layer"]) for f in fields]
+            except (KeyError, ValueError):
+                continue
+            if layers[0] + 1 != layers[1] or layers[1] != layers[2]:
+                continue
+            if previous["end"] > prefetch["start"] or prefetch["end"] > reactive["start"]:
+                continue
+            rows = tuple(f.get("rows") for f in fields)
+            result.append(
+                dict(
+                    key=(layers[1], rows),
+                    to_prefetch_us=prefetch["start"] - previous["end"],
+                    prefetch_body_us=prefetch["end"] - prefetch["start"],
+                    to_reactive_us=reactive["start"] - prefetch["end"],
+                    reactive_body_us=reactive["end"] - reactive["start"],
+                    to_reactive_start_us=reactive["start"] - previous["end"],
+                    to_reactive_end_us=reactive["end"] - previous["end"],
+                )
+            )
+    return result
+
+
+def compare_callback_cycles(root):
+    groups = {}
+    for backend in ("callback", "mte"):
+        paths = [
+            p for p in root.rglob("trace_view.json") if backend in p.parts and p.parent.name == "ASCEND_PROFILER_OUTPUT"
+        ]
+        if len(paths) != 1:
+            raise ValueError(f"需要单个 worker 的 {backend} 时间线，实际找到 {len(paths)} 个")
+        print(f"CPU CYCLE SOURCE {backend}: {paths[0]}", flush=True)
+        callbacks, _, _, _, _ = load_trace(paths[0])
+        groups[backend] = collections.defaultdict(list)
+        for row in callback_cycles(callbacks):
+            groups[backend][row["key"]].append(row)
+    common = groups["callback"].keys() & groups["mte"].keys()
+    matched = [key for key in common if len(groups["callback"][key]) == len(groups["mte"][key])]
+    print(
+        f"CPU SAME-CLOCK COMPARISON: matched_layer_rows_groups={len(matched)}; "
+        f"excluded_groups={len(groups['callback'].keys() | groups['mte'].keys()) - len(matched)}"
+    )
+    print("按层号、三次回调 token 行数组合及样本数对齐；未证明加载专家、请求阶段及计算工作量完全一致。")
+    rows = {b: [row for key in matched for row in groups[b][key]] for b in groups}
+    if not matched:
+        print("无可比较三元组")
+        return
+    print("previous_reactive_end -> to_prefetch -> prefetch_body -> to_reactive -> reactive_body")
+    print(f"samples callback={len(rows['callback'])}; mte={len(rows['mte'])}; units=us")
+    for metric in (
+        "to_prefetch_us",
+        "prefetch_body_us",
+        "to_reactive_us",
+        "reactive_body_us",
+        "to_reactive_start_us",
+        "to_reactive_end_us",
+    ):
+        means = [statistics.mean(row[metric] for row in rows[b]) for b in ("callback", "mte")]
+        print(f"{metric}: callback={means[0]:.3f} mte={means[1]:.3f} delta={means[1] - means[0]:+.3f}")
+    print("最后两项为累计区间，不能与前四项再相加；结果含 profiler 开销，不直接作为净性能收益。")
+
+
 def split_pairs(pairs, device):
     """Conservative temporal candidates, never guess when multiple tasks qualify."""
     waits = sorted((e for e in device if "host_sync_wait" in e["name"].lower()), key=lambda e: e["end"])

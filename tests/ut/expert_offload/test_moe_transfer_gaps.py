@@ -20,6 +20,19 @@ def device(name, start, end):
 
 
 class TransferGapTests(unittest.TestCase):
+    def test_cpu_cycles_partition_and_ignore_layer_boundary(self):
+        events = [callback(0, 10, "reactive", 1), callback(20, 40, "prefetch", 2), callback(90, 120, "reactive", 2)]
+        rows = MODULE["callback_cycles"](events)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["to_reactive_start_us"], 80)
+        self.assertEqual(
+            row["to_reactive_end_us"],
+            sum(row[k] for k in ("to_prefetch_us", "prefetch_body_us", "to_reactive_us", "reactive_body_us")),
+        )
+        events[0]["fields"]["layer"] = "43"
+        self.assertFalse(MODULE["callback_cycles"](events))
+
     def test_publish_partition_without_wait_endpoint(self):
         pairs, _ = MODULE["pair_callbacks"]([callback(0, 10, "prefetch", 2), callback(50, 60, "reactive", 2)])
         MODULE["split_pairs"](pairs, [device("host_sync_wait_2", 0, 9), device("host_sync_publish_1", 30, 35)])
