@@ -3,6 +3,7 @@
 
 import atexit
 import ctypes
+import math
 import os
 import sys
 import threading
@@ -37,6 +38,81 @@ def allocate_prepacked_scale_pool(reference, num_experts, device):
     expert_elements = reference[0].numel()
     backing = torch.empty(num_experts * expert_elements, dtype=reference.dtype, device=device)
     return backing.as_strided((num_experts, *shape), (expert_elements, *strides))
+
+
+class PrepackedQuantViews:
+    """Cache endpoint views, not expert-by-slot combinations or weight data.
+
+    Check live storage/layout metadata on every use, including device format.
+    Rebuild an endpoint when its allocation or layout changes. Strong owner
+    references keep the backing memory alive through asynchronous copies.
+    """
+
+    def __init__(self):
+        self.sources = {}
+        self.destinations = {}
+
+    @staticmethod
+    def metadata(tensor):
+        storage = tensor.untyped_storage()
+        signature = (
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.dtype,
+            tensor.element_size(),
+            tensor.storage_offset(),
+            tensor.device.type,
+            getattr(tensor.device, "index", None),
+            storage.data_ptr(),
+            storage.nbytes(),
+        )
+        return storage, signature
+
+    def prepare(self, source, destination, slot, source_key, destination_key, get_format):
+        storage, signature = self.metadata(destination)
+        shape, strides, dtype, itemsize, offset, device, _, _, capacity = signature
+        device_format = get_format(destination)
+        destination_signature = (signature, device_format)
+        entry = self.destinations.get(destination_key)
+        if entry is None or entry[0] != destination_signature:
+            if device != "npu" or device_format != 2 or len(shape) < 2 or shape[0] < 1:
+                raise RuntimeError("Prepacked quant destination requires an NPU ND expert pool")
+            expert_elements = math.prod(shape[1:])
+            if not dense_strides(shape[1:], strides[1:]) or (shape[0] > 1 and strides[0] < expert_elements):
+                raise RuntimeError("Prepacked quant destination requires dense, non-overlapping expert slots")
+            end = (offset + (shape[0] - 1) * strides[0] + expert_elements) * itemsize
+            if offset < 0 or end > capacity:
+                raise RuntimeError("Prepacked quant destination exceeds storage")
+            # Store only one lazily-created view per physical slot.
+            entry = (destination_signature, destination, storage, {}, expert_elements * itemsize)
+            self.destinations[destination_key] = entry
+        if not 0 <= slot < shape[0]:
+            raise ValueError("Prepacked quant destination slot is out of range")
+        nbytes = entry[4]
+        source_storage, source_signature = self.metadata(source)
+        expected_layout = (shape[1:], strides[1:], dtype, itemsize)
+        source_entry = self.sources.get(source_key)
+        if source_entry is None or source_entry[0] != (source_signature, expected_layout):
+            src_shape, src_strides, src_dtype, src_size, src_offset, src_device, _, _, src_capacity = source_signature
+            if (
+                src_device != "cpu"
+                or src_dtype != dtype
+                or src_size != itemsize
+                or src_shape != shape[1:]
+                or any(size > 1 and left != right for size, left, right in zip(src_shape, src_strides, strides[1:]))
+            ):
+                raise RuntimeError("Prepacked quant layout mismatch; refusing runtime packing")
+            start = src_offset * itemsize
+            if start < 0 or start + nbytes > src_capacity:
+                raise RuntimeError("Prepacked quant source exceeds storage")
+            view = source_storage if start == 0 and nbytes == src_capacity else source_storage[start : start + nbytes]
+            source_entry = ((source_signature, expected_layout), source, view)
+            self.sources[source_key] = source_entry
+        views = entry[3]
+        if slot not in views:
+            start = (offset + slot * strides[0]) * itemsize
+            views[slot] = storage[start : start + nbytes]
+        return source_entry[2], views[slot], nbytes
 
 
 def storage_quant_copy(task, get_format, allocate_host=None, stage=None, allow_pack=True):

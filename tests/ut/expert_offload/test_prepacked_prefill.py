@@ -2,12 +2,13 @@
 """CPU regression checks for Prefill physical layout and byte-copy semantics."""
 
 import ast
+import contextlib
 import importlib.util
 import sys
 import unittest
 from dataclasses import make_dataclass
 from pathlib import Path
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -39,13 +40,19 @@ class PrepackedPrefillTests(unittest.TestCase):
         cls.host = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.host)
         tree = ast.parse((REPO / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8"))
-        names = {"_alloc_prefill_pool_slot", "_build_prefill_h2d_tasks"}
+        names = {
+            "_alloc_prefill_pool_slot",
+            "_build_prefill_h2d_tasks",
+            "_prepacked_quant_task",
+            "_build_quant_attr_h2d_tasks",
+        }
         methods = [node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name in names]
         cls.namespace = {
             "torch": torch,
             "torch_npu": SimpleNamespace(get_npu_format=lambda _: 2),
             "H2DCopyTask": make_dataclass("Task", ["source", "destination", "nbytes", "name"]),
             "_expert_weight": getattr,
+            "callback_stage": lambda *args: contextlib.nullcontext(),
         }
         exec(compile(ast.Module(body=methods, type_ignores=[]), "prefill_manager", "exec"), cls.namespace)
 
@@ -83,6 +90,7 @@ class PrepackedPrefillTests(unittest.TestCase):
             "w2_scale_bias",
         ):
             setattr(manager, "_prefill_" + name, [])
+        manager._prepacked_quant_task = MethodType(self.namespace["_prepacked_quant_task"], manager)
         return manager
 
     def allocate(self, manager, layer, count=3):
@@ -171,6 +179,94 @@ class PrepackedPrefillTests(unittest.TestCase):
         task = self.namespace["H2DCopyTask"](source, DeviceView(pool[0]), source.numel(), "scale")
         with self.assertRaisesRegex(RuntimeError, "Prepacked quant layout mismatch"):
             self.host.storage_quant_copy(task, lambda _: 2, allow_pack=False)
+
+    def test_cached_views_reuse_endpoints_and_read_current_values(self):
+        layer = self.layer()
+        pool = self.host.allocate_prepacked_scale_pool(layer.w13_weight_scale, 3, "cpu")
+        pool.zero_()
+        sources = [torch.empty_strided(pool.shape[1:], pool.stride()[1:], dtype=pool.dtype) for _ in range(2)]
+        cache = self.host.PrepackedQuantViews()
+        for step in range(20):
+            eid, slot = step % 2, step % 3
+            sources[eid].fill_(step)
+            src, dst, nbytes = cache.prepare(sources[eid], DeviceView(pool), slot, eid, "pool", lambda _: 2)
+            again = cache.prepare(sources[eid], DeviceView(pool), slot, eid, "pool", lambda _: 2)
+            self.assertIs(again[0], src)
+            self.assertIs(again[1], dst)
+            self.assertEqual(nbytes, sources[eid].numel())
+            dst.copy_(src)
+            self.assertTrue(torch.all(pool[slot] == step))
+        self.assertEqual(len(cache.sources), 2)
+        self.assertEqual(len(cache.destinations), 1)
+        self.assertEqual(len(cache.destinations["pool"][3]), 3)
+
+    def test_cached_views_invalidate_replaced_allocations_and_keep_old_views_alive(self):
+        cache = self.host.PrepackedQuantViews()
+        source, pool = torch.full((2, 4), 3, dtype=torch.uint8), torch.zeros((3, 2, 4), dtype=torch.uint8)
+        old = cache.prepare(source, DeviceView(pool), 1, "src", "dst", lambda _: 2)
+        new_source, new_pool = source.clone().fill_(8), torch.zeros_like(pool)
+        new = cache.prepare(new_source, DeviceView(new_pool), 1, "src", "dst", lambda _: 2)
+        self.assertNotEqual(old[0].data_ptr(), new[0].data_ptr())
+        self.assertNotEqual(old[1].data_ptr(), new[1].data_ptr())
+        old[1].copy_(old[0])
+        new[1].copy_(new[0])
+        self.assertTrue(torch.all(pool[1] == 3))
+        self.assertTrue(torch.all(new_pool[1] == 8))
+        self.assertEqual(len(cache.sources), 1)
+        self.assertEqual(len(cache.destinations), 1)
+
+    def test_cached_views_recheck_layout_format_and_storage_bounds(self):
+        cache = self.host.PrepackedQuantViews()
+        source, pool = torch.arange(8, dtype=torch.uint8).reshape(2, 4), torch.zeros((3, 2, 4), dtype=torch.uint8)
+        cache.prepare(source, DeviceView(pool), 1, "src", "dst", lambda _: 2)
+        source.transpose_(0, 1)
+        pool.transpose_(1, 2)
+        src, dst, _ = cache.prepare(source, DeviceView(pool), 1, "src", "dst", lambda _: 2)
+        dst.copy_(src)
+        self.assertTrue(torch.equal(pool[1], source))
+        with self.assertRaisesRegex(RuntimeError, "NPU ND"):
+            cache.prepare(source, DeviceView(pool), 1, "src", "dst", lambda _: 29)
+        with self.assertRaisesRegex(RuntimeError, "layout mismatch"):
+            cache.prepare(source.contiguous(), DeviceView(pool), 1, "src", "dst", lambda _: 2)
+        for slot in (-1, 3):
+            with self.assertRaises(ValueError):
+                cache.prepare(source, DeviceView(pool), slot, "src", "dst", lambda _: 2)
+        wrapped = DeviceView(pool)
+        wrapped.untyped_storage = lambda: torch.empty(1, dtype=torch.uint8).untyped_storage()
+        with self.assertRaisesRegex(RuntimeError, "exceeds storage"):
+            cache.prepare(source, wrapped, 1, "src", "dst", lambda _: 2)
+
+    def test_cached_views_preserve_nonzero_offsets_and_reject_overlapping_slots(self):
+        source_backing = torch.arange(16, dtype=torch.uint8)
+        source = source_backing[4:12].reshape(2, 4)
+        backing = torch.zeros(40, dtype=torch.uint8)
+        pool = backing[8:32].reshape(3, 2, 4)
+        cache = self.host.PrepackedQuantViews()
+        src, dst, _ = cache.prepare(source, DeviceView(pool), 1, 0, 0, lambda _: 2)
+        dst.copy_(src)
+        self.assertTrue(torch.equal(pool[1], source))
+        self.assertEqual(backing[:16].count_nonzero().item(), 0)
+        self.assertEqual(backing[24:].count_nonzero().item(), 0)
+        overlap = pool.as_strided(pool.shape, (0, 4, 1))
+        with self.assertRaisesRegex(RuntimeError, "non-overlapping"):
+            cache.prepare(source, DeviceView(overlap), 1, 0, 0, lambda _: 2)
+
+    def test_decode_builder_uses_cached_views_for_prepacked_scale(self):
+        layer = self.layer()
+        manager = self.manager()
+        source = torch.empty_strided(
+            layer.w13_weight_scale.shape[1:], layer.w13_weight_scale.stride()[1:], dtype=torch.uint8
+        ).fill_(17)
+        manager.scale_cpu_buffers = {"w13_weight_scale": [[source]]}
+        layer.w13_weight_scale = DeviceView(layer.w13_weight_scale)
+        with patch.dict(sys.modules, {"vllm_ascend.expert_offload.host_sync": self.host}):
+            first = self.namespace["_build_quant_attr_h2d_tasks"](manager, layer, 0, 0, 1)
+            second = self.namespace["_build_quant_attr_h2d_tasks"](manager, layer, 0, 0, 1)
+        self.assertEqual(len(first), 1)
+        self.assertIs(first[0].source, second[0].source)
+        self.assertIs(first[0].destination, second[0].destination)
+        first[0].destination.copy_(first[0].source)
+        self.assertTrue(torch.all(layer.w13_weight_scale.tensor[1] == 17))
 
 
 if __name__ == "__main__":

@@ -1545,6 +1545,18 @@ class ExpertOffloadManager:
                     or attr_name not in cpu_buffers
                     or layer_idx >= len(cpu_buffers[attr_name])):
                 continue
+            dst_pool = prefill_buffers[pool_slot]
+            if (getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte'
+                    and getattr(self.offload_config, 'host_sync_quant_copy', 'storage') == 'prepacked'
+                    and attr_name in ('w13_weight_scale', 'w2_weight_scale')
+                    and dst_pool.dtype == torch.uint8
+                    and local_eid is not None
+                    and local_eid < len(cpu_buffers[attr_name][layer_idx])):
+                tasks.append(self._prepacked_quant_task(
+                    cpu_buffers[attr_name][layer_idx][local_eid], dst_pool, destination_eid,
+                    (layer_idx, attr_name, local_eid), ('prefill', pool_slot, attr_name),
+                    f"prefill-{attr_name}[L{layer_idx},E{source_eid}->P{pool_slot}:E{destination_eid}]"))
+                continue
             dst = prefill_buffers[pool_slot][destination_eid]
             if (local_eid is not None
                     and local_eid < len(cpu_buffers[attr_name][layer_idx])):
@@ -2448,6 +2460,17 @@ class ExpertOffloadManager:
                 dev_tensor = getattr(layer, attr_name, None)
                 if dev_tensor is None or layer_idx >= len(buffers):
                     continue
+                if (getattr(self.offload_config, 'host_sync_backend', 'callback') == 'mte'
+                        and getattr(self.offload_config, 'host_sync_quant_copy', 'storage') == 'prepacked'
+                        and attr_name in ('w13_weight_scale', 'w2_weight_scale')
+                        and dev_tensor.dtype == torch.uint8
+                        and local_eid is not None and local_eid < len(buffers[layer_idx])):
+                    with callback_stage(self, "quant_adapter"):
+                        tasks.append(self._prepacked_quant_task(
+                            buffers[layer_idx][local_eid], dev_tensor, slot,
+                            (layer_idx, attr_name, local_eid), ('decode', layer_idx, attr_name),
+                            f"{attr_name}[L{layer_idx},E{eid}->S{slot}]"))
+                    continue
                 dst = dev_tensor.data[slot]
                 if (local_eid is not None
                         and local_eid < len(buffers[layer_idx])):
@@ -2480,6 +2503,17 @@ class ExpertOffloadManager:
                     self._mte_pending_quant_sources.append(task.source)
                 tasks.append(task)
         return tasks
+
+    def _prepacked_quant_task(self, source, destination, slot,
+                             source_key, destination_key, name):
+        """Reuse validated endpoint views while constructing only one task."""
+        from vllm_ascend.expert_offload.host_sync import PrepackedQuantViews
+        cache = getattr(self, '_mte_prepacked_quant_views', None)
+        if cache is None:
+            cache = self._mte_prepacked_quant_views = PrepackedQuantViews()
+        src, dst, nbytes = cache.prepare(
+            source, destination, slot, source_key, destination_key, torch_npu.get_npu_format)
+        return H2DCopyTask(source=src, destination=dst, nbytes=nbytes, name=name)
 
     def _copy_quant_attrs_into_slot(self, layer, layer_idx, eid, slot):
         """Copy one expert's quant attributes through the H2D transport."""

@@ -1,5 +1,49 @@
 # MTE 可视化与量化拷贝复核
 
+## 2026-10-26：Prefill 修复验证与准备阶段视图复用
+
+`moe_debug_04` 已验证新的 Prefill 布局能完成当前请求的预热和推理，两组输出及 token 用量一致，
+计时无 errors/dropped，profile 均完整。以下采用关闭 profiler/MSTX 的 CPU 分项计时：
+
+| 指标 | callback | MTE | 说明 |
+| --- | ---: | ---: | --- |
+| Prefill 每层搬权重，ms | 66.795 | 72.234 | 同为 129 次，仍慢约 8.1% |
+| Prefill 每请求累计，ms | 2872.166 | 3106.076 | 多 233.910 ms |
+| 预取准备，μs/次 | 33.710 | 72.426 | 同为 236 个加载专家 |
+| 预取提交＋等待，μs/次 | 313.196 | 336.715 | 多 7.5% |
+| 按需准备，μs/次 | 138.583 | 325.914 | 加载量不同，不能单看均值归因 |
+| 按需提交＋等待，μs/次 | 1449.643 | 1627.474 | 加载专家 1296 / 1340 |
+
+与上一轮相比，MTE Prefill 从 109.052 ms/层降至 72.234 ms/层；两轮 callback 约 66.6–66.8 ms/层，
+支持布局修复消除了大部分新增 Prefill 开销。跨轮结果并非严格交错 A/B 实验，不能把所有差值都认作确定的代码收益。
+作为辅助检查，整请求 MTE 从上一轮约 5081 ms 降至约 3436 ms，本轮 callback 约 3176 ms，仍未形成净加速。
+
+本次按需专家加载量多出约 3.4%，虽然文本结果一致，仍不能认定两组内部工作量完全相同；
+也不能仅凭该差异判定功能错误。需要在后续结果中持续检查加载量，保留“不具备同等工作量”的提示。
+
+### 本轮准备阶段改动
+
+已经预打包的 scale 每次仍经过 Tensor 切片/reshape、完整布局验证、Storage 切片和 Task 替换。
+本轮对 `mte + prepacked` 的 uint8 w13/w2 scale 引入 `PrepackedQuantViews`：
+
+- 按“每个 CPU 专家”和“每个 NPU 目标槽位”复用存储视图，不建立专家×槽位的全组合，也不复制权重数据。
+- 每次仍检查当前存储地址、容量、shape、stride、dtype、offset、设备和目标格式；
+  任意元数据变化时重新验证并创建视图，避免模型重绑定或后注册层使用旧指针。
+- 未变化的布局不再重复排序检查，已有槽位不再重复创建视图，直接构造一次 H2D Task，省去先构造再替换。
+- 保留源/目标的强引用与原 H2D 完成等待；布局不匹配仍报错，不引入运行期 CPU 重排。
+
+Prefill 和 Decode 都使用这一准备路径；实际传输、MTE generation 协议、加载流及回调版保持原逻辑。
+`quant_adapter` 仍可见；内部已复用的步骤不再逐项打点，前后性能比较以无 profiler/MSTX 窗口为准。
+CPU 测试覆盖视图复用、数据更新、分配替换、原地布局变化、格式变化、非零偏移、相邻槽位及越界拒绝；
+设备上的实际准备时间收益尚待本轮真实模型验证。
+
+```bash
+python -B script/run_moe_host_sync.py --npu 4 --backend both --quant-copy prepacked --timing-requests 3 --requests 1 --warmup-requests 1 --profile-timeout 300 --output-dir bench_results_tmp/moe_debug_05
+```
+
+返回该目录的 `summary.txt` 文本。重点检查 `load_prepare`、`load_submit + synchronize`、Prefill 搬权重时间，
+以及输出/加载量是否一致；不能仅看单项等待或整体请求均值。
+
 ## 2026-10-26：无 profiler/MSTX 的结果与 Prefill 布局修复
 
 `moe_debug_03` 的两组各完成 3 个 CPU 分项计时请求和 1 个可视化请求。
