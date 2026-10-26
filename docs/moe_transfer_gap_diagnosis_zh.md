@@ -110,3 +110,22 @@ python -B script/diagnose_mte_tensor_stall.py --npu 7 --profile bench_results_tm
 `other_after_wait_us` 是剩余覆盖。均采用区间并集，避免重复累计重叠任务。
 这能区分实际计算和非计算区间，但剩余部分不能自动命名为 CPU 轮询开销。
 回调间隔变大本身也不证明整层变慢：预取完成提前、计算重叠位置变化都会改变该间隔。
+
+### moe_debug_04 的纯设备结果
+
+该采集来自 Prefill 布局修复后的 prepacked 版本，不是当前原始 Tensor 拷贝复现。
+流 21→23 的 84 个区间中，等待退出到下一发布平均 439.253 μs，计算候选覆盖
+421.265 μs（约 95.9%），其余 17.988 μs。等待期间，流 23 另有平均 518.098 μs
+计算覆盖。这支持该版本存在实际计算重叠，不能把 439 μs 全称为 MTE 同步空泡，
+也不能把剩余 18 μs 直接命名为 CPU 轮询成本。流 23→21 的设备间隔平均 28.095 μs。
+单独的 23→23 样本不纳入这两组层间交接结论。
+
+新启动的原始 Tensor 复现若只返回 `Engine core initialization failed`，应读取已有
+服务日志首个 engine 错误，不能猜测为拷贝死锁、显存不足或机器故障。只读命令：
+
+```bash
+python -B script/diagnose_mte_tensor_stall.py --read-log bench_results_tmp/mte_native_6ce42b09
+```
+
+该命令不调用 gdb、不启动模型、不写文件。监督脚本后续运行失败也会自动保留首错，
+不再只输出 API 进程的最终失败包装栈。

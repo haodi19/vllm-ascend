@@ -17,6 +17,39 @@ ROOT = Path(__file__).resolve().parents[1]
 MARKER = re.compile(r"\[MOE-MTE NATIVE\] pid=(\d+) worker_tid=(\d+)")
 
 
+def startup_excerpt(text):
+    """Keep engine first-cause errors, not just the downstream API traceback."""
+    lines = text.splitlines()
+    selected = set(range(max(0, len(lines) - 20), len(lines)))
+    roots = [
+        i for i, line in enumerate(lines) if "Traceback (most recent call last)" in line and "APIServer" not in line
+    ]
+    for index in roots[:3]:
+        selected.update(range(max(0, index - 8), min(len(lines), index + 120)))
+    errors = [
+        i
+        for i, line in enumerate(lines)
+        if "APIServer" not in line and re.search(r"FAILED:|Error:|Exception:|\[MOE-MTE|\bERROR\b|\bFATAL\b", line)
+    ]
+    for index in errors[:24]:
+        selected.update(range(max(0, index - 3), min(len(lines), index + 7)))
+    return "\n".join(f"{i + 1}: {lines[i]}" for i in sorted(selected)[:600])
+
+
+def read_failures(path, emit=print):
+    if path.is_file():
+        paths = [path]
+    else:
+        paths = sorted(path.glob("run/*/inference_python.log")) or sorted(path.glob("*/inference_python.log"))
+        if not paths and (path / "runner.log").is_file():
+            paths = [path / "runner.log"]
+    if not paths:
+        raise ValueError(f"未找到服务日志或 runner.log: {path}")
+    for log in paths:
+        emit(f"READ-ONLY FIRST-CAUSE LOG: {log}")
+        emit(startup_excerpt(log.read_text(encoding="utf-8", errors="replace")))
+
+
 def selected_stacks(text, worker_tid):
     blocks = re.split(r"(?m)(?=^Thread \d+)", text)
     pattern = re.compile(r"host_sync|Session::poll|Synchronize|synchronize|aclrt|TaskQueue|Dequeue|Enqueue|gil", re.I)
@@ -86,11 +119,15 @@ def capture(gdb, pid, tid, root, emit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--npu", type=int, required=True)
+    parser.add_argument("--npu", type=int)
+    parser.add_argument("--read-log", type=Path, help="只读现有实验目录或日志，输出首个错误；不启动模型、不需要 gdb")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--profile", type=Path, help="可选：先从已有 MTE profile 分析纯设备时钟的交接间隔")
     args = parser.parse_args()
-    if sys.platform != "linux" or args.npu < 0:
+    if args.read_log:
+        read_failures(args.read_log)
+        return 0
+    if sys.platform != "linux" or args.npu is None or args.npu < 0:
         parser.error("请在 Linux 容器中指定物理 NPU 编号")
     gdb = shutil.which("gdb")
     if not gdb:
@@ -181,6 +218,8 @@ def main():
                 emit(f"RUNNER EXIT={child.returncode}; captured_engines={len(captured)}")
                 text = (root / "runner.log").read_text(encoding="utf-8", errors="replace")
                 emit("\n".join(text.splitlines()[-35:]))
+                if child.returncode:
+                    read_failures(root, emit)
                 if not captured:
                     emit("没有触发抓栈：若推理通过，本轮未复现原阻塞；若失败，先查看上面的启动错误。")
                 return child.returncode

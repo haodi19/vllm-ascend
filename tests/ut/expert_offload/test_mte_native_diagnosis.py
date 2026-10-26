@@ -1,6 +1,7 @@
 """原生栈诊断的输出筛选与设备时间分解测试。"""
 
 import runpy
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,29 @@ def event(name, tid, start, end):
 
 
 class NativeDiagnosisTests(unittest.TestCase):
+    def test_first_engine_error_survives_api_tail(self):
+        text = (
+            "(EngineCore pid=2) Traceback (most recent call last):\n"
+            "(EngineCore pid=2) RuntimeError: actual root cause\n"
+            + "noise\n" * 200
+            + "(APIServer pid=1) RuntimeError: Engine core initialization failed\n"
+        )
+        result = NATIVE["startup_excerpt"](text)
+        self.assertIn("actual root cause", result)
+        self.assertIn("initialization failed", result)
+
+    def test_read_only_prefers_original_service_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = root / "run/mte/inference_python.log"
+            service.parent.mkdir(parents=True)
+            service.write_text("RuntimeError: original cause", encoding="utf-8")
+            (root / "runner.log").write_text("unhelpful wrapper", encoding="utf-8")
+            result = []
+            NATIVE["read_failures"](root, result.append)
+            self.assertIn("original cause", "\n".join(result))
+            self.assertNotIn("unhelpful wrapper", "\n".join(result))
+
     def test_worker_first_and_idle_threads_omitted(self):
         text = (
             "Thread 1 (LWP 100):\n#0 futex_wait\n"
