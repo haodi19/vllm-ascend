@@ -43,7 +43,7 @@ def load_trace(path):
             continue
         name, pid = str(event.get("name", "")), str(event.get("pid"))
         is_callback = name.startswith("moe_offload/host_callback|")
-        is_stage = name.startswith(("moe_offload/load_prepare|", "moe_offload/copy_submit|"))
+        is_stage = name.startswith(("moe_offload/load_prepare|", "moe_offload/copy_submit|", "moe_offload/quant_"))
         if pid not in hardware and not is_callback and not is_stage:
             continue
         start, duration = number(event, "ts"), number(event, "dur")
@@ -97,6 +97,15 @@ def split_pairs(pairs, device):
         ws = waits[bisect_left(wait_ends, begin) : bisect_right(wait_ends, end)]
         ps = publishes[bisect_left(publish_starts, begin) : bisect_right(publish_starts, end)]
         pair["wait_candidates"], pair["publish_candidates"] = len(ws), len(ps)
+        # A missing wait endpoint must not discard an independently observable
+        # publish boundary. Keep the same conservative temporal qualification.
+        pair["publish_resolved"] = len(ps) == 1 and ps[0]["end"] <= end
+        if pair["publish_resolved"]:
+            pair.update(
+                before_publish_us=ps[0]["start"] - begin,
+                publish_duration_us=ps[0]["dur"],
+                after_publish_us=end - ps[0]["end"],
+            )
         if len(ws) != 1 or len(ps) != 1 or ws[0]["end"] > ps[0]["start"] or ps[0]["end"] > end:
             pair["resolved"] = False
             continue
@@ -111,6 +120,36 @@ def split_pairs(pairs, device):
             publish_stream=publish["tid"],
         )
     return pairs
+
+
+def nearby_handoffs(pair, device):
+    """Show neighbors without asserting that their task IDs match a callback."""
+    begin, end = pair["left"]["end"], pair["right"]["start"]
+    for token in ("host_sync_wait", "host_sync_publish"):
+        candidates = [e for e in device if token in e["name"].lower()]
+        nearest = sorted(candidates, key=lambda e: min(abs(e["end"] - begin), abs(e["start"] - end)))[:3]
+        for event in sorted(nearest, key=lambda e: e["start"]):
+            print(
+                f"  NEIGHBOR stream={event['tid']} name={event['name']} "
+                f"start_from_left_end={event['start'] - begin:.3f} "
+                f"end_from_left_end={event['end'] - begin:.3f} dur={event['dur']:.3f} us"
+            )
+
+
+def preparation_details(callbacks, stages):
+    for kind in ("prefetch", "reactive"):
+        totals = collections.defaultdict(float)
+        counts = collections.Counter()
+        for event in stages:
+            if event["fields"].get("kind") == kind:
+                name = event["name"].split("|", 1)[0].split("/", 1)[1]
+                totals[name] += event["dur"]
+                counts[name] += 1
+        callback_count = sum(e["fields"].get("kind") == kind for e in callbacks)
+        print(f"PREPARATION {kind}: callbacks={callback_count}; 子项相互嵌套，不能相加")
+        for name in sorted(totals):
+            normalized = totals[name] / callback_count if callback_count else float("nan")
+            print(f"  {name}: events={counts[name]} total_us={totals[name]:.3f} per_callback_us={normalized:.3f}")
 
 
 def stats(label, values):
@@ -128,6 +167,7 @@ def stats(label, values):
 def report(path):
     print(f"\n=== {path} ===", flush=True)
     callbacks, stages, device, processes, hardware = load_trace(path)
+    preparation_details(callbacks, stages)
     print("CPU 阶段计时含 profiler/MSTX 扰动；性能比较仍以 summary.txt 的无 profiler 窗口为准。")
     for kind in ("prefetch", "reactive"):
         for stage in ("load_prepare", "copy_submit"):
@@ -156,6 +196,8 @@ def report(path):
         selected = [p for p in rows if p["resolved"]]
         print(f"\nDIRECTION {direction}: all={len(rows)} uniquely_matched={len(selected)}")
         stats("between_host_callbacks", [p["gap_us"] for p in rows])
+        for key in ("before_publish_us", "publish_duration_us", "after_publish_us"):
+            stats(key, [p[key] for p in rows if p["publish_resolved"]])
         for key in (
             "completion_to_wait_exit_us",
             "after_wait_to_publish_us",
@@ -172,12 +214,18 @@ def report(path):
                 f"waits={pair['wait_candidates']} publishes={pair['publish_candidates']}"
             )
             overlap = collections.defaultdict(float)
+            nearby_handoffs(pair, device)
             for event in device:
                 amount = max(0, min(end, event["end"]) - max(begin, event["start"]))
                 if amount:
                     overlap[(event["tid"], event["name"])] += amount
             for (stream, name), value in sorted(overlap.items(), key=lambda item: -item[1])[:6]:
                 print(f"  device stream={stream} clipped_sum_us={value:.3f} name={name[:160]}")
+            # Long unrelated idle-stream waits otherwise occupy every output
+            # position, hiding the copies and kernels that advance this gap.
+            active = [(key, value) for key, value in overlap.items() if "WAIT" not in key[1].upper()]
+            for (stream, name), value in sorted(active, key=lambda item: -item[1])[:8]:
+                print(f"  NON_WAIT stream={stream} clipped_sum_us={value:.3f} name={name[:160]}")
     inventory = collections.Counter(e["name"] for e in device if "host_sync" in e["name"].lower())
     print(f"HANDOFF KERNEL INVENTORY: {dict(inventory.most_common(12))}")
     if not inventory:

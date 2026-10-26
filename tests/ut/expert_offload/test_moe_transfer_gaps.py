@@ -20,6 +20,27 @@ def device(name, start, end):
 
 
 class TransferGapTests(unittest.TestCase):
+    def test_publish_partition_without_wait_endpoint(self):
+        pairs, _ = MODULE["pair_callbacks"]([callback(0, 10, "prefetch", 2), callback(50, 60, "reactive", 2)])
+        MODULE["split_pairs"](pairs, [device("host_sync_wait_2", 0, 9), device("host_sync_publish_1", 30, 35)])
+        self.assertFalse(pairs[0]["resolved"])
+        self.assertTrue(pairs[0]["publish_resolved"])
+        self.assertEqual(
+            [pairs[0][key] for key in ("before_publish_us", "publish_duration_us", "after_publish_us")], [20, 5, 15]
+        )
+
+    def test_multiple_publish_candidates_not_forced(self):
+        pairs, _ = MODULE["pair_callbacks"]([callback(0, 10, "prefetch", 2), callback(50, 60, "reactive", 2)])
+        MODULE["split_pairs"](pairs, [device("host_sync_publish", 20, 25), device("host_sync_publish", 30, 35)])
+        self.assertFalse(pairs[0]["publish_resolved"])
+
+    def test_neighbor_outside_gap_is_shown_without_association(self):
+        pairs, _ = MODULE["pair_callbacks"]([callback(0, 10, "prefetch", 2), callback(50, 60, "reactive", 2)])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            MODULE["nearby_handoffs"](pairs[0], [device("host_sync_wait", 0, 9)])
+        self.assertIn("end_from_left_end=-1.000", output.getvalue())
+
     def test_layer_pairing(self):
         rows = [
             callback(0, 10, "prefetch", 2),
