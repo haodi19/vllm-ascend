@@ -164,6 +164,66 @@ def stats(label, values):
     )
 
 
+def interval_coverage(events, begin, end):
+    intervals = sorted(
+        (max(begin, e["start"]), min(end, e["end"])) for e in events if e["start"] < end and e["end"] > begin
+    )
+    total, cursor = 0.0, begin
+    for start, stop in intervals:
+        total += max(0, stop - max(cursor, start))
+        cursor = max(cursor, stop)
+    return total
+
+
+def device_pipeline(device):
+    """Device-clock-only intervals; no CPU timestamps or inferred clock shift."""
+    publishes = sorted((e for e in device if "host_sync_publish" in e["name"].lower()), key=lambda e: e["start"])
+    waits = collections.defaultdict(list)
+    work_by_stream = collections.defaultdict(list)
+    for event in sorted(device, key=lambda e: e["start"]):
+        if "host_sync_wait" in event["name"].lower():
+            waits[event["tid"]].append(event)
+        if not any(token in event["name"].upper() for token in ("WAIT", "EVENT", "NOTIFY", "MEMCPY", "HOST_SYNC")):
+            work_by_stream[event["tid"]].append(event)
+    results = []
+    for index, (left, right) in enumerate(zip(publishes, publishes[1:])):
+        # Bound matching by the next publish on this same stream, rather than
+        # by a CPU marker which may have a different clock calibration.
+        following = next((e["start"] for e in publishes[index + 1 :] if e["tid"] == left["tid"]), float("inf"))
+        candidates = [e for e in waits[left["tid"]] if left["start"] <= e["start"] < following]
+        if len(candidates) != 1:
+            continue
+        wait = candidates[0]
+        target_work = work_by_stream[right["tid"]]
+        gap = right["start"] - wait["end"]
+        work = interval_coverage(target_work, wait["end"], right["start"]) if gap >= 0 else 0
+        results.append(
+            dict(
+                streams=f"{left['tid']}->{right['tid']}",
+                wait_to_publish_us=gap,
+                work_after_wait_us=work,
+                other_after_wait_us=max(0, gap) - work,
+                work_during_wait_us=interval_coverage(target_work, wait["start"], wait["end"]),
+            )
+        )
+    return results
+
+
+def report_device_pipeline(device):
+    rows = device_pipeline(device)
+    print("DEVICE-ONLY: 仅设备时钟；非等待/拷贝/事件任务视为计算候选，不代表完整因果归因")
+    for streams in sorted({row["streams"] for row in rows}):
+        selected = [row for row in rows if row["streams"] == streams]
+        print(
+            f"STREAM TRANSITION {streams}: count={len(selected)}; "
+            f"next_publish_before_previous_wait_exit={sum(row['wait_to_publish_us'] < 0 for row in selected)}"
+        )
+        for key in ("wait_to_publish_us", "work_during_wait_us", "work_after_wait_us", "other_after_wait_us"):
+            stats(key, [row[key] for row in selected])
+    if not rows:
+        print("没有可匹配的 MTE 设备发布/等待序列")
+
+
 def report(path):
     print(f"\n=== {path} ===", flush=True)
     callbacks, stages, device, processes, hardware = load_trace(path)
@@ -187,6 +247,7 @@ def report(path):
         print(f"DEVICE UNKNOWN: 需要唯一设备进程；metadata={processes}")
         return
     split_pairs(pairs, device)
+    report_device_pipeline(device)
     print("以下是同一导出时间线中的唯一时间候选，不是关联 ID 证明的因果关系；候选不唯一就不分解。")
     print("completion_to_wait_exit 包含 CPU 发布完成、标记可见、设备轮询与退出；不是纯设备轮询时间。")
     print("after_wait_to_publish 包含映射写回、事件汇合、路由回传及调度；可能等待主流其他计算。")

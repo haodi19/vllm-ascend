@@ -75,3 +75,38 @@ python -B script/probe_mte_compute_overlap.py --npu 4
 自动判定。需要结合 `submit_ms`、`compute_wait_ms` 及另外两组作判断。
 这是对指定设备、算子和独立图调度的隔离实验，不是实际模型图的根因证明或性能验收。
 本实验不改变模型的搬运、映射、等待顺序，不取消推理中的完成检查。
+
+## 继续追查实际 Tensor 拷贝与图内间隔
+
+独立图实验三组均观察到了重叠，包括 MTE 等待组。因此“常驻 AIV 一定阻塞其他流”
+不能成立为本问题的解释。该结果不等于所有模型算子与单张图内部依赖都已排除。
+
+进一步核对 [torch-npu v2.10.0 的 CopyKernelOpApi.cpp](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/aten/ops/op_api/CopyKernelOpApi.cpp)：
+`copy_h2d_baseformat_opapi` 在目标不连续时创建连续临时张量，执行 H2D 后再调用
+`copy_d2d_baseformat_opapi`，后者提交 `aclnnInplaceCopy`。
+因此原始 scale 的 Tensor 拷贝可能包括设备布局转换，不能仅按 MEMCPY 理解。
+公开版本源码与绿区开发版二进制可能有差异，这条源码路径尚不是实际阻塞点的原生栈证据。
+
+现有日志已将复现位置缩小到预取 layer=1 的 `w13_weight_scale`：w13/w2 完成，
+scale 拷贝返回后加载流同步不返回。之前只有 Python 栈，无法确定底层提交队列、
+runtime 等待与设备操作之间的具体依赖。Storage 适配绕开这条路径，不代表根因已修复。
+
+在容器已安装 gdb 的前提下，运行：
+
+```bash
+python -B script/diagnose_mte_tensor_stall.py --npu 7 --profile bench_results_tmp/moe_debug_04/profile
+```
+
+一个命令先分析已有 MTE 时间线的纯设备时钟区间，再启动一次原始 Tensor 拷贝复现。
+没有 gdb 时在启动模型前退出。卡住时由独立监督进程自动附加本次启动的 engine，
+抓取原生线程栈；拒绝附加非本次进程的后代。gdb 最多运行 20 秒，然后原有复现程序
+继续按其超时与清理逻辑退出。不要将抓栈期间的数据用于性能对比。
+
+关键输出保存在打印的 `diagnosis.txt`，完整原生栈和服务日志保留在绿区；只需返回
+经过检查的该汇总文本。未卡住或 gdb 没有抓到栈都会明确报告，不会将其当作根因结论。
+
+纯设备统计中，`work_during_wait_us` 表示下一发布所在流的计算候选在当前等待期间
+的时间覆盖；`work_after_wait_us` 是当前等待退出到下一发布开始之间的计算覆盖；
+`other_after_wait_us` 是剩余覆盖。均采用区间并集，避免重复累计重叠任务。
+这能区分实际计算和非计算区间，但剩余部分不能自动命名为 CPU 轮询开销。
+回调间隔变大本身也不证明整层变慢：预取完成提前、计算重叠位置变化都会改变该间隔。

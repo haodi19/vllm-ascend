@@ -356,6 +356,12 @@ class MteHostDispatcher:
             f"[MOE-MTE DIAGNOSTIC BEGIN] pending_slot={slot} state={state}",
             f"active_callback={active}; completed={self.completed}; captured_slots={self.next_slot - 1}",
         ]
+        # Python's ident is not the Linux LWP ID used by gdb. Resolve it only
+        # on the slow diagnostic path, without adding hot-path bookkeeping.
+        if active:
+            worker = next((t for t in threading.enumerate() if t.ident == active[1]), None)
+            native_id = worker.native_id if worker is not None else None
+            lines.append(f"[MOE-MTE NATIVE] pid={os.getpid()} worker_tid={native_id or 0}")
         for selected in sorted({slot, active[0] if active else slot}):
             fn, args = self.entries[selected]
             layer = args[3] if isinstance(args, tuple) and len(args) > 3 else "unknown"
