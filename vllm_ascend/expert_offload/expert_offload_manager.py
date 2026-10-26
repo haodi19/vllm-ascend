@@ -3147,6 +3147,8 @@ class ExpertOffloadManager:
                 if stream not in subscribed:
                     torch_npu.npu._subscribe_report(stream)
                     subscribed.add(stream)
+                if getattr(self.offload_config, 'host_sync_diagnose_load', False):
+                    callback = dispatcher.diagnostic_prefetch_callback(callback)
             torch_npu.npu._launch_host_func(stream, callback, args)
         else:
             dispatcher.launch(stream, callback, args)

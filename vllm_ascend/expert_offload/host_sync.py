@@ -253,6 +253,7 @@ class MteHostDispatcher:
         self.load_diagnostic_batches = 0
         self.active_callback = None
         self.load_checkpoint = None
+        self.diagnostic_report_active = False
         self.closed = False
         self.stopping = threading.Event()
         self.states = torch.zeros((self.SLOT_CAPACITY, 4), dtype=torch.int64, device="npu")
@@ -316,7 +317,8 @@ class MteHostDispatcher:
         is not a performance measurement. Limit output to eight batches.
         """
         enabled = getattr(self.manager.offload_config, "host_sync_diagnose_load", False)
-        if not enabled or not tasks or self.load_diagnostic_batches >= 8:
+        in_callback = self.active_callback is not None or getattr(self, "diagnostic_report_active", False)
+        if not enabled or not in_callback or not tasks or self.load_diagnostic_batches >= 8:
             return False
         self.load_diagnostic_batches += 1
         batch = self.load_diagnostic_batches
@@ -355,6 +357,18 @@ class MteHostDispatcher:
                 lambda target_slot=target_slot: self.manager._refresh_expert_fp32_scale(layer, target_slot),
             )
         return True
+
+    def diagnostic_prefetch_callback(self, callback):
+        """Reserve diagnostic batches for replay callbacks, not eager warmup."""
+
+        def measured(args):
+            self.diagnostic_report_active = True
+            try:
+                return callback(args)
+            finally:
+                self.diagnostic_report_active = False
+
+        return measured
 
     def _dump_stall(self, slot, state):
         # Only on a stalled request, never on the normal callback hot path.

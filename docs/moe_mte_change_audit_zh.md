@@ -84,3 +84,35 @@ python -B script/diagnose_mte_tensor_stall.py --npu 7 --prefetch-handoff callbac
 功能确认后，可在真实对照入口使用 `--prefetch-handoff callback`，保持同一 quant-copy
 配置与版本，关闭逐任务诊断，比较全 MTE 和混合路径的间隔。不能拿新混合路径结果
 直接与旧 prepacked profile 混合计算收益。最终是否能撤掉适配或恢复回调版时延，尚待这些证据。
+
+## 第一轮结果与合并的第二轮
+
+当前版本两次原始 Tensor 诊断中，仅预取恢复回调的 `mte_native_077b3621` 完成推理，
+全 MTE 的 `mte_native_cbca8e66` 则在请求执行时停滞。后者捕获到原生线程栈：
+MTE worker 经 `NPUStream::synchronize`、`aclrtSynchronizeStreamWithTimeoutImpl` 等函数
+等待设备完成；主线程经 `NPUEvent::synchronize` 等待事件。此时不是 Python 准备计算
+或 LRC 函数占住 worker。runtime 内部缺少符号，尚未证明具体设备依赖环。
+
+全 MTE 输出的前八批拷贝在捕获前预热阶段已经完成，不能把这些 COMPLETE 解释为
+停滞时那次图内加载也完成。诊断计数已修正为仅在 MTE/混合路径的真实回调中消耗，
+不让 eager 预热耗尽检查额度。正常计时关闭该诊断，不增加逐任务同步。
+
+第二轮最多启动三次模型，统一使用当前提交：
+
+1. 原回调，原始量化拷贝。
+2. 全 MTE，prepacked 量化拷贝。
+3. 仅预取恢复回调、按需仍 MTE，使用与第 2 组相同的 prepacked 拷贝。
+
+第 2、3 组只改变预取交接；第 1 组提供目标基线，不能把其与第 2 组差异全归因于交接。
+每组预热 1 请求、关闭 profiler/MSTX 进行 3 请求分项计时，再采集 1 请求 profile。
+三组均不启用逐任务拷贝诊断，自动检查输出和 token 用量、比较搬运分项与同层 CPU 三元组。
+失败即停止，不自动追加重跑；profile 不完整时明确报告间隔对照不可用。
+
+```bash
+python -B script/run_mte_prefetch_comparison.py --npu 7
+```
+
+仅需返回打印的汇总 `summary.txt`，各组详细日志、JSON 数据和 profile 留在绿区。
+本轮属于既定三轮计划的第二轮，不再单独要求逐组执行与逐组返回输出。
+若混合路径同时恢复间隔而加载计时基本一致，支持新增间隔来自预取交接组合；
+若间隔不恢复，就不能将量化阻塞与间隔退化强行归为同一原因。

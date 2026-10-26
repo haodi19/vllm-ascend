@@ -277,6 +277,7 @@ def run(args, root):
             "python",
             env,
         )
+        (directory / "result.json").write_text(json.dumps(reports[backend]), encoding="utf-8")
         if backend == "mte":
             log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
             if args.diagnose_load_stages:

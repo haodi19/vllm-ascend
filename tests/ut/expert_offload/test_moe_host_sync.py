@@ -18,6 +18,24 @@ import torch
 
 
 class MoeHostSyncTests(unittest.TestCase):
+    def test_eager_load_does_not_consume_callback_diagnostics(self):
+        obj = self.dispatcher()
+        obj.manager.offload_config = SimpleNamespace(host_sync_diagnose_load=True)
+        obj.load_diagnostic_batches = 0
+        self.assertFalse(obj.diagnose_load([object()], [], None, 0))
+        self.assertEqual(obj.load_diagnostic_batches, 0)
+
+    def test_report_diagnostic_marker_is_cleared_on_exception(self):
+        obj = self.dispatcher()
+
+        def fail(args):
+            self.assertTrue(obj.diagnostic_report_active)
+            raise RuntimeError("copy failed")
+
+        with self.assertRaisesRegex(RuntimeError, "copy failed"):
+            obj.diagnostic_prefetch_callback(fail)(())
+        self.assertFalse(obj.diagnostic_report_active)
+
     def test_prepacked_loader_matches_original_values_without_runtime_pack(self):
         tree = ast.parse(
             (self.root / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8")
