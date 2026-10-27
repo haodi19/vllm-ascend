@@ -21,10 +21,24 @@ class BenchmarkTests(unittest.TestCase):
             bench = runpy.run_path(str(scripts / "host_sync_benchmark.py"))
             runner = runpy.run_path(str(scripts / "run_host_sync_stage4.py"))
         cls.summarize = staticmethod(bench["summarize"])
+        cls.register_slots = staticmethod(bench["register_benchmark_slots"])
         cls.summarize_worker = staticmethod(bench["summarize_worker"])
         cls.inspect_profile = staticmethod(bench["inspect_profile"])
         cls.compare = staticmethod(runner["compare_results"])
         cls.runner = staticmethod(runner["main"])
+
+    def test_all_slots_registered_but_only_last_slot_may_execute(self):
+        for count in (1, 2048):
+            session = Mock()
+            callback = Mock()
+            self.register_slots(session, count, callback)
+            registered = session.register_task.call_args_list
+            self.assertEqual([call.args[0] for call in registered], list(range(count)))
+            self.assertIs(registered[-1].args[1], callback)
+            for call in registered[:-1]:
+                with self.assertRaisesRegex(RuntimeError, "Inactive benchmark slot"):
+                    call.args[1]()
+            callback.assert_not_called()
 
     def test_statistics_including_nearest_rank_percentile(self):
         result = self.summarize(list(range(1, 21)))

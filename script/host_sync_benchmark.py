@@ -52,6 +52,17 @@ def inspect_profile(path, backend, rounds):
     return result
 
 
+def register_benchmark_slots(session, slots, callback):
+    """Satisfy the old device lease contract; publish only to the last slot."""
+
+    def unexpected_callback():
+        raise RuntimeError("Inactive benchmark slot received a device request")
+
+    for slot in range(slots - 1):
+        session.register_task(slot, unexpected_callback)
+    session.register_task(slots - 1, callback)
+
+
 def run(args):
     # Keep CLI and statistics checks independent of NPU libraries.
     import torch
@@ -96,7 +107,7 @@ def run(args):
         if info["protocol_version"] != 1 or info["slot_stride"] != 1024 or info["done_offset"] != 512:
             raise RuntimeError("Unsupported control-memory layout")
         active_slot = args.slots - 1
-        session.register_task(active_slot, callback)
+        register_benchmark_slots(session, args.slots, callback)
         session.start()
         alias = session.begin_device_access()
         alias += active_slot * info["slot_stride"]
