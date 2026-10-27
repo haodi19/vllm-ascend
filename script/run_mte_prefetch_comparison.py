@@ -27,6 +27,10 @@ METRICS = (
 )
 
 
+def experiment_cases(original_copy):
+    return (CASES[0], CASES[2]) if original_copy else CASES
+
+
 def failure_summary(root, emit):
     """先保留测试进程的错误，避免把清理服务的异常误认成根因。"""
     found = False
@@ -72,12 +76,13 @@ def compare_cycles(cases, emit):
         return
     selected = {name: [row for key in keys for row in group[key]] for name, group in groups.items()}
     emit(f"CPU CYCLES: samples/group={len(next(iter(selected.values())))}; units=us; 含 profiler 开销")
-    emit("metric callback mte hybrid hybrid-minus-mte")
+    names = list(selected)
+    before = "mte" if "mte" in selected else "callback"
+    emit("metric " + " ".join(names) + f" hybrid-minus-{before}")
     for metric in METRICS:
         means = {name: sum(r[metric] for r in rows) / len(rows) for name, rows in selected.items()}
         emit(
-            f"{metric} {means['callback']:.3f} {means['mte']:.3f} {means['hybrid']:.3f} "
-            f"{means['hybrid'] - means['mte']:+.3f}"
+            f"{metric} " + " ".join(f"{means[name]:.3f}" for name in names) + f" {means['hybrid'] - means[before]:+.3f}"
         )
     emit("累计区间不与子项相加；专家加载量另见搬运表，不能仅凭间隔缩短宣布净收益。")
 
@@ -88,6 +93,11 @@ def main():
     parser.add_argument("--read-failure", type=Path, help="只读取已有三组对照目录，不启动模型或写文件")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--profile-timeout", type=int, default=120)
+    parser.add_argument(
+        "--original-copy-final",
+        action="store_true",
+        help="最终两组验收：原回调与混合交接均使用原始 Tensor 拷贝，不开启逐任务同步",
+    )
     args = parser.parse_args()
     if args.read_failure is not None:
         failure_summary(args.read_failure, print)
@@ -96,6 +106,8 @@ def main():
         parser.error("请在 Linux 容器指定 NPU 编号及正数超时")
     root = (args.output_dir or ROOT / "bench_results_tmp" / f"prefetch_compare_{uuid4().hex[:8]}").resolve()
     root.mkdir(parents=True, exist_ok=False)
+    cases = experiment_cases(args.original_copy_final)
+    quant_copy = "tensor" if args.original_copy_final else "prepacked"
     with (root / "summary.txt").open("w", encoding="utf-8") as summary:
 
         def emit(text):
@@ -104,10 +116,10 @@ def main():
             summary.flush()
 
         emit(f"SUMMARY FILE: {root / 'summary.txt'}")
-        emit("最多启动三组，不自动重跑。callback=原回调；mte=全 MTE；hybrid=仅预取用原回调。")
-        emit("两组 MTE 均为 prepacked；关闭逐任务同步；配置继承 test_graph2.sh；每组预热1、计时3、profile1请求。")
+        emit(f"最多启动 {len(cases)} 组，不自动重跑。callback=原回调；mte=全 MTE；hybrid=仅预取用原回调。")
+        emit(f"MTE 拷贝={quant_copy}；关闭逐任务同步；配置继承 test_graph2.sh；每组预热1、计时3、profile1请求。")
         reports, cycles = {}, {}
-        for name, backend, handoff in CASES:
+        for name, backend, handoff in cases:
             directory = root / name
             log_path = root / f"{name}_runner.log"
             command = [
@@ -119,7 +131,7 @@ def main():
                 "--backend",
                 backend,
                 "--quant-copy",
-                "prepacked",
+                quant_copy,
                 "--prefetch-handoff",
                 handoff,
                 "--timing-requests",
@@ -174,12 +186,14 @@ def main():
                         cycles[name] = callback_cycles(callbacks)
                     except (OSError, ValueError) as exc:
                         emit(f"PROFILE ANALYSIS FAILED {name}: {exc}")
-        with contextlib.redirect_stdout(io.StringIO()) as text:
-            compare_weight_timings({"callback": reports["mte"], "mte": reports["hybrid"]})
-        emit(
-            "WEIGHT ABLATION full_mte -> hybrid (下表 callback 列代表 full_mte；mte 列代表 hybrid)\n" + text.getvalue()
-        )
-        if len(cycles) == len(CASES):
+        if "mte" in reports:
+            with contextlib.redirect_stdout(io.StringIO()) as text:
+                compare_weight_timings({"callback": reports["mte"], "mte": reports["hybrid"]})
+            emit(
+                "WEIGHT ABLATION full_mte -> hybrid (下表 callback 列代表 full_mte；mte 列代表 hybrid)\n"
+                + text.getvalue()
+            )
+        if len(cycles) == len(cases):
             compare_cycles(cycles, emit)
         else:
             emit("CPU 间隔三组对照未完成；保留搬运数据，不把不完整 profile 算成功")

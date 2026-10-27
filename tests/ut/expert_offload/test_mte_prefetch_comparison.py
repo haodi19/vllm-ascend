@@ -62,6 +62,16 @@ class ComparisonTests(unittest.TestCase):
             MODULE.CASES, (("callback", "callback", "mte"), ("mte", "mte", "mte"), ("hybrid", "mte", "callback"))
         )
 
+    def test_final_round_excludes_full_mte(self):
+        self.assertEqual(MODULE.experiment_cases(False), MODULE.CASES)
+        self.assertEqual(MODULE.experiment_cases(True), (MODULE.CASES[0], MODULE.CASES[2]))
+
+    def test_two_group_cycles_compare_to_original_callback(self):
+        base = dict(key=(1, ("3", "1", "3")), **{key: 10 for key in MODULE.METRICS})
+        output = []
+        MODULE.compare_cycles(dict(callback=[base], hybrid=[dict(base, to_reactive_us=20)]), output.append)
+        self.assertIn("to_reactive_us 10.000 20.000 +10.000", "\n".join(output))
+
 
 if __name__ == "__main__":
     unittest.main()
