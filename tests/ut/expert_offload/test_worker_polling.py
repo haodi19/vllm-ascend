@@ -8,10 +8,62 @@ import vllm_ascend_host_sync as hs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "script"))
 from host_sync_benchmark import summarize_worker
-from run_worker_poll_tests import cases
+from run_worker_poll_tests import cases, scan_cases
 
 
 class WorkerPollingTests(unittest.TestCase):
+    def test_selected_slots_alternate_without_loss_or_duplicates(self):
+        for selected in (False, True):
+            with self.subTest(selected=selected), hs.Session(slots=2048, backend="cpu") as session:
+                calls = []
+                for slot in (0, 17, 2047):
+                    session.register_task(slot, lambda slot=slot, calls=calls: calls.append(slot))
+                if selected:
+                    session.configure_scan_slots([2047, 0, 17])
+                session.start()
+                expected = []
+                for generation in range(1, 21):
+                    for slot in (17, 2047, 0):
+                        session.submit_for_test(slot, generation)
+                        session.wait(slot, generation)
+                        expected.append(slot)
+                session.stop()
+                self.assertEqual(calls, expected)
+
+    def test_scan_configuration_guards_and_callback_failure(self):
+        def fail():
+            raise ValueError("selected callback failure")
+
+        with hs.Session(slots=4, backend="cpu") as session:
+            for invalid in ([], [1, 1], [4], [-1], [True]):
+                with self.assertRaises((ValueError, IndexError)):
+                    session.configure_scan_slots(invalid)
+            session.configure_scan_slots([3])
+            with self.assertRaises(RuntimeError):
+                session.start()
+            session.register_task(3, fail)
+            session.register_task(0, lambda: None)
+            session.start()
+            with self.assertRaises(RuntimeError):
+                session.configure_scan_slots([0])
+            with self.assertRaisesRegex(RuntimeError, "excluded"):
+                session.submit_for_test(0, 1)
+            session.submit_for_test(3, 1)
+            with self.assertRaisesRegex(RuntimeError, "selected callback failure"):
+                session.wait(3, 1)
+            session.stop()
+
+    def test_scan_comparison_keeps_other_options_fixed(self):
+        self.assertEqual(
+            list(scan_cases(2, [2048])),
+            [
+                (2048, False, 0, "yield", "all"),
+                (2048, False, 0, "yield", "active"),
+                (2048, False, 1, "yield", "active"),
+                (2048, False, 1, "yield", "all"),
+            ],
+        )
+
     def test_modes_and_timing_preserve_generations(self):
         for mode in ("yield", "spin"):
             for timing in (False, True):

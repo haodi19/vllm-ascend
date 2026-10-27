@@ -108,6 +108,8 @@ def run(args):
             raise RuntimeError("Unsupported control-memory layout")
         active_slot = args.slots - 1
         register_benchmark_slots(session, args.slots, callback)
+        if args.scan_mode == "active":
+            session.configure_scan_slots([active_slot])
         session.start()
         alias = session.begin_device_access()
         alias += active_slot * info["slot_stride"]
@@ -219,6 +221,7 @@ def run(args):
                     "backend": args.backend,
                     "idle_mode": args.idle_mode,
                     "slots": args.slots,
+                    "scan_mode": args.scan_mode,
                     "worker_timing": args.worker_timing,
                     "worker_stats": summarize_worker(worker_stats, 1 + args.warmup, args.rounds),
                     "rounds": args.rounds,
@@ -279,6 +282,7 @@ def main():
     parser.add_argument("--idle-mode", choices=("yield", "spin"), default="yield")
     parser.add_argument("--worker-timing", action="store_true")
     parser.add_argument("--slots", type=int, default=1)
+    parser.add_argument("--scan-mode", choices=("all", "active"), default="all")
     args = parser.parse_args()
     if not 1 <= args.slots <= 4096:
         parser.error("slots: 1..4096")

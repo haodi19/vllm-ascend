@@ -36,6 +36,13 @@ class Session:
         """Read bounded diagnostic samples after stop, before close."""
         return self._native.polling_stats()
 
+    def configure_scan_slots(self, slots):
+        """Before start: producer promises to publish only to these fixed slots."""
+        slots = list(slots)
+        for slot in slots:
+            self._check_slot(slot)
+        self._native.configure_scan_slots(slots)
+
     def submit_for_test(self, slot, generation):
         """Simulate the device producer on Host; never mix with device producers."""
         self._check_slot(slot)

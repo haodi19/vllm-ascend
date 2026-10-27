@@ -20,12 +20,38 @@ class BenchmarkTests(unittest.TestCase):
         with patch.object(sys, "path", [str(scripts), *sys.path]):
             bench = runpy.run_path(str(scripts / "host_sync_benchmark.py"))
             runner = runpy.run_path(str(scripts / "run_host_sync_stage4.py"))
+            poll_runner = runpy.run_path(str(scripts / "run_worker_poll_tests.py"))
         cls.summarize = staticmethod(bench["summarize"])
         cls.register_slots = staticmethod(bench["register_benchmark_slots"])
         cls.summarize_worker = staticmethod(bench["summarize_worker"])
         cls.inspect_profile = staticmethod(bench["inspect_profile"])
         cls.compare = staticmethod(runner["compare_results"])
         cls.runner = staticmethod(runner["main"])
+        cls.scan_cases = staticmethod(poll_runner["scan_cases"])
+        cls.scan_comparison = staticmethod(poll_runner["scan_comparison"])
+
+    def test_scan_experiment_order_and_summary(self):
+        self.assertEqual(
+            list(self.scan_cases(2, [2048])),
+            [
+                (2048, False, 0, "yield", "all"),
+                (2048, False, 0, "yield", "active"),
+                (2048, False, 1, "yield", "active"),
+                (2048, False, 1, "yield", "all"),
+            ],
+        )
+        records = [
+            dict(
+                slots=2048,
+                scan_mode=mode,
+                **{key: dict(mean=value, p50=value, p95=value) for key in ("event_interval", "replay_sync_host")},
+            )
+            for mode, value in (("all", 40), ("active", 20))
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.scan_comparison(records)
+        self.assertIn("all=40.000 active=20.000 delta=-20.000", output.getvalue())
 
     def test_all_slots_registered_but_only_last_slot_may_execute(self):
         for count in (1, 2048):

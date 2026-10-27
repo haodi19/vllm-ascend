@@ -2,6 +2,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -72,6 +73,22 @@ class Session {
     return result;
   }
 
+  // Explicit producer contract: only these slots may receive requests.
+  // Freeze before start; preserve numeric scan order and all lifecycle locks.
+  void configure_scan_slots(const std::vector<size_t>& slots) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    if (state_ != "created") throw std::runtime_error("configure_scan_slots requires an unstarted session");
+    if (slots.empty()) throw std::invalid_argument("scan slots must not be empty");
+    auto selected = slots;
+    std::sort(selected.begin(), selected.end());
+    for (size_t i = 0; i < selected.size(); ++i) {
+      check_slot(selected[i]);
+      if (i && selected[i] == selected[i - 1]) throw std::invalid_argument("duplicate scan slot");
+    }
+    scan_slots_ = std::move(selected);
+  }
+
   // The Python facade owns an atexit reference until successful close().
   // This is only a last-resort cleanup for direct native users.
   ~Session() {
@@ -113,6 +130,9 @@ class Session {
       bool any_registered = false;
       for (const auto& callback : callbacks_) any_registered |= bool(callback);
       if (!any_registered) throw std::runtime_error("register a task before start()");
+      for (size_t slot : scan_slots_) {
+        if (!callbacks_[slot]) throw std::runtime_error("scan slot has no registered callback");
+      }
       state_ = "starting";
       try {
         worker_ = std::thread(&Session::run, this);
@@ -144,6 +164,9 @@ class Session {
     if (state_ != "running") throw std::runtime_error("session is not running");
     if (device_access_) throw std::runtime_error("device producer owns the session; Host test submission is disabled");
     if (!callbacks_[slot]) throw std::runtime_error("slot has no registered callback");
+    if (!scan_slots_.empty() && !std::binary_search(scan_slots_.begin(), scan_slots_.end(), slot)) {
+      throw std::runtime_error("slot is excluded from scanning");
+    }
     auto& signal = signals_[slot];
     const uint64_t previous = signal.request.generation.load(std::memory_order_acquire);
     if (previous == std::numeric_limits<uint64_t>::max() || generation == 0 || generation != previous + 1) {
@@ -377,7 +400,9 @@ class Session {
       const bool sample_idle = poll_timing_ && (++sweep % kIdleSampleStride == 0);
       const uint64_t scan_start = sample_idle ? clock_ns() : 0;
       uint64_t scan_lock_wait = 0;
-      for (size_t slot = 0; slot < slots_; ++slot) {
+      const size_t scan_count = scan_slots_.empty() ? slots_ : scan_slots_.size();
+      for (size_t index = 0; index < scan_count; ++index) {
+        const size_t slot = scan_slots_.empty() ? index : scan_slots_[index];
         uint64_t generation;
         const uint64_t claim_begin = poll_timing_ ? clock_ns() : 0;
         uint64_t claim_acquired = 0;
@@ -458,6 +483,7 @@ class Session {
   static constexpr size_t kMaxTimingSamples = 8192;
   static constexpr uint64_t kIdleSampleStride = 1024;
   bool idle_yield_ = true;
+  std::vector<size_t> scan_slots_;
   bool poll_timing_ = false;
   std::vector<std::array<uint64_t, 9>> task_samples_;
   std::vector<std::array<uint64_t, 3>> idle_samples_;
@@ -493,6 +519,7 @@ PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
       .def(py::init<size_t, const std::string&, int, const std::string&>(), py::arg("slots"), py::arg("backend"),
            py::arg("device_id"), py::arg("acl_library"))
       .def("register_task", &host_sync::Session::register_task)
+      .def("configure_scan_slots", &host_sync::Session::configure_scan_slots)
       .def("configure_polling", &host_sync::Session::configure_polling,
            py::arg("idle_mode") = "yield", py::arg("timing") = false)
       .def("polling_stats", &host_sync::Session::polling_stats)
