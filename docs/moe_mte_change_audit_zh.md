@@ -147,3 +147,26 @@ python -B script/run_mte_prefetch_comparison.py --npu 7 --original-copy-final
 额外适配的可用退路；它仍保留预取回调，不能称为全 MTE 修复。若失败或仍明显退化，
 按既定边界停止追加模型试验，保留结果并回到 `942868dd8cec9019dee04bee038bfcd678b6d66a`
 建立独立定位分支。当前证据能定位到预取交接组合，不能声称已证明 runtime 内部依赖环。
+
+## 最后一轮的已完成部分
+
+`prefetch_compare_1e4e448d` 原回调成功采集；混合版原始 Tensor 拷贝完成一次预热及
+三次无 profiler 计时，510 次回调无错误/丢样，未出现原拷贝阻塞。退出发生在启动
+profile 之前：磁盘剩余 19.81 GiB，低于 20 GiB 门槛。因此不能将退出记为 MTE
+阻塞，也没有混合版时间线可验证间隔。有限请求完成不等于长期稳定或两组输出一致。
+
+混合版预取 load_prepare/copy_submit/load_submit/synchronize 分别为
+57.865/155.299/224.732/123.134 μs；按需分别为
+189.023/574.469/792.929/761.876 μs。原始拷贝取消了新增布局适配，但提交仍占
+明显时间。不能引用本轮日志尾部的原回调 profiler 数据作为无 profiler 基线，也不能
+据此认定开销仅由 CPU 重排造成；加载流和执行线程上下文仍与原回调不同。
+
+不追加模型启动，先从已有两组日志恢复同口径计时：
+
+```bash
+python -B script/run_mte_prefetch_comparison.py --read-partial bench_results_tmp/prefetch_compare_1e4e448d
+```
+
+该入口只读输出，无 NPU 和写文件操作。日志没有生成文本摘要时明确不宣称输出一致。
+后续 runner 在 CPU 计时完成后立即保存 weight_timing_python.json，避免 profile
+前置检查或导出失败导致已完成计时的结构化结果丢失。此次只修复结果保留，不修改运行路径。

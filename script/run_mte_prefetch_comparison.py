@@ -1,10 +1,12 @@
 """一次完成三组预取交接对照；汇总搬运计时、CPU 间隔与 profile 路径。"""
 
 import argparse
+import ast
 import collections
 import contextlib
 import io
 import json
+import re
 import signal
 import subprocess
 import sys
@@ -29,6 +31,65 @@ METRICS = (
 
 def experiment_cases(original_copy):
     return (CASES[0], CASES[2]) if original_copy else CASES
+
+
+def timing_from_log(text):
+    """只恢复已完成的无 profiler 窗口；日志不含摘要时不声称输出一致。"""
+    marker = "=== WEIGHT TIMING: CPU timers only; no active profiler/MSTX ==="
+    if text.count(marker) != 1:
+        raise ValueError("需要且只能有一个无 profiler 计时窗口")
+    window = text.split(marker, 1)[1]
+    end = re.search(r"^Request usage: (.+)$", window, re.M)
+    if end is None:
+        raise ValueError("计时窗口未完整结束")
+    window = window[: end.end()]
+    if not re.search(r"callbacks=\d+; errors=0; dropped=0", window):
+        raise ValueError("计时样本存在错误或丢失")
+    groups = {}
+    current = None
+    for line in window.splitlines():
+        header = re.match(r"kind=(\w+) token_rows=(\d+) callbacks=(\d+).*loads_per_callback=(.+)", line)
+        if header:
+            kind, rows, count, loads = header.groups()
+            current = dict(count=int(count), loads=ast.literal_eval(loads), metrics={})
+            groups[(kind, int(rows))] = current
+        elif current is not None:
+            metric = re.fullmatch(r"(\w+)\s+([\d.eE+\-]+)(?:\s+[\d.eE+\-]+){5}\s*", line)
+            if metric:
+                current["metrics"][metric[1]] = float(metric[2])
+    if not groups:
+        raise ValueError("缺少分组计时")
+    return groups, ast.literal_eval(end[1])
+
+
+def partial_comparison(root, emit):
+    groups = []
+    usage = []
+    for name in ("callback", "hybrid"):
+        path = root / f"{name}_runner.log"
+        rows, tokens = timing_from_log(path.read_text(encoding="utf-8", errors="replace"))
+        groups.append(rows)
+        usage.append(tokens)
+    emit("只读恢复已完成计时；不启动模型、不写文件。日志不含输出摘要，未验证两组文本一致。")
+    emit(f"token 用量一致={usage[0] == usage[1]}; 不包含 hybrid profile 间隔结果。")
+    for key in sorted(groups[0].keys() & groups[1].keys()):
+        left, right = (group[key] for group in groups)
+        loads = [r["count"] * r["loads"]["mean"] for r in (left, right)]
+        emit(
+            f"kind={key[0]} rows={key[1]} callbacks={left['count']}/{right['count']} "
+            f"experts={loads[0]:.0f}/{loads[1]:.0f}"
+        )
+        emit("metric callback_us hybrid_us delta_us")
+        for metric in ("load_prepare", "copy_submit", "scale_refresh", "load_submit", "synchronize", "load_and_wait"):
+            values = [
+                r["metrics"]["load_submit"] + r["metrics"]["synchronize"]
+                if metric == "load_and_wait"
+                else r["metrics"][metric]
+                for r in (left, right)
+            ]
+            emit(f"{metric} {values[0]:.3f} {values[1]:.3f} {values[1] - values[0]:+.3f}")
+        if left["count"] != right["count"] or abs(loads[0] - loads[1]) > 1e-6:
+            emit("加载量不同，不能直接把均值差归因为实现开销。")
 
 
 def failure_summary(root, emit):
@@ -90,6 +151,7 @@ def compare_cycles(cases, emit):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=int)
+    parser.add_argument("--read-partial", type=Path, help="只读汇总已有 callback/hybrid 日志中的完整 CPU 计时")
     parser.add_argument("--read-failure", type=Path, help="只读取已有三组对照目录，不启动模型或写文件")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--profile-timeout", type=int, default=120)
@@ -99,6 +161,9 @@ def main():
         help="最终两组验收：原回调与混合交接均使用原始 Tensor 拷贝，不开启逐任务同步",
     )
     args = parser.parse_args()
+    if args.read_partial is not None:
+        partial_comparison(args.read_partial, print)
+        return 0
     if args.read_failure is not None:
         failure_summary(args.read_failure, print)
         return 0

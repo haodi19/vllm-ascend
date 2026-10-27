@@ -498,6 +498,10 @@ def _inference(args, source, backend, env, log):
                 raise RuntimeError("Worker did not disable MSTX for weight timing; update worker code")
             print("\n=== WEIGHT TIMING: CPU timers only; no active profiler/MSTX ===", flush=True)
             print_inference_report(backend, weight_timing, timed_samples, measurement="CPU TIMERS ONLY")
+            if getattr(args, "output_dir", None) is not None:
+                (args.output_dir / f"weight_timing_{backend}.json").write_text(
+                    json.dumps(weight_timing, ensure_ascii=False), encoding="utf-8"
+                )
         require_space(profile_dir)
         request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
         requests = []

@@ -15,6 +15,23 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_partial_log_only_uses_completed_cpu_window(self):
+        text = (
+            "=== WEIGHT TIMING: CPU timers only; no active profiler/MSTX ===\n"
+            "INFERENCE python: callbacks=2; errors=0; dropped=0\n"
+            "kind=prefetch token_rows=1 callbacks=2 layers=[1] loads_per_callback={'mean': 1.0}\n"
+            "load_submit 10.0 9.0 11.0 12.0 8.0 13.0\n"
+            "Request usage: [{'completion_tokens': 5}]\n"
+            "load_submit 999.0 9.0 11.0 12.0 8.0 13.0\n"
+        )
+        rows, usage = MODULE.timing_from_log(text)
+        self.assertEqual(rows[("prefetch", 1)]["metrics"]["load_submit"], 10.0)
+        self.assertEqual(usage, [{"completion_tokens": 5}])
+        with self.assertRaises(ValueError):
+            MODULE.timing_from_log(text.split("Request usage:")[0])
+        with self.assertRaises(ValueError):
+            MODULE.timing_from_log(text.replace("errors=0", "errors=1"))
+
     def test_failure_summary_preserves_runner_error_before_service_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "callback_runner.log"
