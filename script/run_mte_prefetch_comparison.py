@@ -27,6 +27,28 @@ METRICS = (
 )
 
 
+def failure_summary(root, emit):
+    """先保留测试进程的错误，避免把清理服务的异常误认成根因。"""
+    found = False
+    for name, _, _ in CASES:
+        path = root / f"{name}_runner.log"
+        if not path.is_file():
+            continue
+        found = True
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        # run_moe_host_sync prints the runner exception before service excerpts.
+        boundary = next((i for i, line in enumerate(lines) if line.startswith("SERVICE LOG TAIL:")), len(lines))
+        runner = lines[:boundary]
+        selected = set(range(max(0, len(runner) - 65), len(runner)))
+        for i, line in enumerate(runner):
+            if line.startswith(("FAILED", "Traceback")):
+                selected.update(range(max(0, i - 3), min(len(runner), i + 20)))
+        emit(f"RUNNER DIAGNOSTIC: {path}")
+        emit("\n".join(runner[i] for i in sorted(selected)))
+    if not found:
+        raise ValueError(f"未找到 *_runner.log：{root}")
+
+
 def check_outputs(before, after):
     for window in (None, "weight_timing"):
         left, right = (r if window is None else r.get(window) for r in (before, after))
@@ -62,11 +84,15 @@ def compare_cycles(cases, emit):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--npu", type=int, required=True)
+    parser.add_argument("--npu", type=int)
+    parser.add_argument("--read-failure", type=Path, help="只读取已有三组对照目录，不启动模型或写文件")
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--profile-timeout", type=int, default=120)
     args = parser.parse_args()
-    if sys.platform != "linux" or args.npu < 0 or args.profile_timeout < 1:
+    if args.read_failure is not None:
+        failure_summary(args.read_failure, print)
+        return 0
+    if sys.platform != "linux" or args.npu is None or args.npu < 0 or args.profile_timeout < 1:
         parser.error("请在 Linux 容器指定 NPU 编号及正数超时")
     root = (args.output_dir or ROOT / "bench_results_tmp" / f"prefetch_compare_{uuid4().hex[:8]}").resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -121,6 +147,7 @@ def main():
                     raise
             if child.returncode:
                 emit(f"FAILED {name}: exit={child.returncode}; 停止后续组，不自动重跑")
+                failure_summary(root, emit)
                 try:
                     read_failures(directory, emit)
                 except ValueError:

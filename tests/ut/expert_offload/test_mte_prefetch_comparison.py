@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,24 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_failure_summary_preserves_runner_error_before_service_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "callback_runner.log"
+            path.write_text(
+                "WEIGHT TIMING\nFAILED: KeyError: missing_metric\nSERVICE LOG TAIL: service.log\n"
+                + "EngineDeadError during cleanup\n" * 100,
+                encoding="utf-8",
+            )
+            output = []
+            MODULE.failure_summary(Path(directory), output.append)
+            text = "\n".join(output)
+            self.assertIn("FAILED: KeyError: missing_metric", text)
+            self.assertNotIn("EngineDeadError", text)
+
+    def test_failure_summary_missing_logs(self):
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ValueError):
+            MODULE.failure_summary(Path(directory), lambda text: None)
+
     def test_compare_checks_both_windows(self):
         report = dict(
             digests=["same"],
