@@ -21,6 +21,7 @@ class BenchmarkTests(unittest.TestCase):
             bench = runpy.run_path(str(scripts / "host_sync_benchmark.py"))
             runner = runpy.run_path(str(scripts / "run_host_sync_stage4.py"))
         cls.summarize = staticmethod(bench["summarize"])
+        cls.summarize_worker = staticmethod(bench["summarize_worker"])
         cls.inspect_profile = staticmethod(bench["inspect_profile"])
         cls.compare = staticmethod(runner["compare_results"])
         cls.runner = staticmethod(runner["main"])
@@ -28,6 +29,26 @@ class BenchmarkTests(unittest.TestCase):
     def test_statistics_including_nearest_rank_percentile(self):
         result = self.summarize(list(range(1, 21)))
         self.assertEqual(result, {"count": 20, "mean": 10.5, "p50": 10.5, "p95": 19, "min": 1, "max": 20})
+
+    def test_worker_statistics_exclude_warmup_and_convert_units(self):
+        raw = dict(
+            timing_enabled=True,
+            task_samples_dropped=0,
+            task_columns=["slot", "generation", "gil_wait_ns"],
+            task_samples=[[3, 1, 999000], [3, 2, 2000]],
+            idle_columns=["scan_ns"],
+            idle_samples=[[1000]],
+            idle_sample_stride=1024,
+            idle_samples_dropped=0,
+        )
+        result = self.summarize_worker(raw, 1, 1)
+        self.assertEqual(result["task"]["gil_wait_us"]["mean"], 2)
+        self.assertEqual(result["idle"]["scan_us"]["mean"], 1)
+        with self.assertRaises(RuntimeError):
+            self.summarize_worker(raw, 1, 2)
+        raw["task_samples_dropped"] = 1
+        with self.assertRaises(RuntimeError):
+            self.summarize_worker(raw, 1, 1)
 
     def test_invalid_samples_rejected(self):
         for values in ([], [-1], [float("nan")], [float("inf")]):

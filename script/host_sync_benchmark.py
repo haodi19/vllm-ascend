@@ -90,13 +90,16 @@ def run(args):
         wait.restype = None
         state = torch.zeros(4, dtype=torch.int64, device="npu:0")
         torch.npu.synchronize()
-        session = hs.Session(slots=1, backend="acl", device_id=0)
+        session = hs.Session(slots=args.slots, backend="acl", device_id=0)
+        session.configure_polling(args.idle_mode, args.worker_timing)
         info = session.info()
         if info["protocol_version"] != 1 or info["slot_stride"] != 1024 or info["done_offset"] != 512:
             raise RuntimeError("Unsupported control-memory layout")
-        session.register_task(0, callback)
+        active_slot = args.slots - 1
+        session.register_task(active_slot, callback)
         session.start()
         alias = session.begin_device_access()
+        alias += active_slot * info["slot_stride"]
         stream_pointer = int(stream.npu_stream)
 
         def submit():
@@ -186,9 +189,11 @@ def run(args):
 
     stream.synchronize()
     graph.reset()
+    worker_stats = None
     if session is not None:
         session.end_device_access(stream_synchronized=True)
         session.stop()
+        worker_stats = session.polling_stats()
         session.close()
     else:
         torch_npu.npu._unsubscribe_report(stream)
@@ -201,6 +206,10 @@ def run(args):
             + json.dumps(
                 {
                     "backend": args.backend,
+                    "idle_mode": args.idle_mode,
+                    "slots": args.slots,
+                    "worker_timing": args.worker_timing,
+                    "worker_stats": summarize_worker(worker_stats, 1 + args.warmup, args.rounds),
                     "rounds": args.rounds,
                     "warmup_replays": args.warmup,
                     "callback_count": calls,
@@ -217,6 +226,37 @@ def run(args):
         print("PROFILE_RESULT " + json.dumps(inspect_profile(args.profile_dir, args.backend, args.rounds)), flush=True)
 
 
+def summarize_worker(raw, warmup_generations, rounds):
+    if raw is None or not raw["timing_enabled"]:
+        return None
+    if raw["task_samples_dropped"]:
+        raise RuntimeError("Worker task samples overflowed; no valid measured statistics")
+    selected = [row for row in raw["task_samples"] if row[1] > warmup_generations]
+    if len(selected) != rounds:
+        raise RuntimeError(f"Worker timing count mismatch: {len(selected)} != {rounds}")
+    task = {
+        name.removesuffix("_ns") + "_us": summarize([row[index] / 1000 for row in selected])
+        for index, name in enumerate(raw["task_columns"])
+        if index >= 2
+    }
+    idle = (
+        {
+            name.removesuffix("_ns") + "_us": summarize([row[index] / 1000 for row in raw["idle_samples"]])
+            for index, name in enumerate(raw["idle_columns"])
+        }
+        if raw["idle_samples"]
+        else {}
+    )
+    return dict(
+        unit="us",
+        task=task,
+        idle=idle,
+        idle_sample_stride=raw["idle_sample_stride"],
+        idle_samples_dropped=raw["idle_samples_dropped"],
+        idle_scope="session lifetime including startup, capture, warmup and validation; not request wake latency",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--backend", choices=("callback", "mte"), required=True)
@@ -225,7 +265,12 @@ def main():
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--max-polls", type=int, default=100000)
     parser.add_argument("--profile-dir", type=Path)
+    parser.add_argument("--idle-mode", choices=("yield", "spin"), default="yield")
+    parser.add_argument("--worker-timing", action="store_true")
+    parser.add_argument("--slots", type=int, default=1)
     args = parser.parse_args()
+    if not 1 <= args.slots <= 4096:
+        parser.error("slots: 1..4096")
     if not 1 <= args.rounds <= 10000 or not 1 <= args.warmup <= 1000 or not 1 <= args.max_polls <= 10000000:
         parser.error("rounds: 1..10000; warmup: 1..1000; max-polls: 1..10000000")
     try:

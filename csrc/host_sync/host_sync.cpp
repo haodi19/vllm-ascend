@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -37,6 +39,37 @@ class Session {
     for (size_t i = 0; i < slots_; ++i) new (&signals_[i]) Slot();
     callbacks_.resize(slots_);
     errors_.resize(slots_);
+  }
+
+  void configure_polling(const std::string& idle_mode, bool timing) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    if (state_ != "created") throw std::runtime_error("configure_polling requires an unstarted session");
+    if (idle_mode != "yield" && idle_mode != "spin") throw std::invalid_argument("idle_mode must be yield or spin");
+    idle_yield_ = idle_mode == "yield";
+    poll_timing_ = timing;
+    if (timing) {
+      task_samples_.reserve(kMaxTimingSamples);
+      idle_samples_.reserve(kMaxTimingSamples);
+    }
+  }
+
+  py::dict polling_stats() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    if (!finished_) throw std::runtime_error("stop the worker before reading polling_stats");
+    py::dict result;
+    result["idle_mode"] = idle_yield_ ? "yield" : "spin";
+    result["timing_enabled"] = poll_timing_;
+    result["idle_sample_stride"] = kIdleSampleStride;
+    result["task_samples_dropped"] = task_samples_dropped_;
+    result["idle_samples_dropped"] = idle_samples_dropped_;
+    result["task_columns"] = py::make_tuple("slot", "generation", "claim_lock_wait_ns", "found_to_gil_ns",
+        "gil_wait_ns", "callback_ns", "gil_release_ns", "completion_lock_wait_ns", "completion_publish_ns");
+    result["idle_columns"] = py::make_tuple("scan_ns", "scan_lock_wait_ns", "idle_action_ns");
+    result["task_samples"] = task_samples_;
+    result["idle_samples"] = idle_samples_;
+    return result;
   }
 
   // The Python facade owns an atexit reference until successful close().
@@ -338,21 +371,33 @@ class Session {
   }
 
   void poll() {
+    uint64_t sweep = 0;
     while (!stop_requested_.load(std::memory_order_acquire)) {
       bool did_work = false;
+      const bool sample_idle = poll_timing_ && (++sweep % kIdleSampleStride == 0);
+      const uint64_t scan_start = sample_idle ? clock_ns() : 0;
+      uint64_t scan_lock_wait = 0;
       for (size_t slot = 0; slot < slots_; ++slot) {
         uint64_t generation;
+        const uint64_t claim_begin = poll_timing_ ? clock_ns() : 0;
+        uint64_t claim_acquired = 0;
         {
           std::lock_guard<std::mutex> lock(mutex_);
+          if (poll_timing_) claim_acquired = clock_ns();
+          if (sample_idle) scan_lock_wait += claim_acquired - claim_begin;
           if (stop_requested_.load(std::memory_order_acquire)) return;
           generation = signals_[slot].request.generation.load(std::memory_order_acquire);
           if (generation == 0 || terminal(slot, generation)) continue;
           signals_[slot].completion.status.store(static_cast<uint64_t>(TaskStatus::Running), std::memory_order_release);
         }
+        const uint64_t found = poll_timing_ ? clock_ns() : 0;
         did_work = true;
         std::string failure;
+        const uint64_t gil_begin = poll_timing_ ? clock_ns() : 0;
+        uint64_t gil_acquired = 0, callback_end = 0;
         {
           py::gil_scoped_acquire acquire;
+          if (poll_timing_) gil_acquired = clock_ns();
           try {
             if (!callbacks_[slot]) throw std::runtime_error("slot has no registered callback");
             callbacks_[slot]();
@@ -363,9 +408,13 @@ class Session {
           } catch (...) {
             failure = "unknown callback exception";
           }
+          if (poll_timing_) callback_end = clock_ns();
         }
+        const uint64_t released = poll_timing_ ? clock_ns() : 0;
+        uint64_t completion_acquired = 0, published = 0;
         {
           std::lock_guard<std::mutex> lock(mutex_);
+          if (poll_timing_) completion_acquired = clock_ns();
           if (failure.empty()) {
             signals_[slot].completion.status.store(static_cast<uint64_t>(TaskStatus::Success),
                                                    std::memory_order_relaxed);
@@ -373,15 +422,47 @@ class Session {
           } else {
             publish_error(slot, generation, failure, TaskStatus::Error);
           }
+          if (poll_timing_) published = clock_ns();
         }
         changed_.notify_all();
+        if (poll_timing_) {
+          if (task_samples_.size() < kMaxTimingSamples) {
+            task_samples_.push_back({slot, generation, claim_acquired - claim_begin, gil_begin - found,
+                gil_acquired - gil_begin, callback_end - gil_acquired, released - callback_end,
+                completion_acquired - released, published - completion_acquired});
+          } else {
+            ++task_samples_dropped_;
+          }
+        }
       }
-      // Stage 1 favors an inspectable, cooperative host loop. No spin/yield
-      // tuning or performance claim is part of this foundation.
-      if (!did_work) std::this_thread::yield();
+      if (!did_work) {
+        const uint64_t before_idle = sample_idle ? clock_ns() : 0;
+        if (idle_yield_) std::this_thread::yield();
+        if (sample_idle) {
+          const uint64_t after_idle = clock_ns();
+          if (idle_samples_.size() < kMaxTimingSamples) {
+            idle_samples_.push_back({before_idle - scan_start, scan_lock_wait, after_idle - before_idle});
+          } else {
+            ++idle_samples_dropped_;
+          }
+        }
+      }
     }
   }
 
+  static uint64_t clock_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+
+  static constexpr size_t kMaxTimingSamples = 8192;
+  static constexpr uint64_t kIdleSampleStride = 1024;
+  bool idle_yield_ = true;
+  bool poll_timing_ = false;
+  std::vector<std::array<uint64_t, 9>> task_samples_;
+  std::vector<std::array<uint64_t, 3>> idle_samples_;
+  uint64_t task_samples_dropped_ = 0;
+  uint64_t idle_samples_dropped_ = 0;
   size_t slots_;
   std::string backend_;
   int device_id_;
@@ -412,6 +493,9 @@ PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
       .def(py::init<size_t, const std::string&, int, const std::string&>(), py::arg("slots"), py::arg("backend"),
            py::arg("device_id"), py::arg("acl_library"))
       .def("register_task", &host_sync::Session::register_task)
+      .def("configure_polling", &host_sync::Session::configure_polling,
+           py::arg("idle_mode") = "yield", py::arg("timing") = false)
+      .def("polling_stats", &host_sync::Session::polling_stats)
       .def("start", &host_sync::Session::start, py::arg("timeout_ms") = 5000)
       .def("submit_for_test", &host_sync::Session::submit_for_test)
       .def("wait", &host_sync::Session::wait, py::arg("slot"), py::arg("generation"), py::arg("timeout_ms") = 5000)

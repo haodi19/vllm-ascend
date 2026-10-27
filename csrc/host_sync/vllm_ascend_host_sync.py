@@ -28,6 +28,14 @@ class Session:
     def start(self, timeout_ms=5000):
         self._native.start(timeout_ms)
 
+    def configure_polling(self, idle_mode="yield", timing=False):
+        """Opt-in experiment; call before start. Defaults preserve the old worker."""
+        self._native.configure_polling(idle_mode, timing)
+
+    def polling_stats(self):
+        """Read bounded diagnostic samples after stop, before close."""
+        return self._native.polling_stats()
+
     def submit_for_test(self, slot, generation):
         """Simulate the device producer on Host; never mix with device producers."""
         self._check_slot(slot)
