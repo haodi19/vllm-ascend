@@ -89,6 +89,32 @@ class MoeHostSyncTests(unittest.TestCase):
         value.cpu.assert_not_called()
         value.tolist.assert_not_called()
 
+    def test_split_scale_stops_before_destination_on_h2d_failure(self):
+        for fail in (False, True):
+            obj = self.dispatcher()
+            temporary = Mock()
+            obj.torch = SimpleNamespace(empty_like=Mock(return_value=temporary), contiguous_format="contiguous")
+            task = SimpleNamespace(source=object(), destination=Mock(), non_blocking=True)
+            labels = []
+
+            def checkpoint(label, operation, labels=labels, fail=fail):
+                labels.append(label)
+                operation()
+                if fail:
+                    raise RuntimeError("native wait failed")
+
+            with patch("builtins.print"):
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, "native wait failed"):
+                        obj._diagnose_split_scale(task, "scale", checkpoint)
+                    task.destination.copy_.assert_not_called()
+                else:
+                    obj._diagnose_split_scale(task, "scale", checkpoint)
+                    task.destination.copy_.assert_called_once_with(temporary, non_blocking=True)
+                    self.assertEqual(labels, ["scale H2D_CONTIGUOUS", "scale D2D_TARGET_LAYOUT"])
+            temporary.copy_.assert_called_once_with(task.source, non_blocking=True)
+            obj.torch.empty_like.assert_called_once_with(task.destination, memory_format="contiguous")
+
     def test_load_diagnosis_preserves_copies_and_scale_order(self):
         obj = self.dispatcher()
         events = Mock()

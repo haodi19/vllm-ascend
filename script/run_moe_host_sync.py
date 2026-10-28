@@ -28,6 +28,7 @@ def configured_source(
     idle_probe="locked",
     idle_mode="yield",
     diagnose_native_wait=False,
+    diagnose_split_scale=False,
 ):
     start = re.search(r"(?m)^vllm\s+serve\s+", source)
     if start is None:
@@ -43,9 +44,11 @@ def configured_source(
     offload["host_sync_idle_mode"] = idle_mode if backend == "mte" else "yield"
     if diagnose_load:
         offload["host_sync_diagnose_load"] = backend == "mte"
-    if diagnose_native_wait:
+    if diagnose_native_wait or diagnose_split_scale:
         offload["host_sync_diagnose_load"] = backend == "mte"
         offload["host_sync_diagnose_native_wait"] = backend == "mte"
+    if diagnose_split_scale:
+        offload["host_sync_diagnose_split_scale"] = backend == "mte"
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -97,6 +100,11 @@ def main():
     parser.add_argument("--worker-probe", choices=("locked", "atomic"), default="locked")
     parser.add_argument("--worker-idle", choices=("yield", "spin"), default="yield")
     parser.add_argument(
+        "--diagnose-split-scale",
+        action="store_true",
+        help="Diagnostic only: split scale H2D and device layout copy, implies native wait diagnosis",
+    )
+    parser.add_argument(
         "--diagnose-native-wait",
         action="store_true",
         help="Diagnose raw ACL stream completion before torch synchronization; abort on ACL error",
@@ -119,6 +127,8 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
+    if args.diagnose_split_scale:
+        args.diagnose_native_wait = True
     if args.diagnose_native_wait:
         args.diagnose_load_stages = True
     if sys.platform != "linux":
@@ -239,6 +249,7 @@ def run(args, root):
                 args.worker_probe,
                 args.worker_idle,
                 args.diagnose_native_wait,
+                args.diagnose_split_scale,
             ),
             "python",
             env,

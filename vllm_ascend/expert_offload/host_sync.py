@@ -27,6 +27,12 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    if not isinstance(config.get("host_sync_diagnose_split_scale", False), bool):
+        raise ValueError("host_sync_diagnose_split_scale must be boolean")
+    if config.get("host_sync_diagnose_split_scale") and not (
+        config.get("host_sync_diagnose_native_wait") and config.get("host_sync_diagnose_load")
+    ):
+        raise ValueError("split scale diagnosis requires load and native wait diagnosis")
     if not isinstance(config.get("host_sync_diagnose_native_wait", False), bool):
         raise ValueError("host_sync_diagnose_native_wait must be boolean")
     for key, choices, default in (
@@ -264,15 +270,31 @@ class MteHostDispatcher:
                     ),
                     flush=True,
                 )
-            checkpoint(
-                f"copy[{index}] name={task.name} bytes={task.nbytes}", lambda task=task: transport.copy_batch([task])
-            )
+            label = f"copy[{index}] name={task.name} bytes={task.nbytes}"
+            if getattr(self.manager.offload_config, "host_sync_diagnose_split_scale", False) and (
+                task.name.startswith(("w13_weight_scale[", "w2_weight_scale["))
+            ):
+                self._diagnose_split_scale(task, label, checkpoint)
+            else:
+                checkpoint(label, lambda task=task: transport.copy_batch([task]))
         for target_slot, _ in loads:
             checkpoint(
                 f"scale_refresh slot={target_slot}",
                 lambda target_slot=target_slot: self.manager._refresh_expert_fp32_scale(layer, target_slot),
             )
         return True
+
+    def _diagnose_split_scale(self, task, label, checkpoint):
+        # Diagnostic only: preserve the destination and logical values, but
+        # introduce an explicit temporary and synchronization boundaries.
+        # Passing this path does not prove the original copy path is repaired.
+        print(f"[MOE-MTE LOAD] {label} TEMP_ALLOC_BEGIN", flush=True)
+        temporary = self.torch.empty_like(task.destination, memory_format=self.torch.contiguous_format)
+        print(f"[MOE-MTE LOAD] {label} TEMP_ALLOC_READY", flush=True)
+        checkpoint(f"{label} H2D_CONTIGUOUS", lambda: temporary.copy_(task.source, non_blocking=task.non_blocking))
+        checkpoint(f"{label} D2D_TARGET_LAYOUT", lambda: task.destination.copy_(temporary, non_blocking=True))
+        # Retain temporary until both checkpoints finish; never publish done
+        # or proceed to scale refresh after a failed checkpoint.
 
     def _dump_stall(self, slot, state):
         # Only on a stalled request, never on the normal callback hot path.
