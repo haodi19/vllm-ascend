@@ -238,3 +238,33 @@ python -B script/run_moe_host_sync.py --backend mte --npu 0 \
 
 返回精简的 summary.txt 内容。完整错误信息保留在 inference_python.log；summary 单行最多
 2000 字符，并标记截断，避免把大段 Runtime 信息再次变成难以复制的输出。
+
+## 真实上下文中连续目标也失败：转向 Runtime 任务证据
+
+实验 `moe_host_sync_a6a6f2c4` 中，第二批 layer 1 的 H2D 成功，随后新增的
+`D2D_CONTIGUOUS` 已提交，但 ACL 等待返回 507046。因此尚未执行本批独立非连续目标，
+更没有执行本批原目标写入。摘要前面的 `[32,4096,2] INDEPENDENT_STRIDED` 来自此前任务，
+不能误读为第二批的非连续探测已通过。
+
+这进一步排除了“必须写入原 scale 槽位或非连续 stride 才会触发”这一解释。
+临时、原始和连续探测目标的 npu_format 都是 2；worker 的 grad_enabled=true、
+inference_mode=false 只是上下文记录，不能据此认定是原因。
+
+Runtime 明确报告 `Execution_Error_Stream_Synchronize_Timeout(EE1002)`，未完成任务类型
+`KERNEL_AIVEC`，进程 56880，device_id=7，stream_id=27，task_id=773。
+这属于实际失败点的任务类别证据，不等于已经知道 kernel 名称、具体依赖或死锁。
+参考 Torch-NPU CopyKernelOpApi 源码的 D2D 基础格式路径会调用 aclnnInplaceCopy，
+因此连续 Tensor.copy_ 也不能直接等同于纯 DMA；参考源码不保证与绿区开发版二进制完全一致，
+本次以 Runtime 的 KERNEL_AIVEC 报告为准。
+
+下一步先读取已有进程日志，不重启模型：
+
+```bash
+python -B script/inspect_mte_runtime_task.py bench_results/moe_host_sync_a6a6f2c4
+```
+
+脚本从服务日志提取失败 PID/stream/task，搜索当前用户 ascend/log、/var/log/npu/slog、
+/usr/slog 下以该 PID 命名的未压缩日志，读取每个文件末尾最多 16 MiB，最多读取 40 个文件，
+最多输出 70 行任务线索。可用 `--log-root 路径` 指定实际目录。
+日志没有开启、发生轮转、文件命名不含 PID 或信息位于读取范围外时，可能无结果；
+不能把无结果当作不存在对应任务。附近任务或关键词行只是线索，不能直接认定为因果链。
