@@ -29,6 +29,31 @@ class BenchmarkTests(unittest.TestCase):
         cls.runner = staticmethod(runner["main"])
         cls.scan_cases = staticmethod(poll_runner["scan_cases"])
         cls.scan_comparison = staticmethod(poll_runner["scan_comparison"])
+        cls.mutex_cases = staticmethod(poll_runner["mutex_cases"])
+        cls.mutex_comparison = staticmethod(poll_runner["mutex_comparison"])
+
+    def test_mutex_experiment_is_an_independent_comparison(self):
+        self.assertEqual(
+            list(self.mutex_cases(2, [2048])),
+            [
+                (2048, False, 0, "yield", "all", "locked"),
+                (2048, False, 0, "yield", "all", "atomic"),
+                (2048, False, 1, "yield", "all", "atomic"),
+                (2048, False, 1, "yield", "all", "locked"),
+            ],
+        )
+        records = [
+            dict(
+                slots=2048,
+                idle_probe=mode,
+                **{key: dict(mean=value, p50=value, p95=value) for key in ("event_interval", "replay_sync_host")},
+            )
+            for mode, value in (("locked", 40), ("atomic", 20))
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.mutex_comparison(records)
+        self.assertIn("locked=40.000 atomic=20.000 delta=-20.000", output.getvalue())
 
     def test_scan_experiment_order_and_summary(self):
         self.assertEqual(

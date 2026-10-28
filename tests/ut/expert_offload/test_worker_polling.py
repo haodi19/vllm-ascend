@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 
+import test_host_sync_session as lifecycle_tests
 import vllm_ascend_host_sync as hs
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "script"))
@@ -12,6 +13,31 @@ from run_worker_poll_tests import cases, scan_cases
 
 
 class WorkerPollingTests(unittest.TestCase):
+    def test_idle_probe_guards_and_error_reuse(self):
+        calls = []
+
+        def callback():
+            calls.append(1)
+            if len(calls) == 1:
+                raise ValueError("first request failed")
+
+        with hs.Session(slots=2048, backend="cpu") as session:
+            with self.assertRaises(ValueError):
+                session.configure_idle_probe("bad")
+            session.configure_idle_probe("atomic")
+            session.register_task(2047, callback)
+            session.start()
+            with self.assertRaises(RuntimeError):
+                session.configure_idle_probe("locked")
+            session.submit_for_test(2047, 1)
+            with self.assertRaisesRegex(RuntimeError, "first request failed"):
+                session.wait(2047, 1)
+            for generation in range(2, 102):
+                session.submit_for_test(2047, generation)
+                session.wait(2047, generation)
+            session.stop()
+            self.assertEqual(len(calls), 101)
+
     def test_selected_slots_alternate_without_loss_or_duplicates(self):
         for selected in (False, True):
             with self.subTest(selected=selected), hs.Session(slots=2048, backend="cpu") as session:
@@ -118,6 +144,15 @@ class WorkerPollingTests(unittest.TestCase):
             list(cases(2, [1]))[:4],
             [(1, False, 0, "yield"), (1, False, 0, "spin"), (1, False, 1, "spin"), (1, False, 1, "yield")],
         )
+
+
+class AtomicIdleLifecycleTests(lifecycle_tests.HostSyncSessionTests):
+    """Reuse lifecycle race/timeout tests with atomic probing on factory sessions."""
+
+    def make_session(self, **kwargs):
+        session = super().make_session(**kwargs)
+        session.configure_idle_probe("atomic")
+        return session
 
 
 if __name__ == "__main__":

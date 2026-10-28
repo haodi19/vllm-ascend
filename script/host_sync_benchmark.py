@@ -103,6 +103,7 @@ def run(args):
         torch.npu.synchronize()
         session = hs.Session(slots=args.slots, backend="acl", device_id=0)
         session.configure_polling(args.idle_mode, args.worker_timing)
+        session.configure_idle_probe(args.idle_probe)
         info = session.info()
         if info["protocol_version"] != 1 or info["slot_stride"] != 1024 or info["done_offset"] != 512:
             raise RuntimeError("Unsupported control-memory layout")
@@ -222,6 +223,7 @@ def run(args):
                     "idle_mode": args.idle_mode,
                     "slots": args.slots,
                     "scan_mode": args.scan_mode,
+                    "idle_probe": args.idle_probe,
                     "worker_timing": args.worker_timing,
                     "worker_stats": summarize_worker(worker_stats, 1 + args.warmup, args.rounds),
                     "rounds": args.rounds,
@@ -283,6 +285,7 @@ def main():
     parser.add_argument("--worker-timing", action="store_true")
     parser.add_argument("--slots", type=int, default=1)
     parser.add_argument("--scan-mode", choices=("all", "active"), default="all")
+    parser.add_argument("--idle-probe", choices=("locked", "atomic"), default="locked")
     args = parser.parse_args()
     if not 1 <= args.slots <= 4096:
         parser.error("slots: 1..4096")

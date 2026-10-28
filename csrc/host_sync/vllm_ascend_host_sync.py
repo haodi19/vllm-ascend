@@ -36,6 +36,10 @@ class Session:
         """Read bounded diagnostic samples after stop, before close."""
         return self._native.polling_stats()
 
+    def configure_idle_probe(self, mode="locked"):
+        """Before start: optionally skip the mutex for atomic idle checks."""
+        self._native.configure_idle_probe(mode)
+
     def configure_scan_slots(self, slots):
         """Before start: producer promises to publish only to these fixed slots."""
         slots = list(slots)

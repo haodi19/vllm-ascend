@@ -73,6 +73,32 @@ def scan_comparison(records):
     print("分位数为各轮分位数的平均。仅验证声明槽位集合的独立交接，不代表实际模型收益或阻塞修复。")
 
 
+def mutex_cases(repeats, slots):
+    for count in slots:
+        for repeat in range(repeats):
+            for probe in ("locked", "atomic") if repeat % 2 == 0 else ("atomic", "locked"):
+                yield count, False, repeat, "yield", "all", probe
+
+
+def mutex_comparison(records):
+    print("\n=== 空闲检查对照：全槽扫描、yield、内部计时关闭；单位 us ===")
+    for slots in sorted({r["slots"] for r in records}):
+        print(f"slots={slots}")
+        for metric in ("event_interval", "replay_sync_host"):
+            for stat in ("mean", "p50", "p95"):
+                values = {
+                    mode: statistics.mean(
+                        r[metric][stat] for r in records if r["slots"] == slots and r["idle_probe"] == mode
+                    )
+                    for mode in ("locked", "atomic")
+                }
+                print(
+                    f"{metric}.{stat}: locked={values['locked']:.3f} atomic={values['atomic']:.3f} "
+                    f"delta={values['atomic'] - values['locked']:+.3f}"
+                )
+    print("只跳过无任务槽位的锁；任务领取、完成、管理路径仍加锁。分位数为各轮分位数平均，非模型收益。")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number, required=True)
@@ -80,7 +106,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=200)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--slots", type=int, nargs="+", default=[1, 2048])
-    parser.add_argument("--experiment", choices=("yield", "scan"), default="yield")
+    parser.add_argument("--experiment", choices=("yield", "scan", "mutex"), default="yield")
     args = parser.parse_args()
     if sys.platform != "linux":
         parser.error("请在 Linux NPU 容器执行")
@@ -93,8 +119,8 @@ def main():
         contextlib.redirect_stdout(SummaryTee(sys.stdout, summary)),
     ):
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
-        print("基线提交 942868dd；不加载模型、不采集 profiler；保留逐槽 mutex。", flush=True)
-        print(f"experiment={args.experiment}; scan 实验只缩小扫描集合，保留逐槽 mutex 和 yield。", flush=True)
+        print("基线提交 942868dd；不加载模型、不采集 profiler。", flush=True)
+        print(f"experiment={args.experiment}; 每项实验只切换自身选项，原始配置仍为默认。", flush=True)
         build = select_build_directory(None, False)
         py = [sys.executable, "-B"]
         steps = [
@@ -141,8 +167,13 @@ def main():
             if args.experiment == "scan"
             else ((*case, "all") for case in cases(args.repeats, args.slots))
         )
-        for slots, timing, repeat, mode, scan_mode in configurations:
-            label = f"slots={slots} timing={timing} repeat={repeat + 1} mode={mode} scan={scan_mode}"
+        configurations = (
+            mutex_cases(args.repeats, args.slots)
+            if args.experiment == "mutex"
+            else ((*case, "locked") for case in configurations)
+        )
+        for slots, timing, repeat, mode, scan_mode, idle_probe in configurations:
+            label = f"slots={slots} timing={timing} repeat={repeat + 1} mode={mode} scan={scan_mode} probe={idle_probe}"
             command = [
                 *py,
                 str(REPOSITORY_ROOT / "script/host_sync_benchmark.py"),
@@ -156,6 +187,8 @@ def main():
                 str(slots),
                 "--scan-mode",
                 scan_mode,
+                "--idle-probe",
+                idle_probe,
                 "--rounds",
                 str(args.rounds),
                 "--warmup",
@@ -170,7 +203,7 @@ def main():
             with contextlib.redirect_stdout(output):
                 ok = run_step(label, command, 120, env=env, show_success_output=True)
             text = output.getvalue()
-            (root / f"slots{slots}_{mode}_{scan_mode}_timing{int(timing)}_r{repeat}.log").write_text(
+            (root / f"slots{slots}_{mode}_{scan_mode}_{idle_probe}_timing{int(timing)}_r{repeat}.log").write_text(
                 text, encoding="utf-8"
             )
             if not ok:
@@ -185,6 +218,8 @@ def main():
             if len(found) != 1:
                 raise RuntimeError(f"缺少唯一 BENCH_RESULT: {label}")
             record = found[0]
+            if record["idle_probe"] != idle_probe:
+                raise RuntimeError(f"空闲检查配置不匹配: {label}")
             if record["scan_mode"] != scan_mode:
                 raise RuntimeError(f"扫描配置不匹配: {label}")
             if (record["slots"], record["worker_timing"], record["idle_mode"], record["rounds"]) != (
@@ -196,7 +231,9 @@ def main():
                 raise RuntimeError(f"结果配置不匹配: {label}")
             records.append(record)
             print("RESULT " + json.dumps(record, ensure_ascii=False), flush=True)
-        if args.experiment == "scan":
+        if args.experiment == "mutex":
+            mutex_comparison(records)
+        elif args.experiment == "scan":
             scan_comparison(records)
         else:
             comparison(records)

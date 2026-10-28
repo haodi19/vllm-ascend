@@ -73,6 +73,14 @@ class Session {
     return result;
   }
 
+  void configure_idle_probe(const std::string& mode) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    if (state_ != "created") throw std::runtime_error("configure_idle_probe requires an unstarted session");
+    if (mode != "locked" && mode != "atomic") throw std::invalid_argument("idle probe must be locked or atomic");
+    atomic_idle_probe_ = mode == "atomic";
+  }
+
   // Explicit producer contract: only these slots may receive requests.
   // Freeze before start; preserve numeric scan order and all lifecycle locks.
   void configure_scan_slots(const std::vector<size_t>& slots) {
@@ -403,6 +411,14 @@ class Session {
       const size_t scan_count = scan_slots_.empty() ? slots_ : scan_slots_.size();
       for (size_t index = 0; index < scan_count; ++index) {
         const size_t slot = scan_slots_.empty() ? index : scan_slots_[index];
+        if (atomic_idle_probe_) {
+          if (stop_requested_.load(std::memory_order_acquire)) return;
+          // Speculative read of atomic protocol fields only. Recheck under
+          // the existing mutex before claiming work; never read callbacks or
+          // errors here. A concurrent publication is picked up next sweep.
+          const uint64_t observed = signals_[slot].request.generation.load(std::memory_order_acquire);
+          if (observed == 0 || terminal(slot, observed)) continue;
+        }
         uint64_t generation;
         const uint64_t claim_begin = poll_timing_ ? clock_ns() : 0;
         uint64_t claim_acquired = 0;
@@ -483,6 +499,7 @@ class Session {
   static constexpr size_t kMaxTimingSamples = 8192;
   static constexpr uint64_t kIdleSampleStride = 1024;
   bool idle_yield_ = true;
+  bool atomic_idle_probe_ = false;
   std::vector<size_t> scan_slots_;
   bool poll_timing_ = false;
   std::vector<std::array<uint64_t, 9>> task_samples_;
@@ -520,6 +537,7 @@ PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
            py::arg("device_id"), py::arg("acl_library"))
       .def("register_task", &host_sync::Session::register_task)
       .def("configure_scan_slots", &host_sync::Session::configure_scan_slots)
+      .def("configure_idle_probe", &host_sync::Session::configure_idle_probe)
       .def("configure_polling", &host_sync::Session::configure_polling,
            py::arg("idle_mode") = "yield", py::arg("timing") = false)
       .def("polling_stats", &host_sync::Session::polling_stats)
