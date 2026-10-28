@@ -104,6 +104,7 @@ def run(args):
         session = hs.Session(slots=args.slots, backend="acl", device_id=0)
         session.configure_polling(args.idle_mode, args.worker_timing)
         session.configure_idle_probe(args.idle_probe)
+        session.configure_worker_cpu(args.worker_cpu)
         info = session.info()
         if info["protocol_version"] != 1 or info["slot_stride"] != 1024 or info["done_offset"] != 512:
             raise RuntimeError("Unsupported control-memory layout")
@@ -224,6 +225,8 @@ def run(args):
                     "slots": args.slots,
                     "scan_mode": args.scan_mode,
                     "idle_probe": args.idle_probe,
+                    "worker_cpu": args.worker_cpu,
+                    "worker_affinity": worker_stats["worker_affinity"] if worker_stats else None,
                     "worker_timing": args.worker_timing,
                     "worker_stats": summarize_worker(worker_stats, 1 + args.warmup, args.rounds),
                     "rounds": args.rounds,
@@ -286,6 +289,7 @@ def main():
     parser.add_argument("--slots", type=int, default=1)
     parser.add_argument("--scan-mode", choices=("all", "active"), default="all")
     parser.add_argument("--idle-probe", choices=("locked", "atomic"), default="locked")
+    parser.add_argument("--worker-cpu", type=int, default=-1)
     args = parser.parse_args()
     if not 1 <= args.slots <= 4096:
         parser.error("slots: 1..4096")

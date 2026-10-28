@@ -40,6 +40,12 @@ class Session:
         """Before start: optionally skip the mutex for atomic idle checks."""
         self._native.configure_idle_probe(mode)
 
+    def configure_worker_cpu(self, cpu=-1):
+        """Before start: bind only the worker; -1 preserves inherited affinity."""
+        if not isinstance(cpu, int) or isinstance(cpu, bool):
+            raise ValueError("worker CPU must be an integer")
+        self._native.configure_worker_cpu(cpu)
+
     def configure_scan_slots(self, slots):
         """Before start: producer promises to publish only to these fixed slots."""
         slots = list(slots)

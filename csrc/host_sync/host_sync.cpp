@@ -14,6 +14,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#include <cstring>
+#endif
 
 #include "host_memory.h"
 #include "protocol.h"
@@ -62,6 +67,8 @@ class Session {
     py::dict result;
     result["idle_mode"] = idle_yield_ ? "yield" : "spin";
     result["timing_enabled"] = poll_timing_;
+    result["worker_cpu"] = worker_cpu_;
+    result["worker_affinity"] = worker_affinity_;
     result["idle_sample_stride"] = kIdleSampleStride;
     result["task_samples_dropped"] = task_samples_dropped_;
     result["idle_samples_dropped"] = idle_samples_dropped_;
@@ -79,6 +86,19 @@ class Session {
     if (state_ != "created") throw std::runtime_error("configure_idle_probe requires an unstarted session");
     if (mode != "locked" && mode != "atomic") throw std::invalid_argument("idle probe must be locked or atomic");
     atomic_idle_probe_ = mode == "atomic";
+  }
+
+  void configure_worker_cpu(int cpu) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    if (state_ != "created") throw std::runtime_error("configure_worker_cpu requires an unstarted session");
+    if (cpu < -1) throw std::invalid_argument("worker CPU must be -1 or a non-negative index");
+#ifdef __linux__
+    if (cpu >= CPU_SETSIZE) throw std::invalid_argument("worker CPU exceeds CPU_SETSIZE");
+#else
+    if (cpu != -1) throw std::runtime_error("worker affinity requires Linux");
+#endif
+    worker_cpu_ = cpu;
   }
 
   // Explicit producer contract: only these slots may receive requests.
@@ -371,6 +391,26 @@ class Session {
 
   void run() noexcept {
     try {
+#ifdef __linux__
+      cpu_set_t allowed;
+      int code = pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed);
+      if (code) throw std::runtime_error(std::string("read worker affinity: ") + std::strerror(code));
+      if (worker_cpu_ >= 0) {
+        if (!CPU_ISSET(worker_cpu_, &allowed)) throw std::runtime_error("worker CPU is outside inherited allowed set");
+        cpu_set_t selected;
+        CPU_ZERO(&selected);
+        CPU_SET(worker_cpu_, &selected);
+        code = pthread_setaffinity_np(pthread_self(), sizeof(selected), &selected);
+        if (code) throw std::runtime_error(std::string("bind worker affinity: ") + std::strerror(code));
+        code = pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed);
+        if (code) throw std::runtime_error(std::string("verify worker affinity: ") + std::strerror(code));
+        if (!CPU_ISSET(worker_cpu_, &allowed) || CPU_COUNT(&allowed) != 1)
+          throw std::runtime_error("worker affinity verification failed");
+      }
+      for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+        if (CPU_ISSET(cpu, &allowed)) worker_affinity_.push_back(cpu);
+      }
+#endif
       memory_->enter_worker_context();
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -499,6 +539,8 @@ class Session {
   static constexpr size_t kMaxTimingSamples = 8192;
   static constexpr uint64_t kIdleSampleStride = 1024;
   bool idle_yield_ = true;
+  int worker_cpu_ = -1;
+  std::vector<int> worker_affinity_;
   bool atomic_idle_probe_ = false;
   std::vector<size_t> scan_slots_;
   bool poll_timing_ = false;
@@ -538,6 +580,7 @@ PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
       .def("register_task", &host_sync::Session::register_task)
       .def("configure_scan_slots", &host_sync::Session::configure_scan_slots)
       .def("configure_idle_probe", &host_sync::Session::configure_idle_probe)
+      .def("configure_worker_cpu", &host_sync::Session::configure_worker_cpu)
       .def("configure_polling", &host_sync::Session::configure_polling,
            py::arg("idle_mode") = "yield", py::arg("timing") = false)
       .def("polling_stats", &host_sync::Session::polling_stats)

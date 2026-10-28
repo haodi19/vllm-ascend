@@ -31,6 +31,31 @@ class BenchmarkTests(unittest.TestCase):
         cls.scan_comparison = staticmethod(poll_runner["scan_comparison"])
         cls.mutex_cases = staticmethod(poll_runner["mutex_cases"])
         cls.mutex_comparison = staticmethod(poll_runner["mutex_comparison"])
+        cls.affinity_cases = staticmethod(poll_runner["affinity_cases"])
+        cls.affinity_comparison = staticmethod(poll_runner["affinity_comparison"])
+
+    def test_affinity_is_independent_and_balanced(self):
+        self.assertEqual(
+            list(self.affinity_cases(2, [2048], 7)),
+            [
+                (2048, False, 0, "yield", "all", "locked", -1),
+                (2048, False, 0, "yield", "all", "locked", 7),
+                (2048, False, 1, "yield", "all", "locked", 7),
+                (2048, False, 1, "yield", "all", "locked", -1),
+            ],
+        )
+        records = [
+            dict(
+                slots=2048,
+                worker_cpu=cpu,
+                **{key: dict(mean=value, p50=value, p95=value) for key in ("event_interval", "replay_sync_host")},
+            )
+            for cpu, value in ((-1, 40), (7, 20))
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.affinity_comparison(records)
+        self.assertIn("unbound=40.000 bound=20.000 delta=-20.000", output.getvalue())
 
     def test_mutex_experiment_is_an_independent_comparison(self):
         self.assertEqual(

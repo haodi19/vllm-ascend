@@ -99,6 +99,32 @@ def mutex_comparison(records):
     print("只跳过无任务槽位的锁；任务领取、完成、管理路径仍加锁。分位数为各轮分位数平均，非模型收益。")
 
 
+def affinity_cases(repeats, slots, cpu):
+    for count in slots:
+        for repeat in range(repeats):
+            for selected in (-1, cpu) if repeat % 2 == 0 else (cpu, -1):
+                yield count, False, repeat, "yield", "all", "locked", selected
+
+
+def affinity_comparison(records):
+    print("\n=== worker 绑核对照：全槽扫描、locked、yield、内部计时关闭；单位 us ===")
+    for slots in sorted({r["slots"] for r in records}):
+        print(f"slots={slots}")
+        for metric in ("event_interval", "replay_sync_host"):
+            for stat in ("mean", "p50", "p95"):
+                values = {
+                    bound: statistics.mean(
+                        r[metric][stat] for r in records if r["slots"] == slots and (r["worker_cpu"] >= 0) == bound
+                    )
+                    for bound in (False, True)
+                }
+                print(
+                    f"{metric}.{stat}: unbound={values[False]:.3f} bound={values[True]:.3f} "
+                    f"delta={values[True] - values[False]:+.3f}"
+                )
+    print("仅绑定 worker；提交线程允许集合不变，仍可能与 worker 共享 CPU。分位数为各轮分位数平均。")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number, required=True)
@@ -106,10 +132,17 @@ def main():
     parser.add_argument("--rounds", type=int, default=200)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--slots", type=int, nargs="+", default=[1, 2048])
-    parser.add_argument("--experiment", choices=("yield", "scan", "mutex"), default="yield")
+    parser.add_argument("--experiment", choices=("yield", "scan", "mutex", "affinity"), default="yield")
+    parser.add_argument("--worker-cpu", type=int, help="affinity 实验指定 CPU；默认选允许集合中的最大编号")
     args = parser.parse_args()
     if sys.platform != "linux":
         parser.error("请在 Linux NPU 容器执行")
+    allowed_cpus = sorted(os.sched_getaffinity(0))
+    worker_cpu = args.worker_cpu if args.worker_cpu is not None else allowed_cpus[-1]
+    if args.experiment == "affinity" and (worker_cpu not in allowed_cpus or len(allowed_cpus) < 2):
+        parser.error("affinity 需要至少两个允许 CPU，且指定编号必须在允许集合中")
+    if args.worker_cpu is not None and args.experiment != "affinity":
+        parser.error("--worker-cpu 仅用于 --experiment affinity")
     if not 1 <= args.rounds <= 4000 or not 1 <= args.repeats <= 4 or any(not 1 <= n <= 4096 for n in args.slots):
         parser.error("rounds=1..4000; repeats=1..4; slots=1..4096")
     root = (args.output_dir or REPOSITORY_ROOT / "bench_results" / f"worker_poll_{uuid4().hex[:8]}").resolve()
@@ -121,6 +154,8 @@ def main():
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
         print("基线提交 942868dd；不加载模型、不采集 profiler。", flush=True)
         print(f"experiment={args.experiment}; 每项实验只切换自身选项，原始配置仍为默认。", flush=True)
+        if args.experiment == "affinity":
+            print(f"允许 CPU={allowed_cpus}; 选定 worker CPU={worker_cpu}；不保证空闲/独占或 NUMA 最优。")
         build = select_build_directory(None, False)
         py = [sys.executable, "-B"]
         steps = [
@@ -172,8 +207,16 @@ def main():
             if args.experiment == "mutex"
             else ((*case, "locked") for case in configurations)
         )
-        for slots, timing, repeat, mode, scan_mode, idle_probe in configurations:
-            label = f"slots={slots} timing={timing} repeat={repeat + 1} mode={mode} scan={scan_mode} probe={idle_probe}"
+        configurations = (
+            affinity_cases(args.repeats, args.slots, worker_cpu)
+            if args.experiment == "affinity"
+            else ((*case, -1) for case in configurations)
+        )
+        for slots, timing, repeat, mode, scan_mode, idle_probe, cpu in configurations:
+            label = (
+                f"slots={slots} timing={timing} repeat={repeat + 1} mode={mode} "
+                f"scan={scan_mode} probe={idle_probe} cpu={cpu}"
+            )
             command = [
                 *py,
                 str(REPOSITORY_ROOT / "script/host_sync_benchmark.py"),
@@ -189,6 +232,8 @@ def main():
                 scan_mode,
                 "--idle-probe",
                 idle_probe,
+                "--worker-cpu",
+                str(cpu),
                 "--rounds",
                 str(args.rounds),
                 "--warmup",
@@ -203,9 +248,9 @@ def main():
             with contextlib.redirect_stdout(output):
                 ok = run_step(label, command, 120, env=env, show_success_output=True)
             text = output.getvalue()
-            (root / f"slots{slots}_{mode}_{scan_mode}_{idle_probe}_timing{int(timing)}_r{repeat}.log").write_text(
-                text, encoding="utf-8"
-            )
+            (
+                root / f"slots{slots}_{mode}_{scan_mode}_{idle_probe}_cpu{cpu}_timing{int(timing)}_r{repeat}.log"
+            ).write_text(text, encoding="utf-8")
             if not ok:
                 print(text, flush=True)
                 print("停止后续组；失败样本不能纳入收益比较。", flush=True)
@@ -218,6 +263,8 @@ def main():
             if len(found) != 1:
                 raise RuntimeError(f"缺少唯一 BENCH_RESULT: {label}")
             record = found[0]
+            if record["worker_cpu"] != cpu or (cpu >= 0 and record["worker_affinity"] != [cpu]):
+                raise RuntimeError(f"worker 绑核校验失败: {label}")
             if record["idle_probe"] != idle_probe:
                 raise RuntimeError(f"空闲检查配置不匹配: {label}")
             if record["scan_mode"] != scan_mode:
@@ -231,7 +278,9 @@ def main():
                 raise RuntimeError(f"结果配置不匹配: {label}")
             records.append(record)
             print("RESULT " + json.dumps(record, ensure_ascii=False), flush=True)
-        if args.experiment == "mutex":
+        if args.experiment == "affinity":
+            affinity_comparison(records)
+        elif args.experiment == "mutex":
             mutex_comparison(records)
         elif args.experiment == "scan":
             scan_comparison(records)

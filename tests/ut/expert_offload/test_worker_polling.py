@@ -1,6 +1,8 @@
 """CPU-only polling policy, timing and lifecycle regression."""
 
+import os
 import sys
+import threading
 import unittest
 from pathlib import Path
 
@@ -13,6 +15,43 @@ from run_worker_poll_tests import cases, scan_cases
 
 
 class WorkerPollingTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "Linux worker affinity")
+    def test_affinity_changes_only_worker(self):
+        allowed = os.sched_getaffinity(0)
+        cpu = max(allowed)
+        main_thread = threading.get_ident()
+        seen = []
+        with hs.Session(backend="cpu") as session:
+            session.configure_worker_cpu(cpu)
+            session.register_task(0, lambda: seen.append((threading.get_ident(), os.sched_getaffinity(0))))
+            session.start()
+            with self.assertRaises(RuntimeError):
+                session.configure_worker_cpu(-1)
+            session.submit_for_test(0, 1)
+            session.wait(0, 1)
+            session.stop()
+            self.assertEqual(session.polling_stats()["worker_affinity"], [cpu])
+            self.assertEqual(seen[0][1], {cpu})
+            self.assertNotEqual(seen[0][0], main_thread)
+            self.assertEqual(os.sched_getaffinity(0), allowed)
+
+    def test_affinity_configuration_errors(self):
+        with hs.Session(backend="cpu") as session:
+            for cpu in (-2, True, "0"):
+                with self.assertRaises(ValueError):
+                    session.configure_worker_cpu(cpu)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux worker affinity")
+    def test_disallowed_worker_cpu_fails_start_without_silent_fallback(self):
+        excluded = next((cpu for cpu in range(1024) if cpu not in os.sched_getaffinity(0)), None)
+        if excluded is None:
+            self.skipTest("no excluded CPU in supported range")
+        with hs.Session(backend="cpu") as session:
+            session.configure_worker_cpu(excluded)
+            session.register_task(0, lambda: None)
+            with self.assertRaisesRegex(RuntimeError, "outside inherited allowed set"):
+                session.start()
+
     def test_idle_probe_guards_and_error_reuse(self):
         calls = []
 
