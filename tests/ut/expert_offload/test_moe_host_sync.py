@@ -35,6 +35,60 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.manager.offload_config = SimpleNamespace()
         self.assertFalse(obj.diagnose_load([object()], [(0, 1)], None, 1))
 
+    def test_native_wait_split_and_error_stops_progress(self):
+        for fail in (False, True):
+            obj = self.dispatcher()
+            obj.manager.offload_config = SimpleNamespace(
+                host_sync_diagnose_load=True, host_sync_diagnose_native_wait=True
+            )
+            obj.active_callback, obj.load_diagnostic_batches = (1, 123), 0
+            obj.entry_streams[1] = 55
+            stream = Mock(npu_stream=77)
+            obj.manager.load_stream = stream
+            transport = Mock()
+            obj.manager._get_h2d_transport = lambda transport=transport: transport
+            obj.manager._refresh_expert_fp32_scale = Mock()
+            obj._dump_stall = Mock()
+            obj._fatal = Mock(side_effect=RuntimeError("terminated"))
+            native = Mock(side_effect=[0, 123] if fail else [0, 0, 0])
+            lib = SimpleNamespace(aclrtSynchronizeStreamWithTimeout=native)
+            npu = SimpleNamespace(npu=SimpleNamespace(current_stream=lambda: SimpleNamespace(npu_stream=77)))
+            task = SimpleNamespace(name="scale", nbytes=64, non_blocking=True, source=object(), destination=object())
+            with (
+                patch.dict(sys.modules, torch_npu=npu),
+                patch.object(self.module.ctypes, "CDLL", return_value=lib),
+                patch("builtins.print"),
+            ):
+                if fail:
+                    with self.assertRaisesRegex(RuntimeError, "terminated"):
+                        obj.diagnose_load([task], [(0, 1)], None, 1)
+                    self.assertEqual(stream.synchronize.call_count, 1)
+                    obj.manager._refresh_expert_fp32_scale.assert_not_called()
+                else:
+                    self.assertTrue(obj.diagnose_load([task], [(0, 1)], None, 1))
+                    self.assertEqual(stream.synchronize.call_count, 3)
+                native.assert_called_with(77, 10000)
+
+    def test_copy_description_reads_metadata_not_values(self):
+        value = SimpleNamespace(
+            shape=(2, 3),
+            dtype="uint8",
+            device="cpu",
+            stride=lambda: (1, 2),
+            storage_offset=lambda: 4,
+            is_contiguous=lambda: False,
+            data_ptr=lambda: 100,
+            is_pinned=lambda: True,
+            cpu=Mock(side_effect=AssertionError),
+            tolist=Mock(side_effect=AssertionError),
+        )
+        data = self.module.describe_copy_object(value)
+        self.assertEqual(data["stride"], (1, 2))
+        self.assertEqual(data["shape"], [2, 3])
+        self.assertTrue(data["is_pinned"])
+        value.cpu.assert_not_called()
+        value.tolist.assert_not_called()
+
     def test_load_diagnosis_preserves_copies_and_scale_order(self):
         obj = self.dispatcher()
         events = Mock()
@@ -122,6 +176,7 @@ class MoeHostSyncTests(unittest.TestCase):
         obj = self.module.MteHostDispatcher.__new__(self.module.MteHostDispatcher)
         obj.closed, obj.next_slot = False, 1
         obj.entries = [None] * 4
+        obj.entry_streams = [None] * 4
         obj.SLOT_CAPACITY = 4
         obj.alias, obj.stride, obj.done_offset, obj.state_base = 10000, 1024, 512, 20000
         obj.publish, obj.wait = Mock(), Mock()

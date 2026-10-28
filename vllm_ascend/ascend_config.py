@@ -1017,6 +1017,7 @@ class ExpertOffloadConfig:
         "host_sync_idle_probe": "locked",  # locked / atomic (idle precheck)
         "host_sync_idle_mode": "yield",  # yield / spin
         "host_sync_diagnose_load": False,
+        "host_sync_diagnose_native_wait": False,  # diagnostic ACL/torch wait split; not performance
         "host_sync_library": "",
         "cache_recent_window": 32,
         "cache_ema_beta": 0.9,

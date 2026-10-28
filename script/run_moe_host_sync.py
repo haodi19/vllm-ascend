@@ -20,7 +20,14 @@ from run_verified_cpp_tests import SummaryTee, inference, launch_spec
 
 
 def configured_source(
-    source, backend, library, diagnose_load=False, scan_mode="all", idle_probe="locked", idle_mode="yield"
+    source,
+    backend,
+    library,
+    diagnose_load=False,
+    scan_mode="all",
+    idle_probe="locked",
+    idle_mode="yield",
+    diagnose_native_wait=False,
 ):
     start = re.search(r"(?m)^vllm\s+serve\s+", source)
     if start is None:
@@ -36,6 +43,9 @@ def configured_source(
     offload["host_sync_idle_mode"] = idle_mode if backend == "mte" else "yield"
     if diagnose_load:
         offload["host_sync_diagnose_load"] = backend == "mte"
+    if diagnose_native_wait:
+        offload["host_sync_diagnose_load"] = backend == "mte"
+        offload["host_sync_diagnose_native_wait"] = backend == "mte"
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -87,6 +97,11 @@ def main():
     parser.add_argument("--worker-probe", choices=("locked", "atomic"), default="locked")
     parser.add_argument("--worker-idle", choices=("yield", "spin"), default="yield")
     parser.add_argument(
+        "--diagnose-native-wait",
+        action="store_true",
+        help="Diagnose raw ACL stream completion before torch synchronization; abort on ACL error",
+    )
+    parser.add_argument(
         "--diagnose-load-stages",
         action="store_true",
         help="Serialize the first eight MTE load batches for diagnosis, not performance",
@@ -104,6 +119,8 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
+    if args.diagnose_native_wait:
+        args.diagnose_load_stages = True
     if sys.platform != "linux":
         parser.error("Run inside the Linux NPU container")
     if min(args.requests, args.warmup_requests, args.startup_timeout, args.request_timeout, args.profile_timeout) < 1:
@@ -221,6 +238,7 @@ def run(args, root):
                 args.worker_scan,
                 args.worker_probe,
                 args.worker_idle,
+                args.diagnose_native_wait,
             ),
             "python",
             env,
@@ -234,7 +252,12 @@ def run(args, root):
                 raise RuntimeError("Missing runtime evidence of requested MTE worker policies")
             print(expected_policy, flush=True)
             if args.diagnose_load_stages:
-                print("\n".join(line for line in log.splitlines() if "[MOE-MTE LOAD]" in line), flush=True)
+                print(
+                    "\n".join(
+                        line for line in log.splitlines() if "[MOE-MTE LOAD]" in line or "[MOE-MTE LAYOUT]" in line
+                    ),
+                    flush=True,
+                )
             if "[MOE-MTE] first real offload callback completed" not in log:
                 raise RuntimeError("No evidence that real offload callbacks executed through MTE")
         print(

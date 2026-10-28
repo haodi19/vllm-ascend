@@ -3,6 +3,7 @@
 
 import atexit
 import ctypes
+import json
 import os
 import sys
 import threading
@@ -26,6 +27,8 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    if not isinstance(config.get("host_sync_diagnose_native_wait", False), bool):
+        raise ValueError("host_sync_diagnose_native_wait must be boolean")
     for key, choices, default in (
         ("host_sync_scan_mode", ("all", "allocated"), "all"),
         ("host_sync_idle_probe", ("locked", "atomic"), "locked"),
@@ -47,6 +50,22 @@ def validate_host_sync_config(config):
     library = config.get("host_sync_library", "")
     if not isinstance(library, str) or not Path(library).is_absolute() or not Path(library).is_file():
         raise ValueError("host_sync_library must point to the built absolute libhost_sync_device.so path")
+
+
+def describe_copy_object(value):
+    """Metadata only: never read tensor values or synchronize the device."""
+    result = {"type": type(value).__name__}
+    for name in ("shape", "dtype", "device"):
+        if hasattr(value, name):
+            item = getattr(value, name)
+            result[name] = list(item) if name == "shape" else str(item)
+    for name in ("stride", "storage_offset", "is_contiguous", "data_ptr"):
+        method = getattr(value, name, None)
+        if callable(method):
+            result[name] = method()
+    if str(getattr(value, "device", "")) == "cpu" and callable(getattr(value, "is_pinned", None)):
+        result["is_pinned"] = value.is_pinned()
+    return result
 
 
 def configure_mte_worker(session, config):
@@ -84,6 +103,7 @@ class MteHostDispatcher:
     STALL_SECONDS = 120
     WARMUP_MAX_POLLS = 1000000
     DIAGNOSTIC_SECONDS = 10
+    DIAGNOSTIC_WAIT_TIMEOUT_MS = 10_000
 
     def __init__(self, manager, library_path):
         # Optional runtime dependencies are loaded only for the opt-in backend.
@@ -105,6 +125,7 @@ class MteHostDispatcher:
         self.warmup_wait.argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_uint64]
         self.warmup_wait.restype = None
         self.entries = [None] * self.SLOT_CAPACITY
+        self.entry_streams = [None] * self.SLOT_CAPACITY
         self.next_slot = 1
         self.completed = 0
         self.load_diagnostic_batches = 0
@@ -183,18 +204,66 @@ class MteHostDispatcher:
         self.load_diagnostic_batches += 1
         batch = self.load_diagnostic_batches
         stream = self.manager.load_stream
+        native_wait = getattr(self.manager.offload_config, "host_sync_diagnose_native_wait", False)
+        raw_stream = None
+        sync_native = None
+        if native_wait:
+            print(f"[MOE-MTE LOAD] batch={batch} STREAM_HANDLE_BEGIN", flush=True)
+            raw_stream = int(stream.npu_stream)
+            import torch_npu  # Lazy diagnostic import; never from the watchdog.
+
+            current = int(torch_npu.npu.current_stream().npu_stream)
+            slot = self.active_callback[0]
+            print(
+                f"[MOE-MTE LOAD] batch={batch} STREAM_HANDLE_READY "
+                f"load={raw_stream} current={current} handoff={self.entry_streams[slot]} "
+                f"slot={slot} tid={threading.get_native_id()}",
+                flush=True,
+            )
+            library = ctypes.CDLL("libascendcl.so")
+            sync_native = library.aclrtSynchronizeStreamWithTimeout
+            sync_native.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+            sync_native.restype = ctypes.c_int
 
         def checkpoint(label, operation):
             prefix = f"[MOE-MTE LOAD] batch={batch} layer={layer_idx} {label}"
             print(f"{prefix} BEGIN", flush=True)
             operation()
             print(f"{prefix} SUBMITTED", flush=True)
+            if sync_native is not None:
+                print(
+                    f"{prefix} ACL_WAIT_BEGIN stream={raw_stream} timeout_ms={self.DIAGNOSTIC_WAIT_TIMEOUT_MS}",
+                    flush=True,
+                )
+                result = sync_native(raw_stream, self.DIAGNOSTIC_WAIT_TIMEOUT_MS)
+                print(f"{prefix} ACL_WAIT_RETURN code={result}", flush=True)
+                if result != 0:
+                    self._dump_stall(self.active_callback[0], self.session.snapshot(self.active_callback[0]))
+                    self._fatal(f"diagnostic native stream wait failed code={result}; no inference continuation")
+                print(f"{prefix} TORCH_WAIT_BEGIN", flush=True)
             stream.synchronize()
             print(f"{prefix} COMPLETE", flush=True)
 
         checkpoint("prior_stream_work", lambda: None)
         transport = self.manager._get_h2d_transport()
         for index, task in enumerate(tasks):
+            if native_wait:
+                print(
+                    "[MOE-MTE LAYOUT] "
+                    + json.dumps(
+                        {
+                            "batch": batch,
+                            "layer": layer_idx,
+                            "index": index,
+                            "name": task.name,
+                            "bytes": task.nbytes,
+                            "non_blocking": task.non_blocking,
+                            "source": describe_copy_object(task.source),
+                            "destination": describe_copy_object(task.destination),
+                        }
+                    ),
+                    flush=True,
+                )
             checkpoint(
                 f"copy[{index}] name={task.name} bytes={task.nbytes}", lambda task=task: transport.copy_batch([task])
             )
@@ -252,6 +321,7 @@ class MteHostDispatcher:
         # drains its Host submission queue. Read it HERE, after preceding copy_
         # and event submissions; never cache it across model operations.
         pointer = int(stream.npu_stream)
+        self.entry_streams[slot] = pointer
         request = self.alias + slot * self.stride
         state = self.state_base + slot * self.STATE_BYTES
         self.publish(pointer, request, state)
