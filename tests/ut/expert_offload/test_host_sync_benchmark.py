@@ -33,6 +33,32 @@ class BenchmarkTests(unittest.TestCase):
         cls.mutex_comparison = staticmethod(poll_runner["mutex_comparison"])
         cls.affinity_cases = staticmethod(poll_runner["affinity_cases"])
         cls.affinity_comparison = staticmethod(poll_runner["affinity_comparison"])
+        cls.combined_cases = staticmethod(poll_runner["combined_cases"])
+        cls.combined_comparison = staticmethod(poll_runner["combined_comparison"])
+
+    def test_combined_matrix_and_marginal_comparison(self):
+        cases = list(self.combined_cases(2, [2048]))
+        self.assertEqual([c[4:6] for c in cases[:4]], list(reversed([c[4:6] for c in cases[4:]])))
+        self.assertEqual(len(set(c[4:6] for c in cases)), 4)
+        self.assertTrue(all(c[1] is False and c[3] == "yield" and c[6] == -1 for c in cases))
+        records = [
+            dict(
+                slots=2048,
+                scan_mode=scan,
+                idle_probe=probe,
+                **{key: dict(mean=value, p50=value, p95=value) for key in ("event_interval", "replay_sync_host")},
+            )
+            for scan, probe, value in (
+                ("all", "locked", 40),
+                ("active", "locked", 25),
+                ("all", "atomic", 24),
+                ("active", "atomic", 23),
+            )
+        ]
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.combined_comparison(records)
+        self.assertIn("combined_minus_active=-2.000; combined_minus_atomic=-1.000", output.getvalue())
 
     def test_affinity_is_independent_and_balanced(self):
         self.assertEqual(

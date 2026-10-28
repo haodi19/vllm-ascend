@@ -125,6 +125,37 @@ def affinity_comparison(records):
     print("仅绑定 worker；提交线程允许集合不变，仍可能与 worker 共享 CPU。分位数为各轮分位数平均。")
 
 
+def combined_cases(repeats, slots):
+    for count in slots:
+        for repeat in range(repeats):
+            pairs = [("all", "locked"), ("active", "locked"), ("all", "atomic"), ("active", "atomic")]
+            for scan, probe in pairs if repeat % 2 == 0 else reversed(pairs):
+                yield count, False, repeat, "yield", scan, probe, -1
+
+
+def combined_comparison(records):
+    print("\n=== 扫描/空闲锁组合：固定 yield、不绑核、关闭内部计时；单位 us ===")
+    for slots in sorted({r["slots"] for r in records}):
+        print(f"slots={slots}")
+        for metric in ("event_interval", "replay_sync_host"):
+            for stat in ("mean", "p50", "p95"):
+                values = {
+                    (scan, probe): statistics.mean(
+                        r[metric][stat]
+                        for r in records
+                        if (r["slots"], r["scan_mode"], r["idle_probe"]) == (slots, scan, probe)
+                    )
+                    for scan in ("all", "active")
+                    for probe in ("locked", "atomic")
+                }
+                print(f"{metric}.{stat}: " + " ".join(f"{s}/{p}={v:.3f}" for (s, p), v in values.items()))
+                print(
+                    f"  combined_minus_active={values['active', 'atomic'] - values['active', 'locked']:+.3f}; "
+                    f"combined_minus_atomic={values['active', 'atomic'] - values['all', 'atomic']:+.3f}"
+                )
+    print("只检验两项收益是否重叠；单个活动槽位的独立图测试，不代表真实模型。分位数是各轮分位数平均。")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number, required=True)
@@ -132,7 +163,7 @@ def main():
     parser.add_argument("--rounds", type=int, default=200)
     parser.add_argument("--repeats", type=int, default=2)
     parser.add_argument("--slots", type=int, nargs="+", default=[1, 2048])
-    parser.add_argument("--experiment", choices=("yield", "scan", "mutex", "affinity"), default="yield")
+    parser.add_argument("--experiment", choices=("yield", "scan", "mutex", "affinity", "combined"), default="yield")
     parser.add_argument("--worker-cpu", type=int, help="affinity 实验指定 CPU；默认选允许集合中的最大编号")
     args = parser.parse_args()
     if sys.platform != "linux":
@@ -212,6 +243,8 @@ def main():
             if args.experiment == "affinity"
             else ((*case, -1) for case in configurations)
         )
+        if args.experiment == "combined":
+            configurations = combined_cases(args.repeats, args.slots)
         for slots, timing, repeat, mode, scan_mode, idle_probe, cpu in configurations:
             label = (
                 f"slots={slots} timing={timing} repeat={repeat + 1} mode={mode} "
@@ -278,7 +311,9 @@ def main():
                 raise RuntimeError(f"结果配置不匹配: {label}")
             records.append(record)
             print("RESULT " + json.dumps(record, ensure_ascii=False), flush=True)
-        if args.experiment == "affinity":
+        if args.experiment == "combined":
+            combined_comparison(records)
+        elif args.experiment == "affinity":
             affinity_comparison(records)
         elif args.experiment == "mutex":
             mutex_comparison(records)
