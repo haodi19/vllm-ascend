@@ -53,6 +53,16 @@ class Session:
             self._check_slot(slot)
         self._native.configure_scan_slots(slots)
 
+    def configure_scan_prefix(self, count):
+        """Before start: scan [0, count); producer must expand before new publications."""
+        self._check_slot(count)
+        self._native.configure_scan_prefix(count)
+
+    def expand_scan_prefix(self, count):
+        """While running: monotonically publish a larger initialized prefix."""
+        self._check_slot(count)
+        self._native.expand_scan_prefix(count)
+
     def submit_for_test(self, slot, generation):
         """Simulate the device producer on Host; never mix with device producers."""
         self._check_slot(slot)

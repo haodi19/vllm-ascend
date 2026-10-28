@@ -1012,6 +1012,10 @@ class ExpertOffloadConfig:
         "callback_mstx_enabled": False,
         # Opt-in single-card graph handoff. Default preserves ACL callbacks.
         "host_sync_backend": "callback",
+        # MTE-only worker policies; defaults preserve original dispatch.
+        "host_sync_scan_mode": "all",  # all / allocated (monotonic task prefix)
+        "host_sync_idle_probe": "locked",  # locked / atomic (idle precheck)
+        "host_sync_idle_mode": "yield",  # yield / spin
         "host_sync_diagnose_load": False,
         "host_sync_library": "",
         "cache_recent_window": 32,

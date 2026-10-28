@@ -45,6 +45,7 @@ class Session {
     for (size_t i = 0; i < slots_; ++i) new (&signals_[i]) Slot();
     callbacks_.resize(slots_);
     errors_.resize(slots_);
+    scan_limit_.store(slots_, std::memory_order_relaxed);
   }
 
   void configure_polling(const std::string& idle_mode, bool timing) {
@@ -101,12 +102,36 @@ class Session {
     worker_cpu_ = cpu;
   }
 
+  void configure_scan_prefix(size_t count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    if (state_ != "created" || !scan_slots_.empty())
+      throw std::runtime_error("scan prefix requires unstarted session without static scan slots");
+    if (count == 0 || count > slots_) throw std::invalid_argument("scan prefix outside capacity");
+    prefix_scan_ = true;
+    scan_limit_.store(count, std::memory_order_release);
+  }
+
+  void expand_scan_prefix(size_t count) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    if (!prefix_scan_ || state_ != "running" || stop_requested_.load(std::memory_order_acquire))
+      throw std::runtime_error("expand_scan_prefix requires running prefix session");
+    const size_t previous = scan_limit_.load(std::memory_order_acquire);
+    if (count < previous || count > slots_) throw std::invalid_argument("scan prefix must grow within capacity");
+    for (size_t slot = previous; slot < count; ++slot) {
+      if (!callbacks_[slot]) throw std::runtime_error("new scan slot has no registered callback");
+    }
+    scan_limit_.store(count, std::memory_order_release);
+  }
+
   // Explicit producer contract: only these slots may receive requests.
   // Freeze before start; preserve numeric scan order and all lifecycle locks.
   void configure_scan_slots(const std::vector<size_t>& slots) {
     std::lock_guard<std::mutex> lock(mutex_);
     require_open();
     if (state_ != "created") throw std::runtime_error("configure_scan_slots requires an unstarted session");
+    if (prefix_scan_) throw std::runtime_error("static scan slots cannot be combined with prefix scanning");
     if (slots.empty()) throw std::invalid_argument("scan slots must not be empty");
     auto selected = slots;
     std::sort(selected.begin(), selected.end());
@@ -161,6 +186,11 @@ class Session {
       for (size_t slot : scan_slots_) {
         if (!callbacks_[slot]) throw std::runtime_error("scan slot has no registered callback");
       }
+      if (prefix_scan_) {
+        for (size_t slot = 0; slot < scan_limit_.load(std::memory_order_acquire); ++slot) {
+          if (!callbacks_[slot]) throw std::runtime_error("scan prefix has unregistered callback");
+        }
+      }
       state_ = "starting";
       try {
         worker_ = std::thread(&Session::run, this);
@@ -192,6 +222,7 @@ class Session {
     if (state_ != "running") throw std::runtime_error("session is not running");
     if (device_access_) throw std::runtime_error("device producer owns the session; Host test submission is disabled");
     if (!callbacks_[slot]) throw std::runtime_error("slot has no registered callback");
+    if (slot >= scan_limit_.load(std::memory_order_acquire)) throw std::runtime_error("slot outside scan prefix");
     if (!scan_slots_.empty() && !std::binary_search(scan_slots_.begin(), scan_slots_.end(), slot)) {
       throw std::runtime_error("slot is excluded from scanning");
     }
@@ -448,7 +479,7 @@ class Session {
       const bool sample_idle = poll_timing_ && (++sweep % kIdleSampleStride == 0);
       const uint64_t scan_start = sample_idle ? clock_ns() : 0;
       uint64_t scan_lock_wait = 0;
-      const size_t scan_count = scan_slots_.empty() ? slots_ : scan_slots_.size();
+      const size_t scan_count = scan_slots_.empty() ? scan_limit_.load(std::memory_order_acquire) : scan_slots_.size();
       for (size_t index = 0; index < scan_count; ++index) {
         const size_t slot = scan_slots_.empty() ? index : scan_slots_[index];
         if (atomic_idle_probe_) {
@@ -543,6 +574,8 @@ class Session {
   std::vector<int> worker_affinity_;
   bool atomic_idle_probe_ = false;
   std::vector<size_t> scan_slots_;
+  bool prefix_scan_ = false;
+  std::atomic<size_t> scan_limit_{0};
   bool poll_timing_ = false;
   std::vector<std::array<uint64_t, 9>> task_samples_;
   std::vector<std::array<uint64_t, 3>> idle_samples_;
@@ -581,6 +614,8 @@ PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
       .def("configure_scan_slots", &host_sync::Session::configure_scan_slots)
       .def("configure_idle_probe", &host_sync::Session::configure_idle_probe)
       .def("configure_worker_cpu", &host_sync::Session::configure_worker_cpu)
+      .def("configure_scan_prefix", &host_sync::Session::configure_scan_prefix)
+      .def("expand_scan_prefix", &host_sync::Session::expand_scan_prefix)
       .def("configure_polling", &host_sync::Session::configure_polling,
            py::arg("idle_mode") = "yield", py::arg("timing") = false)
       .def("polling_stats", &host_sync::Session::polling_stats)

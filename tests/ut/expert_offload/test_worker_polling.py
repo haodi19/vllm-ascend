@@ -15,6 +15,40 @@ from run_worker_poll_tests import cases, scan_cases
 
 
 class WorkerPollingTests(unittest.TestCase):
+    def test_prefix_expansion_preserves_old_and_new_tasks(self):
+        for probe in ("locked", "atomic"):
+            with hs.Session(slots=8, backend="cpu") as session:
+                seen = []
+                for slot in range(8):
+                    session.register_task(slot, lambda slot=slot, seen=seen: seen.append(slot))
+                session.configure_polling("spin", False)
+                session.configure_idle_probe(probe)
+                session.configure_scan_prefix(1)
+                with self.assertRaises(RuntimeError):
+                    session.configure_scan_slots([0])
+                session.start()
+                with self.assertRaises(RuntimeError):
+                    session.submit_for_test(7, 1)
+                generations = [0] * 8
+                expected = []
+                for count in range(1, 9):
+                    session.expand_scan_prefix(count)
+                    for slot in reversed(range(count)):
+                        generations[slot] += 1
+                        session.submit_for_test(slot, generations[slot])
+                        session.wait(slot, generations[slot])
+                        expected.append(slot)
+                with self.assertRaises(ValueError):
+                    session.expand_scan_prefix(7)
+                with self.assertRaises(ValueError):
+                    session.expand_scan_prefix(9)
+                with self.assertRaises(RuntimeError):
+                    session.configure_scan_prefix(1)
+                session.stop()
+                self.assertEqual(seen, expected)
+                with self.assertRaises(RuntimeError):
+                    session.expand_scan_prefix(8)
+
     @unittest.skipUnless(sys.platform == "linux", "Linux worker affinity")
     def test_affinity_changes_only_worker(self):
         allowed = os.sched_getaffinity(0)

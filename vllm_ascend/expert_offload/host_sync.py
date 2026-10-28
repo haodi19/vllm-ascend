@@ -26,6 +26,13 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    for key, choices, default in (
+        ("host_sync_scan_mode", ("all", "allocated"), "all"),
+        ("host_sync_idle_probe", ("locked", "atomic"), "locked"),
+        ("host_sync_idle_mode", ("yield", "spin"), "yield"),
+    ):
+        if config.get(key, default) not in choices:
+            raise ValueError(f"{key} must be one of {choices}")
     if not isinstance(config.get("host_sync_diagnose_load", False), bool):
         raise ValueError("host_sync_diagnose_load must be boolean")
     backend = config.get("host_sync_backend", "callback")
@@ -40,6 +47,29 @@ def validate_host_sync_config(config):
     library = config.get("host_sync_library", "")
     if not isinstance(library, str) or not Path(library).is_absolute() or not Path(library).is_file():
         raise ValueError("host_sync_library must point to the built absolute libhost_sync_device.so path")
+
+
+def configure_mte_worker(session, config):
+    """Configure opt-in worker policies before start; keep old defaults usable."""
+    scan = getattr(config, "host_sync_scan_mode", "all")
+    probe = getattr(config, "host_sync_idle_probe", "locked")
+    idle = getattr(config, "host_sync_idle_mode", "yield")
+    required = []
+    if scan == "allocated":
+        required.extend(("configure_scan_prefix", "expand_scan_prefix"))
+    if probe != "locked":
+        required.append("configure_idle_probe")
+    if idle != "yield":
+        required.append("configure_polling")
+    if any(not callable(getattr(session, name, None)) for name in required):
+        raise RuntimeError("Rebuild csrc/host_sync in this checkout for selected MTE worker policies")
+    if scan == "allocated":
+        session.configure_scan_prefix(1)  # slot 0: initialization handshake
+    if probe != "locked":
+        session.configure_idle_probe(probe)
+    if idle != "yield":
+        session.configure_polling(idle, False)
+    return scan == "allocated"
 
 
 class MteHostDispatcher:
@@ -91,8 +121,15 @@ class MteHostDispatcher:
         self.stride, self.done_offset = info["slot_stride"], info["done_offset"]
         for slot in range(self.SLOT_CAPACITY):
             self.session.register_task(slot, lambda slot=slot: self._run(slot))
+        self.allocated_scan = configure_mte_worker(self.session, manager.offload_config)
         self.session.start()
         self.alias = self.session.begin_device_access()
+        print(
+            f"[MOE-MTE WORKER] scan={getattr(manager.offload_config, 'host_sync_scan_mode', 'all')} "
+            f"probe={getattr(manager.offload_config, 'host_sync_idle_probe', 'locked')} "
+            f"idle={getattr(manager.offload_config, 'host_sync_idle_mode', 'yield')}",
+            flush=True,
+        )
         self.entries[0] = (lambda args: None, None)
         stream = torch.npu.current_stream()
         pointer = int(stream.npu_stream)
@@ -206,6 +243,10 @@ class MteHostDispatcher:
             raise RuntimeError("MTE dispatcher closed or graph callback slot capacity exceeded")
         slot = self.next_slot
         self.entries[slot] = (callback, args)
+        if self.allocated_scan:
+            # Publish the initialized entry's range before any device request.
+            # Older captured graphs keep their slots inside the growing prefix.
+            self.session.expand_scan_prefix(slot + 1)
         self.next_slot += 1
         # torch_npu 2.10's npu_stream property calls NPUStream::stream(), which
         # drains its Host submission queue. Read it HERE, after preceding copy_

@@ -127,7 +127,87 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.publish, obj.wait = Mock(), Mock()
         obj.manager, obj.completed = SimpleNamespace(_cb_failures=0), 0
         obj.active_callback = None
+        obj.allocated_scan = False
+        obj.session = Mock()
         return obj
+
+    def test_allocated_prefix_published_after_entry_before_device(self):
+        obj = self.dispatcher()
+        obj.allocated_scan = True
+        calls = []
+        callback = Mock()
+
+        def expand(count):
+            self.assertEqual(obj.entries[count - 1], (callback, count - 1))
+            calls.append(("expand", count))
+
+        obj.session.expand_scan_prefix.side_effect = expand
+        obj.publish.side_effect = lambda *args: calls.append(("publish",))
+        obj.wait.side_effect = lambda *args: calls.append(("wait",))
+        for slot in (1, 2):
+            obj.launch(SimpleNamespace(npu_stream=55), callback, slot)
+        self.assertEqual(calls, [("expand", 2), ("publish",), ("wait",), ("expand", 3), ("publish",), ("wait",)])
+
+    def test_worker_policy_defaults_and_opt_in(self):
+        session = Mock()
+        self.assertFalse(self.module.configure_mte_worker(session, SimpleNamespace()))
+        self.assertEqual(session.mock_calls, [])
+        config = SimpleNamespace(
+            host_sync_scan_mode="allocated", host_sync_idle_probe="atomic", host_sync_idle_mode="spin"
+        )
+        self.assertTrue(self.module.configure_mte_worker(session, config))
+        session.configure_scan_prefix.assert_called_once_with(1)
+        session.configure_idle_probe.assert_called_once_with("atomic")
+        session.configure_polling.assert_called_once_with("spin", False)
+        with self.assertRaisesRegex(RuntimeError, "Rebuild"):
+            self.module.configure_mte_worker(object(), config)
+        for key in ("host_sync_scan_mode", "host_sync_idle_probe", "host_sync_idle_mode"):
+            with self.assertRaises(ValueError):
+                self.module.validate_host_sync_config({key: "invalid"})
+
+    def test_prefix_failure_prevents_device_publication(self):
+        obj = self.dispatcher()
+        obj.allocated_scan = True
+        obj.session.expand_scan_prefix.side_effect = RuntimeError("failed")
+        with self.assertRaisesRegex(RuntimeError, "failed"):
+            obj.launch(SimpleNamespace(npu_stream=55), Mock(), None)
+        obj.publish.assert_not_called()
+        obj.wait.assert_not_called()
+        self.assertEqual(obj.next_slot, 1)
+
+    def test_runtime_artifacts_include_package_and_preserve_existing_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source, target = Path(temp) / "source", Path(temp) / "target"
+            package = source / "vllm_ascend"
+            binary = package / "_cann_ops_custom/vendors/custom_transformer/kernel.bin"
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"device binary")
+            (package / "_build_info.py").write_text("build_info = 1")
+            (package / "_C.so").write_bytes(b"extension")
+            (package / "host_sync.py").write_text("must not copy source")
+            target.mkdir()
+            with patch("builtins.print"):
+                self.runner.prepare_runtime_artifacts(source, target)
+            self.assertEqual((target / binary.relative_to(source)).read_bytes(), b"device binary")
+            self.assertFalse((target / "vllm_ascend/host_sync.py").exists())
+            (target / "vllm_ascend/_build_info.py").write_text("keep")
+            with patch("builtins.print"):
+                self.runner.prepare_runtime_artifacts(source, target)
+            self.assertEqual((target / "vllm_ascend/_build_info.py").read_text(), "keep")
+
+    def test_runner_worker_switches_only_apply_to_mte(self):
+        source = (self.root / "script/test_graph2.sh").read_text(encoding="utf-8")
+        for backend in ("mte", "callback"):
+            updated = self.runner.configured_source(
+                source, backend, "/tmp/lib.so", False, "allocated", "atomic", "spin"
+            )
+            _, command, _, _ = self.runner.launch_spec(updated, "python", 1, None, 18155)
+            config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
+            expected = ("allocated", "atomic", "spin") if backend == "mte" else ("all", "locked", "yield")
+            self.assertEqual(
+                tuple(config[key] for key in ("host_sync_scan_mode", "host_sync_idle_probe", "host_sync_idle_mode")),
+                expected,
+            )
 
     def test_capture_slots_and_submission_order(self):
         obj, calls = self.dispatcher(), []
@@ -274,6 +354,9 @@ class MoeHostSyncTests(unittest.TestCase):
         new = json.loads(after[after.index("--additional-config") + 1])["expert_offload_config"]
         self.assertEqual(new.pop("host_sync_backend"), "mte")
         self.assertEqual(new.pop("host_sync_library"), "/tmp/libhost_sync_device.so")
+        self.assertEqual(new.pop("host_sync_scan_mode"), "all")
+        self.assertEqual(new.pop("host_sync_idle_probe"), "locked")
+        self.assertEqual(new.pop("host_sync_idle_mode"), "yield")
         self.assertEqual(new, old)
         self.assertFalse(any(not word.strip() for word in after))
 
