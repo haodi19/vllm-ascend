@@ -30,6 +30,13 @@ class MoeHostSyncTests(unittest.TestCase):
         self.module.validate_host_sync_config({})
         self.module.validate_host_sync_config({"host_sync_backend": "callback"})
 
+    def test_bounded_wait_cannot_be_enabled_without_completion_guard(self):
+        with self.assertRaisesRegex(ValueError, "completion guard"):
+            self.module.validate_host_sync_config({"host_sync_diagnose_prefetch_poll_budget": 1000})
+        for value in (-1, True, 10_000_001):
+            with self.assertRaises(ValueError):
+                self.module.validate_host_sync_config({"host_sync_diagnose_prefetch_poll_budget": value})
+
     def test_profile_parser_failure_overrides_export_success(self):
         report = {"profile_status": "complete", "request_us": 123, "mstx_trace_occurrences": 0}
         log = "profiler.py: Task [CANNTimelineParser] run failed.\nEngineDeadError"
@@ -307,6 +314,8 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.publish, obj.wait = Mock(), Mock()
         obj.manager, obj.completed = SimpleNamespace(_cb_failures=0, offload_config=SimpleNamespace()), 0
         obj.report_wait_streams = set()
+        obj.report_wait_samples = 0
+        obj.warmup_wait = Mock()
         obj.active_callback = None
         obj.allocated_scan = False
         obj.session = Mock()
@@ -346,6 +355,35 @@ class MoeHostSyncTests(unittest.TestCase):
                 obj._report_wait_completion(2)
         obj.publish.assert_not_called()
         obj.wait.assert_not_called()
+
+    def test_bounded_prefetch_always_has_following_report_guard(self):
+        obj = self.dispatcher()
+        prefetch = SimpleNamespace(npu_stream=55)
+        obj.manager._prefetch_stream = prefetch
+        obj.manager.offload_config = SimpleNamespace(
+            host_sync_diagnose_prefetch_report_wait=True, host_sync_diagnose_prefetch_poll_budget=1000000
+        )
+        events = Mock()
+        obj.publish, obj.warmup_wait = events.publish, events.bounded_wait
+        npu = SimpleNamespace(_subscribe_report=events.subscribe, _launch_host_func=events.report_guard)
+        with patch.dict(sys.modules, torch_npu=SimpleNamespace(npu=npu)), patch("builtins.print"):
+            obj.launch(prefetch, Mock(), ())
+        names = [entry[0] for entry in events.mock_calls]
+        self.assertEqual(names, ["publish", "bounded_wait", "subscribe", "report_guard"])
+        self.assertEqual(events.bounded_wait.call_args.args[-1], 1000000)
+        obj.wait.assert_not_called()
+
+    def test_bounded_wait_reports_pending_then_matching_completion(self):
+        obj = self.dispatcher()
+        obj.manager.offload_config.host_sync_diagnose_prefetch_poll_budget = 1000
+        obj.session.snapshot.return_value = {"request_generation": 1, "done_generation": 0}
+        obj.session.wait.return_value = {"done_generation": 1}
+        with patch("builtins.print") as output:
+            obj._report_wait_completion(2)
+        text = "\n".join(entry.args[0] for entry in output.call_args_list)
+        self.assertIn('"done_at_report_entry": 0', text)
+        self.assertIn('"done": 1', text)
+        obj.session.wait.assert_called_once_with(2, 1, timeout_ms=30000)
 
     def test_allocated_prefix_published_after_entry_before_device(self):
         obj = self.dispatcher()

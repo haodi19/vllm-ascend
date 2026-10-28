@@ -378,3 +378,33 @@ profile 仍为 invalid：同线程初始化错误、CANNTimelineParser/RelationP
 失败、MSTX 标记数为 0，engine_error_seen=true。请求结果成功和采集阶段故障要分开记录；
 目前不能确定 EngineDeadError 是 profiler 故障引起，不能把两者时间上的相邻当作已证实因果。
 报告线程等待保留为诊断对照，不启用为默认优化，更不能称为已经完成纯轮询方案。
+
+## AIV 退出前后完成状态实验
+
+仅替换报告线程等待已经得到触发条件线索，但没有解释为什么。下一轮保留真实预取 AIV
+等待，设置有限轮询预算，并紧接一个报告线程完成守卫：AIV 退出不代表权重就绪，
+后面的阻塞回调仍等待本槽本轮 done，成功前不允许图继续消费权重。
+默认纯 MTE 路径不变，按需仍使用 strict AIV wait；有限预算只用于这项诊断。
+
+使用 `--diagnose-prefetch-poll-budget 1000000` 自动启用报告线程守卫。记录前八次预取：
+
+- `AIV_EXIT`：报告回调开始时，AIV 已退出；读取 request、done、error 及正在执行的 worker。
+- `AFTER_AIV_EXIT`：原生 worker 真正完成，记录完成代数及报告回调守卫耗时。
+
+如果 AIV 退出后仍未 done，而 worker 随后完成，结合此前 strict wait 超过十秒仍不完成，
+将提供等待驻留与拷贝推进关系的更强证据。但单次预算耗尽也可能只是工作量超出预算，
+还需结合原始 ACL 拷贝阶段记录，不能单凭 done_at_report_entry=0 宣布资源死锁。
+报告回调守卫耗时是 Host 测量，包含调度和打印，不是精确设备空泡时间。
+若守卫也超时，则该实验没有解除触发条件，进程仍会退出，不伪造完成信号。
+
+```bash
+python -B script/run_moe_host_sync.py --backend mte --npu 0 \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --worker-scan all --worker-probe locked --worker-idle yield \
+  --diagnose-native-wait --diagnose-prefetch-poll-budget 1000000 \
+  --requests 1 --warmup-requests 1 --request-timeout 180 --profile-timeout 120
+```
+
+本轮只判读交接和拷贝推进证据，不依赖已知存在问题的 profiler 导出。
+正常模型配置不启用此选项；禁止将有界等待移除后续完成守卫单独用于推理。

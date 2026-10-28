@@ -32,8 +32,10 @@ def configured_source(
     diagnose_split_scale=False,
     diagnose_scale_context=False,
     diagnose_prefetch_report_wait=False,
+    diagnose_prefetch_poll_budget=0,
 ):
     diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
+    diagnose_prefetch_report_wait = diagnose_prefetch_report_wait or bool(diagnose_prefetch_poll_budget)
     start = re.search(r"(?m)^vllm\s+serve\s+", source)
     if start is None:
         raise ValueError("Missing vllm serve command")
@@ -57,6 +59,8 @@ def configured_source(
         offload["host_sync_diagnose_scale_context"] = backend == "mte"
     if diagnose_prefetch_report_wait:
         offload["host_sync_diagnose_prefetch_report_wait"] = backend == "mte"
+    if diagnose_prefetch_poll_budget:
+        offload["host_sync_diagnose_prefetch_poll_budget"] = diagnose_prefetch_poll_budget if backend == "mte" else 0
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -76,6 +80,8 @@ def failure_excerpt(text):
         ("[MOE-MTE FATAL]", 1),
         ("[MOE-MTE STREAM_MAP]", 1),
         ("[MOE-MTE WAIT_CONTROL]", 1),
+        ("[MOE-MTE AIV_EXIT]", 8),
+        ("[MOE-MTE AFTER_AIV_EXIT]", 8),
         ("[MOE-MTE PENDING]", 1),
         ("[MOE-MTE ACL_DETAIL]", 1),
         ("[MOE-MTE SCALE_CONTEXT]", 1),
@@ -144,6 +150,12 @@ def main():
     parser.add_argument("--worker-probe", choices=("locked", "atomic"), default="locked")
     parser.add_argument("--worker-idle", choices=("yield", "spin"), default="yield")
     parser.add_argument(
+        "--diagnose-prefetch-poll-budget",
+        type=int,
+        default=0,
+        help="Bounded AIV followed by mandatory report completion guard; diagnostic only",
+    )
+    parser.add_argument(
         "--diagnose-prefetch-report-wait",
         action="store_true",
         help="Control experiment: replace prefetch AIV wait only; keep native worker and MTE publish",
@@ -181,6 +193,10 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
+    if not 0 <= args.diagnose_prefetch_poll_budget <= 10_000_000:
+        parser.error("prefetch poll budget must be 0..10000000")
+    if args.diagnose_prefetch_poll_budget:
+        args.diagnose_prefetch_report_wait = True
     if args.diagnose_scale_context:
         args.diagnose_split_scale = True
     if args.diagnose_split_scale:
@@ -313,6 +329,7 @@ def run(args, root):
                 args.diagnose_split_scale,
                 args.diagnose_scale_context,
                 args.diagnose_prefetch_report_wait,
+                args.diagnose_prefetch_poll_budget,
             ),
             "python",
             env,
@@ -329,7 +346,7 @@ def run(args, root):
             if args.diagnose_prefetch_report_wait:
                 if "[MOE-MTE WAIT_CONTROL]" not in log:
                     raise RuntimeError("Missing evidence that prefetch report-wait control was used")
-            if args.diagnose_load_stages:
+            if args.diagnose_load_stages or args.diagnose_prefetch_poll_budget:
                 print(f"DIAGNOSTIC EXCERPT (full log: {directory / 'inference_python.log'}):", flush=True)
                 print(failure_excerpt(log), flush=True)
             if "[MOE-MTE] first real offload callback completed" not in log:

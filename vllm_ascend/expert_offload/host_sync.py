@@ -27,6 +27,11 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    budget = config.get("host_sync_diagnose_prefetch_poll_budget", 0)
+    if type(budget) is not int or not 0 <= budget <= 10_000_000:
+        raise ValueError("host_sync_diagnose_prefetch_poll_budget must be an integer in 0..10000000")
+    if budget and not config.get("host_sync_diagnose_prefetch_report_wait", False):
+        raise ValueError("bounded prefetch wait requires report completion guard")
     if not isinstance(config.get("host_sync_diagnose_prefetch_report_wait", False), bool):
         raise ValueError("host_sync_diagnose_prefetch_report_wait must be boolean")
     if not isinstance(config.get("host_sync_diagnose_scale_context", False), bool):
@@ -178,6 +183,7 @@ class MteHostDispatcher:
         self.entries = [None] * self.SLOT_CAPACITY
         self.entry_streams = [None] * self.SLOT_CAPACITY
         self.report_wait_streams = set()
+        self.report_wait_samples = 0
         self.next_slot = 1
         self.completed = 0
         self.load_diagnostic_batches = 0
@@ -463,11 +469,18 @@ class MteHostDispatcher:
         ):
             import torch_npu  # Optional diagnostic path only.
 
+            budget = getattr(self.manager.offload_config, "host_sync_diagnose_prefetch_poll_budget", 0)
+            if budget:
+                # A report callback immediately after this kernel still guards
+                # consumers until actual completion. Never use bounded wait alone.
+                self.warmup_wait(pointer, request + self.done_offset, state, budget)
             if pointer not in self.report_wait_streams:
                 torch_npu.npu._subscribe_report(stream)
                 self.report_wait_streams.add(pointer)
                 print(
-                    "[MOE-MTE WAIT_CONTROL] prefetch=report_wait; request=MTE; worker=native; reactive=AIV", flush=True
+                    "[MOE-MTE WAIT_CONTROL] prefetch=report_wait; request=MTE; worker=native; reactive=AIV; "
+                    f"bounded_aiv_polls={budget}",
+                    flush=True,
                 )
             torch_npu.npu._launch_host_func(stream, self._report_wait_completion, slot)
         else:
@@ -479,12 +492,45 @@ class MteHostDispatcher:
         # Session.wait releases GIL and its mutex while waiting, so the worker
         # can run. Failure must never release the graph to consume stale data.
         try:
-            generation = self.session.snapshot(slot)["request_generation"]
+            snapshot = self.session.snapshot(slot)
+            generation = snapshot["request_generation"]
             if generation <= 0:
                 raise RuntimeError("report wait ran before request publication")
+            budget = getattr(self.manager.offload_config, "host_sync_diagnose_prefetch_poll_budget", 0)
+            record = budget and self.report_wait_samples < 8
+            begin = time.perf_counter_ns()
+            if record:
+                self.report_wait_samples += 1
+                print(
+                    "[MOE-MTE AIV_EXIT] "
+                    + json.dumps(
+                        {
+                            "slot": slot,
+                            "poll_budget": budget,
+                            "generation": generation,
+                            "done_at_report_entry": snapshot.get("done_generation"),
+                            "error_at_report_entry": snapshot.get("error_generation"),
+                            "active_worker": self.active_callback,
+                        }
+                    ),
+                    flush=True,
+                )
             result = self.session.wait(slot, generation, timeout_ms=self.REPORT_WAIT_TIMEOUT_MS)
             if result["done_generation"] != generation:
                 raise RuntimeError("report wait returned without matching completion")
+            if record:
+                print(
+                    "[MOE-MTE AFTER_AIV_EXIT] "
+                    + json.dumps(
+                        {
+                            "slot": slot,
+                            "generation": generation,
+                            "done": result["done_generation"],
+                            "report_guard_us": (time.perf_counter_ns() - begin) / 1000,
+                        }
+                    ),
+                    flush=True,
+                )
         except BaseException as exc:
             self._fatal(f"report wait slot={slot}: {exc}")
 
