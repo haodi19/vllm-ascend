@@ -95,6 +95,23 @@ def failure_excerpt(text):
     )
 
 
+def assess_profile_report(report, service_log):
+    """Request success and an exported filename do not validate profiler output."""
+    errors = []
+    for line in service_log.splitlines():
+        if ("profiler.py" in line and "run failed" in line) or (
+            "External init callback must run in same thread" in line
+        ):
+            errors.append(line.strip()[:500])
+    if errors:
+        report["profile_status"] = "invalid"
+    elif report.get("profile_status") == "complete" and report.get("mstx_trace_occurrences") == 0:
+        report["profile_status"] = "unverified"
+    report["profile_errors"] = list(dict.fromkeys(errors))[:4]
+    report["engine_error_seen"] = "EngineDeadError" in service_log
+    return report
+
+
 def prepare_runtime_artifacts(source, target):
     """Copy missing build artifacts only; never replace source code or existing files."""
     source, target = source.resolve(), target.resolve()
@@ -300,8 +317,9 @@ def run(args, root):
             "python",
             env,
         )
+        log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
+        assess_profile_report(reports[backend], log)
         if backend == "mte":
-            log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
             expected_policy = (
                 f"[MOE-MTE WORKER] scan={args.worker_scan} probe={args.worker_probe} idle={args.worker_idle}"
             )
@@ -325,6 +343,8 @@ def run(args, root):
                     "digests": reports[backend]["digests"],
                     "usage": reports[backend]["usage"],
                     "profile_status": reports[backend]["profile_status"],
+                    "profile_errors": reports[backend]["profile_errors"],
+                    "engine_error_seen": reports[backend]["engine_error_seen"],
                 }
             ),
             flush=True,

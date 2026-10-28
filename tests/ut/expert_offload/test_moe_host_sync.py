@@ -30,6 +30,23 @@ class MoeHostSyncTests(unittest.TestCase):
         self.module.validate_host_sync_config({})
         self.module.validate_host_sync_config({"host_sync_backend": "callback"})
 
+    def test_profile_parser_failure_overrides_export_success(self):
+        report = {"profile_status": "complete", "request_us": 123, "mstx_trace_occurrences": 0}
+        log = "profiler.py: Task [CANNTimelineParser] run failed.\nEngineDeadError"
+        self.runner.assess_profile_report(report, log)
+        self.assertEqual(report["profile_status"], "invalid")
+        self.assertEqual(report["request_us"], 123)
+        self.assertTrue(report["engine_error_seen"])
+        self.assertEqual(len(report["profile_errors"]), 1)
+
+    def test_missing_mstx_is_unverified_not_success(self):
+        report = {"profile_status": "complete", "mstx_trace_occurrences": 0}
+        self.runner.assess_profile_report(report, "")
+        self.assertEqual(report["profile_status"], "unverified")
+        report = {"profile_status": "timeout", "mstx_trace_occurrences": 0}
+        self.runner.assess_profile_report(report, "")
+        self.assertEqual(report["profile_status"], "timeout")
+
     def test_acl_error_detail_handles_null_and_missing_api(self):
         for raw, expected in ((b"task detail", "task detail"), (None, "<no recent ACL error>")):
             library = SimpleNamespace(aclGetRecentErrMsg=Mock(return_value=raw))

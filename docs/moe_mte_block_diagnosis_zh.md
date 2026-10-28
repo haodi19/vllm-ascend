@@ -328,3 +328,28 @@ python -B script/run_moe_host_sync.py --backend mte --npu 0 \
 
 不要同时加入 `--diagnose-scale-context` 或 `--diagnose-split-scale`。返回 summary.txt 即可，
 失败时自动附加 Runtime 日志。正常配置默认关闭此开关，仍使用原有 MTE 等待方式。
+
+## 预取报告线程等待对照完成推理
+
+实验 `moe_host_sync_d0b14946` 明确打印 `prefetch=report_wait; request=MTE;
+worker=native; reactive=AIV`，预热和一条测量请求完成，输出 5 个 token，
+摘要为 `21e9f347a4cd40b1d4c2263761c4737c6543bdc4027b2c3ade06ce19f176621a`。
+原始 scale Tensor 拷贝和后续 scale_refresh 均继续执行，诊断已推进到第八批。
+请求耗时 3272.343 ms，但本轮不是性能对照，不能据此宣称提速。
+
+与此前原生 worker + 预取 AIV 等待反复在第二批失败相比，本轮提供了较强的触发条件证据：
+保留原生 worker、原始权重布局和拷贝时，更换预取等待机制即可让本次推理完成。
+这说明 CPU 重排并非完成原始拷贝的必需条件，也不支持仅因 SyncLaunchStream 或
+原生 worker 存在就必然阻塞的解释。但跨轮实验不是相同设备负载下的严格重复对照，
+且等待实现改变了调度与时序；具体 Runtime 调度、资源或依赖原因尚未证实。
+不能把报告线程等待称为最终的纯轮询优化或已根治所有输入。
+
+同时本轮 profile 不合格：日志出现 `External init callback must run in same thread as
+registerClient`、`CANNTimelineParser run failed`，MSTX 标记数为 0，间隔分析也失败。
+已有请求完成不因此被抹去，但不能用此 profile 分析空泡或证明交接收益；后续还出现
+EngineDeadError，服务完整生命周期也不能标为通过。
+
+修正结果判定：本入口在读取完整服务日志后，将明确解析失败标记为 profile_status=invalid，
+只有缺少预期 MSTX 标记而没有明确解析错误时标记为 unverified，同时单独记录
+engine_error_seen。旧 summary 中的 complete 是错误的有效性结论，不能继续沿用。
+本次只修正结果记录，不宣称解决 profiler 的线程初始化或解析问题。
