@@ -89,6 +89,19 @@ def recent_acl_error(library):
         return f"<ACL error detail unavailable: {exc}>"
 
 
+def runtime_stream_identity(library, pointer):
+    """Query Runtime ID, not the Python stream index or pointer address."""
+    try:
+        query = library.aclrtStreamGetId
+        query.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
+        query.restype = ctypes.c_int
+        stream_id = ctypes.c_int32(-1)
+        code = query(pointer, ctypes.byref(stream_id))
+        return {"pointer": pointer, "code": code, "stream_id": stream_id.value if code == 0 else None}
+    except Exception as exc:
+        return {"pointer": pointer, "query_error": str(exc)}
+
+
 def describe_npu_tensor(torch_module, value):
     # Diagnostic metadata only; no cpu(), item(), tensor contents or synchronization.
     import torch_npu
@@ -256,6 +269,17 @@ class MteHostDispatcher:
                 flush=True,
             )
             library = ctypes.CDLL("libascendcl.so")
+            identities = {"load": runtime_stream_identity(library, raw_stream)}
+            for entry_slot in range(1, self.next_slot):
+                pointer = self.entry_streams[entry_slot]
+                if pointer is not None and str(pointer) not in identities:
+                    fn, _ = self.entries[entry_slot]
+                    identities[str(pointer)] = {
+                        **runtime_stream_identity(library, pointer),
+                        "example_slot": entry_slot,
+                        "callback": getattr(fn, "__name__", type(fn).__name__),
+                    }
+            print("[MOE-MTE STREAM_MAP] " + json.dumps(identities), flush=True)
             sync_native = library.aclrtSynchronizeStreamWithTimeout
             sync_native.argtypes = [ctypes.c_void_p, ctypes.c_int32]
             sync_native.restype = ctypes.c_int
@@ -370,6 +394,23 @@ class MteHostDispatcher:
             f"[MOE-MTE DIAGNOSTIC BEGIN] pending_slot={slot} state={state}",
             f"active_callback={active}; completed={self.completed}; captured_slots={self.next_slot - 1}",
         ]
+        pending_entries = []
+        for entry_slot in range(1, self.next_slot):
+            snapshot = self.session.snapshot(entry_slot)
+            if not isinstance(snapshot, dict):
+                continue
+            if snapshot.get("request_generation", 0) > snapshot.get("done_generation", 0):
+                fn, args = self.entries[entry_slot]
+                pending_entries.append(
+                    {
+                        "slot": entry_slot,
+                        "stream_pointer": self.entry_streams[entry_slot],
+                        "callback": getattr(fn, "__name__", type(fn).__name__),
+                        "layer": args[3] if isinstance(args, tuple) and len(args) > 3 else "unknown",
+                        "state": snapshot,
+                    }
+                )
+        lines.append("[MOE-MTE PENDING] " + json.dumps(pending_entries))
         for selected in sorted({slot, active[0] if active else slot}):
             fn, args = self.entries[selected]
             layer = args[3] if isinstance(args, tuple) and len(args) > 3 else "unknown"

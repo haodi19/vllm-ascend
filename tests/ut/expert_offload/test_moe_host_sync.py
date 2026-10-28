@@ -36,6 +36,37 @@ class MoeHostSyncTests(unittest.TestCase):
             self.assertEqual(self.module.recent_acl_error(library), expected)
         self.assertIn("unavailable", self.module.recent_acl_error(SimpleNamespace()))
 
+    def test_runtime_stream_id_is_distinct_from_pointer(self):
+        def query(pointer, output):
+            self.assertEqual(pointer, 12345)
+            output._obj.value = 27
+            return 0
+
+        library = SimpleNamespace(aclrtStreamGetId=Mock(side_effect=query))
+        self.assertEqual(
+            self.module.runtime_stream_identity(library, 12345), {"pointer": 12345, "code": 0, "stream_id": 27}
+        )
+        self.assertIn("query_error", self.module.runtime_stream_identity(SimpleNamespace(), 12345))
+
+    def test_stall_lists_pending_slots_without_device_access(self):
+        obj = self.dispatcher()
+        obj.next_slot = 3
+        obj.entries[1] = obj.entries[2] = (lambda args: None, (None, None, None, 7))
+        obj.entry_streams[1:3] = [111, 222]
+        obj.session.snapshot.side_effect = lambda slot: {
+            "request_generation": 1,
+            "done_generation": 1 if slot == 1 else 0,
+        }
+        with patch("builtins.print") as output:
+            obj._dump_stall(2, {})
+        text = output.call_args.args[0]
+        pending = next(line for line in text.splitlines() if line.startswith("[MOE-MTE PENDING]"))
+        records = json.loads(pending.split("] ", 1)[1])
+        self.assertEqual([record["slot"] for record in records], [2])
+        self.assertEqual(records[0]["stream_pointer"], 222)
+        obj.publish.assert_not_called()
+        obj.wait.assert_not_called()
+
     def test_context_probes_stop_on_first_failed_checkpoint(self):
         obj = self.dispatcher()
         contiguous, strided = Mock(), Mock()

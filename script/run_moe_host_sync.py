@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from inspect_mte_runtime_task import inspect_run
 from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, run_step
 from run_host_sync_stage2 import target_cmake_args
 from run_host_sync_stage3 import select_build_directory
@@ -70,6 +71,8 @@ def failure_excerpt(text):
         ("active_callback=", 1),
         ("callback=_", 1),
         ("[MOE-MTE FATAL]", 1),
+        ("[MOE-MTE STREAM_MAP]", 1),
+        ("[MOE-MTE PENDING]", 1),
         ("[MOE-MTE ACL_DETAIL]", 1),
         ("[MOE-MTE SCALE_CONTEXT]", 1),
         ("[MOE-MTE PROBE_TARGET]", 2),
@@ -178,6 +181,11 @@ def main():
                     f"SERVICE LOG TAIL: {log}\n" + failure_excerpt(log.read_text(encoding="utf-8", errors="replace")),
                     flush=True,
                 )
+            if args.diagnose_native_wait:
+                try:
+                    inspect_run(root)
+                except Exception as log_error:
+                    print(f"Runtime log extraction unavailable: {log_error}", flush=True)
             return 1
 
 

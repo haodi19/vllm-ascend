@@ -44,14 +44,10 @@ def select_lines(lines, stream, task):
     return [(index + 1, lines[index][:1200]) for index in sorted(selected)[-MAX_LINES:]]
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("run_dir", type=Path)
-    parser.add_argument("--log-root", type=Path, action="append", default=[])
-    args = parser.parse_args()
-    service = args.run_dir / "mte/inference_python.log"
+def inspect_run(run_dir, log_roots=()):
+    service = Path(run_dir) / "mte/inference_python.log"
     if not service.is_file():
-        parser.error(f"缺少服务日志：{service}")
+        raise ValueError(f"缺少服务日志：{service}")
     text = service.read_text(encoding="utf-8", errors="replace")
     pid, stream, task = failure_identity(text)
     print(f"READ ONLY: pid={pid}; stream_id={stream}; task_id={task}")
@@ -60,7 +56,7 @@ def main():
     for line in text.splitlines():
         if "[MOE-MTE ACL_DETAIL]" in line:
             print(line[:2400])
-    roots = args.log_root or [Path.home() / "ascend/log", Path("/var/log/npu/slog"), Path("/usr/slog")]
+    roots = log_roots or [Path.home() / "ascend/log", Path("/var/log/npu/slog"), Path("/usr/slog")]
     files = []
     seen = set()
     pid_pattern = re.compile(rf"(?<!\d){pid}(?!\d)")
@@ -105,6 +101,14 @@ def main():
     if not files:
         print("未发现该 PID 命名的日志；可能目录不同、日志轮转或日志未开启，不能据此判断任务不存在。")
     print("完成；无模型启动、无文件写入。请返回以上控制台输出。")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--log-root", type=Path, action="append", default=[])
+    args = parser.parse_args()
+    inspect_run(args.run_dir, args.log_root)
 
 
 if __name__ == "__main__":

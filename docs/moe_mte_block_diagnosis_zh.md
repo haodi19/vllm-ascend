@@ -268,3 +268,27 @@ python -B script/inspect_mte_runtime_task.py bench_results/moe_host_sync_a6a6f2c
 最多输出 70 行任务线索。可用 `--log-root 路径` 指定实际目录。
 日志没有开启、发生轮转、文件命名不含 PID 或信息位于读取范围外时，可能无结果；
 不能把无结果当作不存在对应任务。附近任务或关键词行只是线索，不能直接认定为因果链。
+
+## Runtime 超时快照与流身份核对
+
+上述进程的 plog 在同一超时快照中列出：流 20/task 2、流 22/task 64、
+流 27/task 773 是 KERNEL_AIVEC；流 23、49、55、57、59 是 EVENT_WAIT；
+流 61/task 1358 是 NOTIFY_WAIT，NotifyId=704。
+这不是 kernel 名称表，也不证明这些任务同时占据执行核。事件等待可能只是上游停顿的后果，
+不能把多个 WAIT 直接解释为死锁，更不能按相邻日志行建立依赖边。
+
+为减少多轮交互，原诊断入口现在同时记录：
+
+- `STREAM_MAP`：通过 aclrtStreamGetId 查询加载流和捕获交接流的 Runtime ID，
+  同时保留句柄、代表槽位和回调名称。查询接口不可用时明确标记，不猜编号。
+- `PENDING`：超时快照中 request_generation 大于 done_generation 的所有交接槽位，
+  包含流句柄、回调类别和层号。它是 CPU 依次读取的状态快照，并非设备原子快照。
+- 失败后自动提取同一 PID 的 Runtime 日志，无需再单独运行提取命令。
+
+接口依据：[aclrtStreamGetId](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclpythondevg_01_1038.html)。
+图执行可能使用内部调度流，若捕获时交接流 ID 与超时快照不一致，不能强行配对，
+仍需图任务映射证据。PENDING 用于区分一个已发布任务未完成与多个已发布任务积压，
+不能揭示尚未执行到 publish 的图节点。
+
+继续使用上一节 `--diagnose-scale-context` 的完整模型命令，返回同一份 summary 即可。
+本次不改变交接、拷贝或等待策略，仅补充可核对的身份信息和自动日志提取。
