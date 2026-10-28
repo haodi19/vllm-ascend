@@ -381,10 +381,18 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.wait.assert_not_called()
 
     def test_error_summary_keeps_diagnostic_before_shutdown_tail(self):
-        block = "[MOE-MTE DIAGNOSTIC BEGIN]\nworker stack\n[MOE-MTE DIAGNOSTIC END]\n"
+        block = "[MOE-MTE DIAGNOSTIC BEGIN]\nworker stack\n[MOE-MTE FATAL] failed\n"
         result = self.runner.failure_excerpt(block + "shutdown noise\n" * 100)
-        self.assertIn("worker stack", result)
-        self.assertEqual(result.count("shutdown noise"), 70)
+        self.assertIn("DIAGNOSTIC BEGIN", result)
+        self.assertIn("FATAL", result)
+        self.assertNotIn("shutdown noise", result)
+
+    def test_error_summary_bounds_successful_load_output(self):
+        block = "[MOE-MTE LOAD] success COMPLETE\n" * 1000
+        block += "[MOE-MTE LOAD] D2D_TARGET_LAYOUT ACL_WAIT_RETURN code=507046\n[MOE-MTE FATAL] failed"
+        result = self.runner.failure_excerpt(block)
+        self.assertLessEqual(len(result.splitlines()), 20)
+        self.assertIn("D2D_TARGET_LAYOUT", result)
 
     def test_close_synchronizes_before_releasing_lease(self):
         obj = self.dispatcher()

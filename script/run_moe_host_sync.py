@@ -54,17 +54,27 @@ def configured_source(
 
 
 def failure_excerpt(text):
-    """Retain first-cause diagnostics even after HTTP shutdown floods the tail."""
+    """Bound copied output; full stacks and successful copies stay in service log."""
     lines = text.splitlines()
-    selected = set(range(max(0, len(lines) - 70), len(lines)))
-    inside = False
-    for index, line in enumerate(lines):
-        if "[MOE-MTE DIAGNOSTIC BEGIN]" in line:
-            inside = True
-        if inside or "[MOE-MTE" in line:
-            selected.add(index)
-        if "[MOE-MTE DIAGNOSTIC END]" in line:
-            inside = False
+    selected = set()
+    for marker, count in (
+        ("[MOE-MTE LOAD]", 18),
+        ("[MOE-MTE LAYOUT]", 1),
+        ("STREAM_HANDLE_READY", 1),
+        ("[MOE-MTE WORKER]", 1),
+        ("[MOE-MTE DIAGNOSTIC BEGIN]", 1),
+        ("active_callback=", 1),
+        ("callback=_", 1),
+        ("[MOE-MTE FATAL]", 1),
+    ):
+        selected.update([index for index, line in enumerate(lines) if marker in line][-count:])
+    if not any("[MOE-MTE FATAL]" in line for line in lines):
+        errors = [index for index, line in enumerate(lines) if "Error" in line or "ERROR" in line]
+        selected.update(errors[:4] + errors[-4:])
+        if errors:
+            selected.update(range(max(0, errors[0] - 3), min(len(lines), errors[0] + 4)))
+        else:
+            selected.update(range(max(0, len(lines) - 8), len(lines)))
     return "\n".join(lines[index] for index in sorted(selected))
 
 
@@ -263,12 +273,8 @@ def run(args, root):
                 raise RuntimeError("Missing runtime evidence of requested MTE worker policies")
             print(expected_policy, flush=True)
             if args.diagnose_load_stages:
-                print(
-                    "\n".join(
-                        line for line in log.splitlines() if "[MOE-MTE LOAD]" in line or "[MOE-MTE LAYOUT]" in line
-                    ),
-                    flush=True,
-                )
+                print(f"DIAGNOSTIC EXCERPT (full log: {directory / 'inference_python.log'}):", flush=True)
+                print(failure_excerpt(log), flush=True)
             if "[MOE-MTE] first real offload callback completed" not in log:
                 raise RuntimeError("No evidence that real offload callbacks executed through MTE")
         print(
