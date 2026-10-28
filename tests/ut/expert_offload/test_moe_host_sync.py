@@ -30,6 +30,56 @@ class MoeHostSyncTests(unittest.TestCase):
         self.module.validate_host_sync_config({})
         self.module.validate_host_sync_config({"host_sync_backend": "callback"})
 
+    def test_acl_error_detail_handles_null_and_missing_api(self):
+        for raw, expected in ((b"task detail", "task detail"), (None, "<no recent ACL error>")):
+            library = SimpleNamespace(aclGetRecentErrMsg=Mock(return_value=raw))
+            self.assertEqual(self.module.recent_acl_error(library), expected)
+        self.assertIn("unavailable", self.module.recent_acl_error(SimpleNamespace()))
+
+    def test_context_probes_stop_on_first_failed_checkpoint(self):
+        obj = self.dispatcher()
+        contiguous, strided = Mock(), Mock()
+        task = SimpleNamespace(name="scale", destination=Mock())
+        task.destination.stride.return_value = strided.stride.return_value = (2, 128, 1)
+        obj.torch = SimpleNamespace(
+            empty_like=Mock(side_effect=[contiguous, strided]),
+            contiguous_format="contiguous",
+            preserve_format="preserve",
+        )
+        checkpoint = Mock(side_effect=RuntimeError("wait failed"))
+        with (
+            patch.object(self.module, "describe_npu_tensor", return_value={}),
+            patch("builtins.print"),
+            self.assertRaisesRegex(RuntimeError, "wait failed"),
+        ):
+            obj._diagnose_scale_targets(task, Mock(), "scale", checkpoint)
+        self.assertEqual(obj.torch.empty_like.call_count, 1)
+        task.destination.copy_.assert_not_called()
+        strided.copy_.assert_not_called()
+
+    def test_context_probes_preserve_original_target(self):
+        obj = self.dispatcher()
+        contiguous, strided, temporary = Mock(), Mock(), Mock()
+        task = SimpleNamespace(name="scale", destination=Mock())
+        task.destination.stride.return_value = strided.stride.return_value = (2, 128, 1)
+        obj.torch = SimpleNamespace(
+            empty_like=Mock(side_effect=[contiguous, strided]),
+            contiguous_format="contiguous",
+            preserve_format="preserve",
+        )
+        labels = []
+
+        def checkpoint(label, operation):
+            labels.append(label)
+            operation()
+
+        with patch.object(self.module, "describe_npu_tensor", return_value={}), patch("builtins.print"):
+            obj._diagnose_scale_targets(task, temporary, "scale", checkpoint)
+        self.assertEqual(labels, ["scale D2D_CONTIGUOUS", "scale D2D_INDEPENDENT_STRIDED"])
+        contiguous.copy_.assert_called_once_with(temporary, non_blocking=True)
+        strided.copy_.assert_called_once_with(temporary, non_blocking=True)
+        task.destination.copy_.assert_not_called()
+
     def test_load_diagnosis_disabled_does_not_touch_stream(self):
         obj = self.dispatcher()
         obj.manager.offload_config = SimpleNamespace()
@@ -92,6 +142,7 @@ class MoeHostSyncTests(unittest.TestCase):
     def test_split_scale_stops_before_destination_on_h2d_failure(self):
         for fail in (False, True):
             obj = self.dispatcher()
+            obj.manager.offload_config = SimpleNamespace()
             temporary = Mock()
             obj.torch = SimpleNamespace(empty_like=Mock(return_value=temporary), contiguous_format="contiguous")
             task = SimpleNamespace(source=object(), destination=Mock(), non_blocking=True)

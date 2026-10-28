@@ -1019,6 +1019,7 @@ class ExpertOffloadConfig:
         "host_sync_diagnose_load": False,
         "host_sync_diagnose_native_wait": False,  # diagnostic ACL/torch wait split; not performance
         "host_sync_diagnose_split_scale": False,  # diagnostic H2D/D2D split; not a copy optimization
+        "host_sync_diagnose_scale_context": False,  # diagnostic independent D2D targets in real callback
         "host_sync_library": "",
         "cache_recent_window": 32,
         "cache_ema_beta": 0.9,

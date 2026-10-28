@@ -27,6 +27,10 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    if not isinstance(config.get("host_sync_diagnose_scale_context", False), bool):
+        raise ValueError("host_sync_diagnose_scale_context must be boolean")
+    if config.get("host_sync_diagnose_scale_context") and not config.get("host_sync_diagnose_split_scale"):
+        raise ValueError("scale context diagnosis requires split scale diagnosis")
     if not isinstance(config.get("host_sync_diagnose_split_scale", False), bool):
         raise ValueError("host_sync_diagnose_split_scale must be boolean")
     if config.get("host_sync_diagnose_split_scale") and not (
@@ -71,6 +75,31 @@ def describe_copy_object(value):
             result[name] = method()
     if str(getattr(value, "device", "")) == "cpu" and callable(getattr(value, "is_pinned", None)):
         result["is_pinned"] = value.is_pinned()
+    return result
+
+
+def recent_acl_error(library):
+    """Read thread-local Runtime detail immediately after failure, on that worker."""
+    try:
+        getter = library.aclGetRecentErrMsg
+        getter.argtypes, getter.restype = [], ctypes.c_char_p
+        message = getter()
+        return message.decode("utf-8", errors="replace") if message else "<no recent ACL error>"
+    except Exception as exc:
+        return f"<ACL error detail unavailable: {exc}>"
+
+
+def describe_npu_tensor(torch_module, value):
+    # Diagnostic metadata only; no cpu(), item(), tensor contents or synchronization.
+    import torch_npu
+
+    result = describe_copy_object(value)
+    try:
+        result["npu_format"] = torch_npu.get_npu_format(value)
+    except Exception as exc:
+        result["npu_format_error"] = str(exc)
+    result["grad_enabled"] = torch_module.is_grad_enabled()
+    result["inference_mode"] = torch_module.is_inference_mode_enabled()
     return result
 
 
@@ -244,6 +273,7 @@ class MteHostDispatcher:
                 result = sync_native(raw_stream, self.DIAGNOSTIC_WAIT_TIMEOUT_MS)
                 print(f"{prefix} ACL_WAIT_RETURN code={result}", flush=True)
                 if result != 0:
+                    print("[MOE-MTE ACL_DETAIL] " + json.dumps(recent_acl_error(library)), flush=True)
                     self._dump_stall(self.active_callback[0], self.session.snapshot(self.active_callback[0]))
                     self._fatal(f"diagnostic native stream wait failed code={result}; no inference continuation")
                 print(f"{prefix} TORCH_WAIT_BEGIN", flush=True)
@@ -292,9 +322,44 @@ class MteHostDispatcher:
         temporary = self.torch.empty_like(task.destination, memory_format=self.torch.contiguous_format)
         print(f"[MOE-MTE LOAD] {label} TEMP_ALLOC_READY", flush=True)
         checkpoint(f"{label} H2D_CONTIGUOUS", lambda: temporary.copy_(task.source, non_blocking=task.non_blocking))
+        if getattr(self.manager.offload_config, "host_sync_diagnose_scale_context", False):
+            self._diagnose_scale_targets(task, temporary, label, checkpoint)
         checkpoint(f"{label} D2D_TARGET_LAYOUT", lambda: task.destination.copy_(temporary, non_blocking=True))
         # Retain temporary until both checkpoints finish; never publish done
         # or proceed to scale refresh after a failed checkpoint.
+
+    def _diagnose_scale_targets(self, task, temporary, label, checkpoint):
+        print(
+            "[MOE-MTE SCALE_CONTEXT] "
+            + json.dumps(
+                {
+                    "name": task.name,
+                    "temporary": describe_npu_tensor(self.torch, temporary),
+                    "original": describe_npu_tensor(self.torch, task.destination),
+                }
+            ),
+            flush=True,
+        )
+        for kind, template, memory_format in (
+            ("CONTIGUOUS", temporary, self.torch.contiguous_format),
+            ("INDEPENDENT_STRIDED", task.destination, self.torch.preserve_format),
+        ):
+            print(f"[MOE-MTE LOAD] {label} {kind}_ALLOC_BEGIN", flush=True)
+            probe = self.torch.empty_like(template, memory_format=memory_format)
+            print(
+                "[MOE-MTE PROBE_TARGET] "
+                + json.dumps(
+                    {
+                        "kind": kind,
+                        "metadata": describe_npu_tensor(self.torch, probe),
+                    }
+                ),
+                flush=True,
+            )
+            if kind == "INDEPENDENT_STRIDED" and probe.stride() != task.destination.stride():
+                raise RuntimeError("Independent scale probe did not preserve destination stride")
+            checkpoint(f"{label} D2D_{kind}", lambda probe=probe: probe.copy_(temporary, non_blocking=True))
+            # checkpoint finishes before probe can be released/reallocated.
 
     def _dump_stall(self, slot, state):
         # Only on a stalled request, never on the normal callback hot path.

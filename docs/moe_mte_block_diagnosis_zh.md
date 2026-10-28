@@ -201,3 +201,40 @@ publish/wait，再记录 done，计算流等待 done。所有事件在重放期�
 继续需要真实图中的额外条件或设备任务证据；不能把通过当作原问题已解决。
 
 命令仍为 `python -B script/probe_scale_wait_dependency.py --npu 0`，输出只在控制台。
+
+## 分叉汇合实验通过，返回真实模型取证
+
+后续四组全部通过，有界等待均以 state[1]=1 正常退出，实际轮询 226～1074 次，
+没有耗尽预算。由此简单的分叉汇合关系也不足以复现真实阻塞；不能把事件等待直接认定为死锁。
+不再继续扩展已通过的合成图，转回真实模型的第二批 scale 拷贝位置。
+
+新增 `--diagnose-scale-context` 自动包含前述分段诊断，H2D 完成后按顺序检查：
+
+1. `D2D_CONTIGUOUS`：写入独立连续 NPU 目标。
+2. `D2D_INDEPENDENT_STRIDED`：写入独立、相同 stride 的 NPU 目标。
+3. `D2D_TARGET_LAYOUT`：写入原模型的目标张量。
+
+前两项只写临时目标，不改变模型权重；第三项仍执行原目标写入。每项失败立即停止，
+不发布成功。独立非连续目标使用 preserve_format，并检查 stride 与原目标一致；
+它的 storage_offset/底层分配不同，因此只用于区分布局操作与原目标关联条件，不能宣称完全等价。
+这轮改变了分配和时序，若全部通过，应记录为触发条件变化，而不是问题修复。
+
+同时记录临时张量、原目标、探测目标的 NPU format、stride 和 CPU 线程 grad/inference 状态。
+ACL 等待失败后，立刻在同一 worker 线程调用 aclGetRecentErrMsg 获取 Runtime 错误说明，
+再打印 Python 栈并终止。该接口默认读取线程级错误，并会清除所读消息，因此结果立即保存到
+服务日志；不存在消息时明确打印空结果，不凭错误码推断具体任务。
+接口依据：[AscendCL aclGetRecentErrMsg 文档](https://www.hiascend.com/doc_center/source/en/canncommercial/800/apiref/appdevgapi/aclcppdevg_03_0028.html)。
+
+执行：
+
+```bash
+python -B script/run_moe_host_sync.py --backend mte --npu 0 \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --worker-scan all --worker-probe locked --worker-idle yield \
+  --diagnose-scale-context --requests 1 --warmup-requests 1 \
+  --request-timeout 180 --profile-timeout 120
+```
+
+返回精简的 summary.txt 内容。完整错误信息保留在 inference_python.log；summary 单行最多
+2000 字符，并标记截断，避免把大段 Runtime 信息再次变成难以复制的输出。

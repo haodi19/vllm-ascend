@@ -29,7 +29,9 @@ def configured_source(
     idle_mode="yield",
     diagnose_native_wait=False,
     diagnose_split_scale=False,
+    diagnose_scale_context=False,
 ):
+    diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
     start = re.search(r"(?m)^vllm\s+serve\s+", source)
     if start is None:
         raise ValueError("Missing vllm serve command")
@@ -49,6 +51,8 @@ def configured_source(
         offload["host_sync_diagnose_native_wait"] = backend == "mte"
     if diagnose_split_scale:
         offload["host_sync_diagnose_split_scale"] = backend == "mte"
+    if diagnose_scale_context:
+        offload["host_sync_diagnose_scale_context"] = backend == "mte"
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -66,6 +70,9 @@ def failure_excerpt(text):
         ("active_callback=", 1),
         ("callback=_", 1),
         ("[MOE-MTE FATAL]", 1),
+        ("[MOE-MTE ACL_DETAIL]", 1),
+        ("[MOE-MTE SCALE_CONTEXT]", 1),
+        ("[MOE-MTE PROBE_TARGET]", 2),
     ):
         selected.update([index for index, line in enumerate(lines) if marker in line][-count:])
     if not any("[MOE-MTE FATAL]" in line for line in lines):
@@ -75,7 +82,10 @@ def failure_excerpt(text):
             selected.update(range(max(0, errors[0] - 3), min(len(lines), errors[0] + 4)))
         else:
             selected.update(range(max(0, len(lines) - 8), len(lines)))
-    return "\n".join(lines[index] for index in sorted(selected))
+    return "\n".join(
+        lines[index] if len(lines[index]) <= 2000 else lines[index][:2000] + " ... [full text in service log]"
+        for index in sorted(selected)
+    )
 
 
 def prepare_runtime_artifacts(source, target):
@@ -110,6 +120,11 @@ def main():
     parser.add_argument("--worker-probe", choices=("locked", "atomic"), default="locked")
     parser.add_argument("--worker-idle", choices=("yield", "spin"), default="yield")
     parser.add_argument(
+        "--diagnose-scale-context",
+        action="store_true",
+        help="Probe independent D2D targets in real worker; implies split-scale diagnosis",
+    )
+    parser.add_argument(
         "--diagnose-split-scale",
         action="store_true",
         help="Diagnostic only: split scale H2D and device layout copy, implies native wait diagnosis",
@@ -137,6 +152,8 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
+    if args.diagnose_scale_context:
+        args.diagnose_split_scale = True
     if args.diagnose_split_scale:
         args.diagnose_native_wait = True
     if args.diagnose_native_wait:
@@ -260,6 +277,7 @@ def run(args, root):
                 args.worker_idle,
                 args.diagnose_native_wait,
                 args.diagnose_split_scale,
+                args.diagnose_scale_context,
             ),
             "python",
             env,
