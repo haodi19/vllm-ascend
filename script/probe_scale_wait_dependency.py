@@ -12,6 +12,21 @@ import traceback
 from pathlib import Path
 
 
+def capture_exchange(npu, compute, handoff, launch, fork_join):
+    """Record the model's ready -> prefetch -> done -> compute join edges."""
+    if not fork_join:
+        launch()
+        return ()
+    ready, done = npu.Event(), npu.Event()
+    compute.record_event(ready)
+    with npu.stream(handoff):
+        handoff.wait_event(ready)
+        launch()
+        handoff.record_event(done)
+    compute.wait_event(done)
+    return ready, done
+
+
 def child(args):
     # Optional device dependencies belong only to the isolated child.
     import torch
@@ -29,6 +44,8 @@ def child(args):
     sync = acl.aclrtSynchronizeStreamWithTimeout
     sync.argtypes, sync.restype = [ctypes.c_void_p, ctypes.c_int32], ctypes.c_int
     handoff = torch.npu.Stream()
+    compute = torch.npu.Stream()
+    capture_stream = compute if args.topology == "fork_join" else handoff
     load = torch_npu.npu.SyncLaunchStream()
     state = torch.zeros(4, dtype=torch.int64, device="npu")
     # Same shape, stride and element offset as the failed layer-1 scale slot.
@@ -73,19 +90,26 @@ def child(args):
     wait(handoff_pointer, completion, state.data_ptr(), 100_000)
     handoff.synchronize()
     graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph, stream=handoff):
-        publish(handoff_pointer, alias, state.data_ptr())
+
+    def launch():
+        # Flush the ready-event submission before raw kernel launches, just
+        # like MteHostDispatcher.launch in the real prefetch path.
+        pointer = int(handoff.npu_stream)
+        publish(pointer, alias, state.data_ptr())
         if args.polls:
             # Bounded exit is safe ONLY in this isolated graph: there are no
             # expert/model consumers after wait. Never use it in MoE inference.
-            wait(handoff_pointer, completion, state.data_ptr(), args.polls)
-    handoff.synchronize()
+            wait(pointer, completion, state.data_ptr(), args.polls)
+
+    with torch.npu.graph(graph, stream=capture_stream):
+        events = capture_exchange(torch.npu, compute, handoff, launch, args.topology == "fork_join")
+    capture_stream.synchronize()
     for generation in range(2, 5):
         target.zero_()
         torch.npu.synchronize()
-        with torch.npu.stream(handoff):
+        with torch.npu.stream(capture_stream):
             graph.replay()
-        code = sync(int(handoff.npu_stream), 15_000)
+        code = sync(int(capture_stream.npu_stream), 15_000)
         if code:
             raise RuntimeError(f"handoff ACL wait returned {code}; worker errors={errors}")
         session.wait(0, generation, timeout_ms=15_000)
@@ -98,11 +122,19 @@ def child(args):
         print(
             "RESULT "
             + json.dumps(
-                {"polls": args.polls, "round": generation, "state": result, "worker": timings[-1], "values_match": True}
+                {
+                    "topology": args.topology,
+                    "polls": args.polls,
+                    "round": generation,
+                    "state": result,
+                    "worker": timings[-1],
+                    "values_match": True,
+                }
             ),
             flush=True,
         )
     graph.reset()
+    del events  # Retain captured events through every replay and graph reset.
     session.end_device_access(stream_synchronized=True)
     session.stop()
     session.close()
@@ -113,6 +145,7 @@ def main():
     parser.add_argument("--npu", type=int, required=True)
     parser.add_argument("--library", type=Path)
     parser.add_argument("--polls", type=int, default=0)
+    parser.add_argument("--topology", choices=("independent", "fork_join"), default="independent")
     parser.add_argument("--child", action="store_true")
     args = parser.parse_args()
     if args.npu < 0:
@@ -135,11 +168,16 @@ def main():
         args.library = max(candidates, key=lambda path: path.stat().st_mtime)
     args.library = args.library.resolve(strict=True)
     print(f"Library={args.library}; NPU={args.npu}; no model/profile; console output only", flush=True)
-    print("0=publish only; bounded waits=100000/1000000 polls. Poll count is not elapsed time.", flush=True)
+    print("Compare independent graph with compute -> prefetch -> compute fork/join; no model consumers.", flush=True)
     env = os.environ.copy()
     env["ASCEND_RT_VISIBLE_DEVICES"] = str(args.npu)
     results = []
-    for polls in (0, 100_000, 1_000_000):
+    for topology, polls in (
+        ("independent", 100_000),
+        ("fork_join", 0),
+        ("fork_join", 100_000),
+        ("fork_join", 1_000_000),
+    ):
         command = [
             sys.executable,
             "-u",
@@ -152,18 +190,20 @@ def main():
             str(args.library),
             "--polls",
             str(polls),
+            "--topology",
+            topology,
         ]
-        print(f"CASE polls={polls}; timeout=90s", flush=True)
+        print(f"CASE topology={topology} polls={polls}; timeout=90s", flush=True)
         try:
             completed = subprocess.run(command, env=env, timeout=90, check=False)
-            results.append({"polls": polls, "exit": completed.returncode})
+            results.append({"topology": topology, "polls": polls, "exit": completed.returncode})
         except subprocess.TimeoutExpired:
-            results.append({"polls": polls, "timeout": True})
+            results.append({"topology": topology, "polls": polls, "timeout": True})
         if results[-1].get("exit") != 0:
             break
     print("SUMMARY " + json.dumps(results), flush=True)
     print("state[1]=1: completion observed; 3: bounded wait expired. Success here does not prove model safety.")
-    return 0 if len(results) == 3 and all(item.get("exit") == 0 for item in results) else 1
+    return 0 if len(results) == 4 and all(item.get("exit") == 0 for item in results) else 1
 
 
 if __name__ == "__main__":
