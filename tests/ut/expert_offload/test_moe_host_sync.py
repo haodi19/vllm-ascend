@@ -72,6 +72,19 @@ class MoeHostSyncTests(unittest.TestCase):
         )
         self.assertIn("query_error", self.module.runtime_stream_identity(SimpleNamespace(), 12345))
 
+    def test_last_task_query_handles_success_failure_and_missing_symbol(self):
+        def query(output):
+            output._obj.value = 773
+            return 0
+
+        library = SimpleNamespace(aclrtGetThreadLastTaskId=Mock(side_effect=query))
+        result = self.module.runtime_last_task(library)
+        self.assertEqual(result["task_id"], 773)
+        self.assertGreater(result["host_tid"], 0)
+        library.aclrtGetThreadLastTaskId = Mock(return_value=1)
+        self.assertIsNone(self.module.runtime_last_task(library)["task_id"])
+        self.assertIn("query_error", self.module.runtime_last_task(SimpleNamespace()))
+
     def test_stall_lists_pending_slots_without_device_access(self):
         obj = self.dispatcher()
         obj.next_slot = 3

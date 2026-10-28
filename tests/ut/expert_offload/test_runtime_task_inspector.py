@@ -20,6 +20,11 @@ class RuntimeTaskInspectorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.module.failure_identity("HTTP 500")
 
+    def test_exact_pass_excludes_fallback_and_accepts_camelcase(self):
+        self.assertEqual(self.module.select_lines(["KERNEL_AIVEC"], 27, 773, fallback=False), [])
+        line = "launch streamId=27 taskId=773 kernel=example"
+        self.assertEqual(self.module.select_lines([line], 27, 773, fallback=False), [(1, line)])
+
     def test_exact_numbers_do_not_match_longer_task_id(self):
         lines = ["stream_id=27 task_id=7730"] + ["noise"] * 5 + ["stream_id=27 task_id=773"]
         selected = self.module.select_lines(lines, 27, 773)

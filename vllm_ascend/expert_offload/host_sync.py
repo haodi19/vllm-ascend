@@ -109,6 +109,21 @@ def runtime_stream_identity(library, pointer):
         return {"pointer": pointer, "query_error": str(exc)}
 
 
+def runtime_last_task(library):
+    """Last task submitted by this thread; not proof of execution or stream ownership."""
+    result = {"host_tid": threading.get_native_id()}
+    try:
+        query = library.aclrtGetThreadLastTaskId
+        query.argtypes = [ctypes.POINTER(ctypes.c_uint32)]
+        query.restype = ctypes.c_int
+        task_id = ctypes.c_uint32()
+        code = query(ctypes.byref(task_id))
+        result.update(code=code, task_id=task_id.value if code == 0 else None)
+    except Exception as exc:
+        result["query_error"] = str(exc)
+    return result
+
+
 def describe_npu_tensor(torch_module, value):
     # Diagnostic metadata only; no cpu(), item(), tensor contents or synchronization.
     import torch_npu
@@ -305,6 +320,7 @@ class MteHostDispatcher:
             operation()
             print(f"{prefix} SUBMITTED", flush=True)
             if sync_native is not None:
+                print(f"{prefix} LAST_TASK " + json.dumps(runtime_last_task(library)), flush=True)
                 print(
                     f"{prefix} ACL_WAIT_BEGIN stream={raw_stream} timeout_ms={self.DIAGNOSTIC_WAIT_TIMEOUT_MS}",
                     flush=True,
