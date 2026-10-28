@@ -31,6 +31,7 @@ def configured_source(
     diagnose_native_wait=False,
     diagnose_split_scale=False,
     diagnose_scale_context=False,
+    diagnose_prefetch_report_wait=False,
 ):
     diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
     start = re.search(r"(?m)^vllm\s+serve\s+", source)
@@ -54,6 +55,8 @@ def configured_source(
         offload["host_sync_diagnose_split_scale"] = backend == "mte"
     if diagnose_scale_context:
         offload["host_sync_diagnose_scale_context"] = backend == "mte"
+    if diagnose_prefetch_report_wait:
+        offload["host_sync_diagnose_prefetch_report_wait"] = backend == "mte"
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -72,6 +75,7 @@ def failure_excerpt(text):
         ("callback=_", 1),
         ("[MOE-MTE FATAL]", 1),
         ("[MOE-MTE STREAM_MAP]", 1),
+        ("[MOE-MTE WAIT_CONTROL]", 1),
         ("[MOE-MTE PENDING]", 1),
         ("[MOE-MTE ACL_DETAIL]", 1),
         ("[MOE-MTE SCALE_CONTEXT]", 1),
@@ -122,6 +126,11 @@ def main():
     parser.add_argument("--worker-scan", choices=("all", "allocated"), default="all")
     parser.add_argument("--worker-probe", choices=("locked", "atomic"), default="locked")
     parser.add_argument("--worker-idle", choices=("yield", "spin"), default="yield")
+    parser.add_argument(
+        "--diagnose-prefetch-report-wait",
+        action="store_true",
+        help="Control experiment: replace prefetch AIV wait only; keep native worker and MTE publish",
+    )
     parser.add_argument(
         "--diagnose-scale-context",
         action="store_true",
@@ -286,6 +295,7 @@ def run(args, root):
                 args.diagnose_native_wait,
                 args.diagnose_split_scale,
                 args.diagnose_scale_context,
+                args.diagnose_prefetch_report_wait,
             ),
             "python",
             env,
@@ -298,6 +308,9 @@ def run(args, root):
             if expected_policy not in log:
                 raise RuntimeError("Missing runtime evidence of requested MTE worker policies")
             print(expected_policy, flush=True)
+            if args.diagnose_prefetch_report_wait:
+                if "[MOE-MTE WAIT_CONTROL]" not in log:
+                    raise RuntimeError("Missing evidence that prefetch report-wait control was used")
             if args.diagnose_load_stages:
                 print(f"DIAGNOSTIC EXCERPT (full log: {directory / 'inference_python.log'}):", flush=True)
                 print(failure_excerpt(log), flush=True)

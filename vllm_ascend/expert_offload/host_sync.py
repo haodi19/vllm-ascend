@@ -27,6 +27,8 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    if not isinstance(config.get("host_sync_diagnose_prefetch_report_wait", False), bool):
+        raise ValueError("host_sync_diagnose_prefetch_report_wait must be boolean")
     if not isinstance(config.get("host_sync_diagnose_scale_context", False), bool):
         raise ValueError("host_sync_diagnose_scale_context must be boolean")
     if config.get("host_sync_diagnose_scale_context") and not config.get("host_sync_diagnose_split_scale"):
@@ -152,6 +154,7 @@ class MteHostDispatcher:
     WARMUP_MAX_POLLS = 1000000
     DIAGNOSTIC_SECONDS = 10
     DIAGNOSTIC_WAIT_TIMEOUT_MS = 10_000
+    REPORT_WAIT_TIMEOUT_MS = 30_000
 
     def __init__(self, manager, library_path):
         # Optional runtime dependencies are loaded only for the opt-in backend.
@@ -174,6 +177,7 @@ class MteHostDispatcher:
         self.warmup_wait.restype = None
         self.entries = [None] * self.SLOT_CAPACITY
         self.entry_streams = [None] * self.SLOT_CAPACITY
+        self.report_wait_streams = set()
         self.next_slot = 1
         self.completed = 0
         self.load_diagnostic_batches = 0
@@ -453,7 +457,36 @@ class MteHostDispatcher:
         request = self.alias + slot * self.stride
         state = self.state_base + slot * self.STATE_BYTES
         self.publish(pointer, request, state)
-        self.wait(pointer, request + self.done_offset, state)
+        if (
+            getattr(self.manager.offload_config, "host_sync_diagnose_prefetch_report_wait", False)
+            and stream == self.manager._prefetch_stream
+        ):
+            import torch_npu  # Optional diagnostic path only.
+
+            if pointer not in self.report_wait_streams:
+                torch_npu.npu._subscribe_report(stream)
+                self.report_wait_streams.add(pointer)
+                print(
+                    "[MOE-MTE WAIT_CONTROL] prefetch=report_wait; request=MTE; worker=native; reactive=AIV", flush=True
+                )
+            torch_npu.npu._launch_host_func(stream, self._report_wait_completion, slot)
+        else:
+            self.wait(pointer, request + self.done_offset, state)
+
+    def _report_wait_completion(self, slot):
+        # Control experiment: report thread only waits; the native worker still
+        # executes the original callback and publishes done after H2D sync.
+        # Session.wait releases GIL and its mutex while waiting, so the worker
+        # can run. Failure must never release the graph to consume stale data.
+        try:
+            generation = self.session.snapshot(slot)["request_generation"]
+            if generation <= 0:
+                raise RuntimeError("report wait ran before request publication")
+            result = self.session.wait(slot, generation, timeout_ms=self.REPORT_WAIT_TIMEOUT_MS)
+            if result["done_generation"] != generation:
+                raise RuntimeError("report wait returned without matching completion")
+        except BaseException as exc:
+            self._fatal(f"report wait slot={slot}: {exc}")
 
     def _watch(self):
         pending = {}

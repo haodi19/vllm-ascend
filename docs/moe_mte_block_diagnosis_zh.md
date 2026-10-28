@@ -292,3 +292,39 @@ python -B script/inspect_mte_runtime_task.py bench_results/moe_host_sync_a6a6f2c
 
 继续使用上一节 `--diagnose-scale-context` 的完整模型命令，返回同一份 summary 即可。
 本次不改变交接、拷贝或等待策略，仅补充可核对的身份信息和自动日志提取。
+
+## 流映射结果与预取等待方式对照
+
+实验 `moe_host_sync_3250358c` 确认加载流 Runtime ID=27。按需交接捕获流 ID=47，
+预取交接捕获流 ID=56；超时快照的其他 AIVEC 位于 21、23，仍不能直接将它们配对为自定义等待算子。
+PENDING 中只有 slot 2（layer 1 的 `_prefetch_host_cb`），request=1、done=0。
+因此该快照没有显示多个已发布交接请求积压；未发布的图任务不在这项观测范围内。
+独立连续 D2D 仍未完成，H2D 仍已完成。
+
+下一轮使用 `--diagnose-prefetch-report-wait` 做等待方式对照：
+
+1. 预取流保留原来的 MTE publish，继续由设备写入 request_generation。
+2. 原生轮询 worker 仍执行 `_prefetch_host_cb` 和原始权重拷贝，完成 H2D 同步后发布 done。
+3. 仅预取流不再提交 AIV wait，而注册阻塞型 Host 回调，由报告线程调用 Session.wait
+   等待同一槽位本轮 done。Session.wait 在原生代码中释放 GIL，并在等待期间释放 mutex，
+   不占住 worker 执行所需的 GIL 或锁。
+4. 按需交接仍使用原来的 MTE publish + AIV wait。任何完成等待失败都会终止引擎，
+   不提前写 done，不让图消费未完成权重。
+
+这不是最终优化方案，也不是将预取计算整体退回旧回调线程。它只改变预取等待机制，
+仍会改变设备调度和 Host 时序。若通过，支持预取 AIV 等待与真实图组合参与触发问题；
+仍不足以断言具体调度器原因或死锁。若仍失败，该等待方式就不是唯一触发条件。
+
+本轮关闭临时 scale 分段/目标探测，回到原始 Tensor 拷贝；保留逐项原始 ACL 等待诊断：
+
+```bash
+python -B script/run_moe_host_sync.py --backend mte --npu 0 \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --worker-scan all --worker-probe locked --worker-idle yield \
+  --diagnose-native-wait --diagnose-prefetch-report-wait \
+  --requests 1 --warmup-requests 1 --request-timeout 180 --profile-timeout 120
+```
+
+不要同时加入 `--diagnose-scale-context` 或 `--diagnose-split-scale`。返回 summary.txt 即可，
+失败时自动附加 Runtime 日志。正常配置默认关闭此开关，仍使用原有 MTE 等待方式。

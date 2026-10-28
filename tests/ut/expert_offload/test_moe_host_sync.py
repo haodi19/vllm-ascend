@@ -288,11 +288,47 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.SLOT_CAPACITY = 4
         obj.alias, obj.stride, obj.done_offset, obj.state_base = 10000, 1024, 512, 20000
         obj.publish, obj.wait = Mock(), Mock()
-        obj.manager, obj.completed = SimpleNamespace(_cb_failures=0), 0
+        obj.manager, obj.completed = SimpleNamespace(_cb_failures=0, offload_config=SimpleNamespace()), 0
+        obj.report_wait_streams = set()
         obj.active_callback = None
         obj.allocated_scan = False
         obj.session = Mock()
         return obj
+
+    def test_report_wait_control_changes_prefetch_wait_only(self):
+        obj = self.dispatcher()
+        prefetch, reactive = SimpleNamespace(npu_stream=55), SimpleNamespace(npu_stream=66)
+        obj.manager._prefetch_stream = prefetch
+        obj.manager.offload_config.host_sync_diagnose_prefetch_report_wait = True
+        npu = SimpleNamespace(_subscribe_report=Mock(), _launch_host_func=Mock())
+        callback = Mock()
+        with patch.dict(sys.modules, torch_npu=SimpleNamespace(npu=npu)), patch("builtins.print"):
+            obj.launch(prefetch, callback, "prefetch args")
+            obj.launch(reactive, callback, "reactive args")
+        self.assertEqual(obj.publish.call_count, 2)
+        obj.wait.assert_called_once_with(
+            66, obj.alias + 2 * obj.stride + obj.done_offset, obj.state_base + 2 * obj.STATE_BYTES
+        )
+        npu._subscribe_report.assert_called_once_with(prefetch)
+        npu._launch_host_func.assert_called_once_with(prefetch, obj._report_wait_completion, 1)
+        self.assertEqual(obj.entries[1], (callback, "prefetch args"))
+        callback.assert_not_called()
+
+    def test_report_wait_requires_real_worker_completion(self):
+        obj = self.dispatcher()
+        obj.session.snapshot.return_value = {"request_generation": 3}
+        obj.session.wait.return_value = {"done_generation": 3}
+        obj._fatal = Mock(side_effect=RuntimeError("terminated"))
+        obj._report_wait_completion(2)
+        obj.session.wait.assert_called_once_with(2, 3, timeout_ms=30000)
+        obj._fatal.assert_not_called()
+        for result in ({"done_generation": 2}, TimeoutError("pending")):
+            obj.session.wait.side_effect = result if isinstance(result, Exception) else None
+            obj.session.wait.return_value = result
+            with self.assertRaisesRegex(RuntimeError, "terminated"):
+                obj._report_wait_completion(2)
+        obj.publish.assert_not_called()
+        obj.wait.assert_not_called()
 
     def test_allocated_prefix_published_after_entry_before_device(self):
         obj = self.dispatcher()
