@@ -82,6 +82,7 @@ def failure_excerpt(text):
         ("[MOE-MTE WAIT_CONTROL]", 1),
         ("[MOE-MTE AIV_EXIT]", 8),
         ("[MOE-MTE AFTER_AIV_EXIT]", 8),
+        ("[MOE-MTE EXIT_COUNTS]", 4),
         ("[MOE-MTE PENDING]", 1),
         ("[MOE-MTE ACL_DETAIL]", 1),
         ("[MOE-MTE SCALE_CONTEXT]", 1),

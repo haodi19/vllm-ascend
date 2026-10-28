@@ -316,6 +316,9 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.report_wait_streams = set()
         obj.report_wait_samples = 0
         obj.warmup_wait = Mock()
+        obj.wait_states_h = {1: Mock(), 2: Mock()}
+        obj.states = {1: object(), 2: object()}
+        obj.wait_exit_counts = {"completed": 0, "budget": 0}
         obj.active_callback = None
         obj.allocated_scan = False
         obj.session = Mock()
@@ -365,11 +368,13 @@ class MoeHostSyncTests(unittest.TestCase):
         )
         events = Mock()
         obj.publish, obj.warmup_wait = events.publish, events.bounded_wait
+        obj.wait_states_h[1] = SimpleNamespace(copy_=events.exit_record_copy)
         npu = SimpleNamespace(_subscribe_report=events.subscribe, _launch_host_func=events.report_guard)
         with patch.dict(sys.modules, torch_npu=SimpleNamespace(npu=npu)), patch("builtins.print"):
             obj.launch(prefetch, Mock(), ())
         names = [entry[0] for entry in events.mock_calls]
-        self.assertEqual(names, ["publish", "bounded_wait", "subscribe", "report_guard"])
+        self.assertEqual(names, ["publish", "bounded_wait", "exit_record_copy", "subscribe", "report_guard"])
+        events.exit_record_copy.assert_called_once_with(obj.states[1], non_blocking=True)
         self.assertEqual(events.bounded_wait.call_args.args[-1], 1000000)
         obj.wait.assert_not_called()
 
@@ -378,12 +383,23 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.manager.offload_config.host_sync_diagnose_prefetch_poll_budget = 1000
         obj.session.snapshot.return_value = {"request_generation": 1, "done_generation": 0}
         obj.session.wait.return_value = {"done_generation": 1}
+        obj.wait_states_h[2].tolist.return_value = [1, 3, 0, 1000]
         with patch("builtins.print") as output:
             obj._report_wait_completion(2)
         text = "\n".join(entry.args[0] for entry in output.call_args_list)
         self.assertIn('"done_at_report_entry": 0', text)
         self.assertIn('"done": 1', text)
         obj.session.wait.assert_called_once_with(2, 1, timeout_ms=30000)
+
+    def test_bad_device_exit_record_never_releases_report_guard(self):
+        obj = self.dispatcher()
+        obj.manager.offload_config.host_sync_diagnose_prefetch_poll_budget = 1000
+        obj.session.snapshot.return_value = {"request_generation": 1, "done_generation": 0}
+        obj.wait_states_h[2].tolist.return_value = [2, 3, 0, 1000]
+        obj._fatal = Mock(side_effect=RuntimeError("terminated"))
+        with self.assertRaisesRegex(RuntimeError, "terminated"):
+            obj._report_wait_completion(2)
+        obj.session.wait.assert_not_called()
 
     def test_allocated_prefix_published_after_entry_before_device(self):
         obj = self.dispatcher()

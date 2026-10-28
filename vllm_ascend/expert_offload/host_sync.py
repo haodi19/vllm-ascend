@@ -160,6 +160,7 @@ class MteHostDispatcher:
     DIAGNOSTIC_SECONDS = 10
     DIAGNOSTIC_WAIT_TIMEOUT_MS = 10_000
     REPORT_WAIT_TIMEOUT_MS = 30_000
+    WAIT_EXIT_SUMMARY_INTERVAL = 32
 
     def __init__(self, manager, library_path):
         # Optional runtime dependencies are loaded only for the opt-in backend.
@@ -191,6 +192,10 @@ class MteHostDispatcher:
         self.closed = False
         self.stopping = threading.Event()
         self.states = torch.zeros((self.SLOT_CAPACITY, 4), dtype=torch.int64, device="npu")
+        self.wait_states_h = None
+        self.wait_exit_counts = {"completed": 0, "budget": 0}
+        if getattr(manager.offload_config, "host_sync_diagnose_prefetch_poll_budget", 0):
+            self.wait_states_h = torch.empty((self.SLOT_CAPACITY, 4), dtype=torch.int64, pin_memory=True)
         torch.npu.synchronize()
         self.state_base = self.states.data_ptr()
         self.session = hs.Session(slots=self.SLOT_CAPACITY, backend="acl", device_id=torch.npu.current_device())
@@ -474,6 +479,10 @@ class MteHostDispatcher:
                 # A report callback immediately after this kernel still guards
                 # consumers until actual completion. Never use bounded wait alone.
                 self.warmup_wait(pointer, request + self.done_offset, state, budget)
+                # Capture the 32-byte device exit record on the same stream,
+                # before the report callback. Never read device values from
+                # the report thread, which could introduce another dependency.
+                self.wait_states_h[slot].copy_(self.states[slot], non_blocking=True)
             if pointer not in self.report_wait_streams:
                 torch_npu.npu._subscribe_report(stream)
                 self.report_wait_streams.add(pointer)
@@ -497,6 +506,14 @@ class MteHostDispatcher:
             if generation <= 0:
                 raise RuntimeError("report wait ran before request publication")
             budget = getattr(self.manager.offload_config, "host_sync_diagnose_prefetch_poll_budget", 0)
+            device_exit = None
+            if budget:
+                device_exit = self.wait_states_h[slot].tolist()  # Pinned CPU data, D2H precedes callback.
+                if device_exit[0] != generation or device_exit[1] not in (1, 3):
+                    raise RuntimeError(f"unexpected AIV exit record: {device_exit}; generation={generation}")
+                if device_exit[1] == 3 and device_exit[3] != budget:
+                    raise RuntimeError(f"AIV poll count differs from budget: {device_exit}")
+                self.wait_exit_counts["completed" if device_exit[1] == 1 else "budget"] += 1
             record = budget and self.report_wait_samples < 8
             begin = time.perf_counter_ns()
             if record:
@@ -511,6 +528,7 @@ class MteHostDispatcher:
                             "done_at_report_entry": snapshot.get("done_generation"),
                             "error_at_report_entry": snapshot.get("error_generation"),
                             "active_worker": self.active_callback,
+                            "device_exit": device_exit,
                         }
                     ),
                     flush=True,
@@ -531,6 +549,8 @@ class MteHostDispatcher:
                     ),
                     flush=True,
                 )
+            if budget and sum(self.wait_exit_counts.values()) % self.WAIT_EXIT_SUMMARY_INTERVAL == 0:
+                print("[MOE-MTE EXIT_COUNTS] " + json.dumps(self.wait_exit_counts), flush=True)
         except BaseException as exc:
             self._fatal(f"report wait slot={slot}: {exc}")
 
