@@ -457,3 +457,25 @@ python -B script/run_moe_host_sync.py --backend mte --npu 0 \
 本轮目标是给超时任务补充具体下发操作与 kernel 线索；即使匹配成功，也不能仅凭
 下发日志认定任务实际占用了哪些 AIV 核，或直接认定死锁根因。详细日志保留绿区，
 只需返回经检查脱敏的 summary.txt。
+
+## Runtime DEBUG 已确认原始 scale 拷贝对应超时 AIVEC 任务
+
+`moe_host_sync_8e2b8992` 在第二次交接、layer=1 的预取重现阻塞。
+本次 w13、w2 原始拷贝均同步成功；w13_weight_scale 原始拷贝提交返回后同步超时。
+查询返回编号 74901，Runtime 分配和下发日志明确对应
+`stream_id=27, task_id=711, task_sn=74901, KERNEL_AIVEC`，与超时任务一致。
+同一 CPU 线程 66757 的附近下发日志显示 `blockDim=56`。
+这将阻塞定位到原始 scale.copy_ 提交的设备任务，而不是 Python 尚未提交任务。
+`DavidSendTask drvRet=0` 只证明下发接口成功，不能判断该 kernel 尚未调度还是执行中停滞。
+
+本次日志同时证明 task_id=711 在同一进程、同一流中循环复用：更早记录对应
+task_sn=71843 的 MEMCPY_ASYNC。因此不能只凭 stream/task 数字把早期 DMA 与当前
+AIVEC 当成同一个任务。新增只读脚本按 task_sn=最后提交序号提取上下文，并从设备函数
+地址查找注册线索，不启动模型、不写文件。blockDim=56 是下发参数，不能直接等同于
+同时占用 56 个物理核，也尚不能据此断言等待算子与拷贝算子构成资源死锁。
+
+```bash
+python -B script/inspect_mte_task_serial.py bench_results/moe_host_sync_8e2b8992
+```
+
+本轮要补全具体 kernel 身份及调度参数，沿用已有 DEBUG 日志，无需重新进行推理实验。
