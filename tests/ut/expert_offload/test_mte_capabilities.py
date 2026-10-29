@@ -25,6 +25,12 @@ class CapabilityTests(unittest.TestCase):
         """
         self.assertEqual(self.module.declarations(text), ["aclrtExampleDump(void* graph, const char* path);"])
 
+    def test_graph_model_prefix_is_included(self):
+        self.assertEqual(
+            self.module.declarations("aclError aclmdlRIDebugPrint(aclmdlRI modelRI);"),
+            ["aclmdlRIDebugPrint(aclmdlRI modelRI);"],
+        )
+
     def test_fixture_probe_reads_headers_without_running_device_tools(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

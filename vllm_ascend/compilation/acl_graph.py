@@ -94,6 +94,8 @@ class ACLGraphWrapper:
     ):
         self.runnable = runnable
         self.vllm_config = vllm_config
+        offload_config = (vllm_config.additional_config or {}).get("expert_offload_config", {})
+        self._moe_graph_dump = bool(offload_config.get("host_sync_diagnose_graph_dump", False))
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
 
@@ -163,6 +165,10 @@ class ACLGraphWrapper:
             input_addresses = [x.data_ptr() for x in args if isinstance(x, torch.Tensor)]
             entry.input_addresses = input_addresses
             aclgraph = torch.npu.NPUGraph()
+            if self._moe_graph_dump:
+                if not all(callable(getattr(aclgraph, name, None)) for name in ("enable_debug_mode", "debug_dump")):
+                    raise RuntimeError("MoE graph diagnosis requires NPUGraph.enable_debug_mode/debug_dump")
+                aclgraph.enable_debug_mode()
 
             with ExitStack() as stack:
                 if self.aclgraph_options.gc_disable:
@@ -218,6 +224,11 @@ class ACLGraphWrapper:
                             f"Original error:\n{exc}"
                         ) from exc
                     raise
+
+            if self._moe_graph_dump:
+                logger.warning("[MOE-MTE GRAPH_DUMP_BEGIN] mode=%s batch=%s", self.runtime_mode, batch_descriptor)
+                aclgraph.debug_dump()
+                logger.warning("[MOE-MTE GRAPH_DUMP_END] mode=%s batch=%s", self.runtime_mode, batch_descriptor)
 
             # here we always use weak ref for the workspaces
             # to save memory

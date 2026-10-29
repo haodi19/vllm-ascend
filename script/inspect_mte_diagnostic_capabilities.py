@@ -14,7 +14,7 @@ MAX_HEADER_BYTES = 2 * 1024 * 1024
 MAX_APIS = 35
 MAX_TOOLS = 25
 API_PATTERN = re.compile(
-    r"\b(?:aclrt|rt)[A-Za-z0-9_]*(?:Debug|Dump|Snapshot|TaskInfo|TaskId|TaskName|"
+    r"\b(?:aclrt|aclmdl|rt)[A-Za-z0-9_]*(?:Debug|Dump|Snapshot|TaskInfo|TaskId|TaskName|"
     r"ModelInfo|ModelGet|CaptureGet|GraphGet|ExceptionInfo)[A-Za-z0-9_]*\s*\("
 )
 TOOL_PATTERN = re.compile(

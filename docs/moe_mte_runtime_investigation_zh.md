@@ -100,3 +100,33 @@ python -B script/inspect_mte_diagnostic_capabilities.py
 也不能把后续布局绕行当成已针对根因修复。
 
 本材料可经人工检查、脱敏后提供给内部对接人员；没有自动发送任何日志或消息。
+
+## 与 MTE 改造的关系及自主图映射诊断
+
+当前证据支持的是“新增预取 AIV 等待方式参与触发阻塞”，不是“共享内存本身错误”。
+纯 MTE 路径将回调机制换成设备 publish、Host worker 轮询、设备 AIV wait，并为 worker
+使用 SyncLaunchStream。预取报告等待对照保留了共享内存请求发布、原生 worker、
+SyncLaunchStream 和原始拷贝，仅替换预取完成等待，有限请求恢复正常。
+因此，这个对照比笼统地归因于整个 MTE 改造更具体；还不能单独认定 flag 可见性、
+模型图调度、AIV 资源或内部同步中的哪一项是根因。现有证据也不足以断言
+SyncLaunchStream 与其他机制的组合完全无关。
+
+绿区安装了 CANN 9.1.0 与 msdebug。工具文件存在不证明它支持当前型号的在线调试；
+异常回调符号存在也不保证普通流超时会触发所需设备信息。
+前一能力检测脚本遗漏 aclmdl 前缀，导致漏查图模型调试接口，现已修正并加回归测试。
+
+CANN 9.1 官方的
+[aclmdlRIDebugPrint](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1786.html)
+支持950，要求捕获结束后使用有效图实例，打印 device/stream/task 信息。
+本次采用 Torch NPU 的 NPUGraph.enable_debug_mode 与 debug_dump 入口，避免猜测
+内部图句柄或在捕获过程中调用打印。正式默认配置关闭，只有诊断配置显式开启。
+绿区脚本先检查 Python 方法存在，再运行原始纯 MTE 模型，捕获完成后打印图信息。
+该接口不能保证直接给出核上的运行 PC；第一目标是补齐图内任务身份。
+
+```bash
+python -B script/diagnose_mte_graph_mapping.py --npu 7
+```
+
+本轮不分核、不替换等待、不重排权重。完整日志保留本地，只返回 graph_diagnosis.txt。
+该文件报告图打印开始/结束次数及 Runtime 候选记录。接口调用失败、工具输出不包含
+映射或日志被轮转均需明确区分，不能将“开启图打印”本身写成已定位根因。

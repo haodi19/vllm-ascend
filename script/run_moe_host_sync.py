@@ -34,6 +34,7 @@ def configured_source(
     diagnose_prefetch_report_wait=False,
     diagnose_prefetch_poll_budget=0,
     diagnose_load_vector_cores=0,
+    diagnose_graph_dump=False,
 ):
     diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
     diagnose_prefetch_report_wait = diagnose_prefetch_report_wait or bool(diagnose_prefetch_poll_budget)
@@ -45,6 +46,8 @@ def configured_source(
     config = json.loads(words[index])
     offload = config["expert_offload_config"]
     offload["host_sync_backend"] = backend
+    if diagnose_graph_dump:
+        offload["host_sync_diagnose_graph_dump"] = backend == "mte"
     if diagnose_load_vector_cores:
         offload["host_sync_diagnose_load_vector_cores"] = diagnose_load_vector_cores if backend == "mte" else 0
     offload["host_sync_library"] = str(library) if backend == "mte" else ""
@@ -78,6 +81,8 @@ def failure_excerpt(text):
         ("STREAM_HANDLE_READY", 1),
         ("[MOE-MTE WORKER]", 1),
         ("[MOE-MTE VECTOR_LIMIT]", 1),
+        ("[MOE-MTE GRAPH_DUMP_BEGIN]", 4),
+        ("[MOE-MTE GRAPH_DUMP_END]", 4),
         ("[MOE-MTE DIAGNOSTIC BEGIN]", 1),
         ("active_callback=", 1),
         ("callback=_", 1),
@@ -187,6 +192,7 @@ def main():
     )
     parser.add_argument("--test-script", type=Path, default=REPOSITORY_ROOT / "script/test_graph2.sh")
     parser.add_argument("--requests", type=int, default=3)
+    parser.add_argument("--diagnose-graph-dump", action="store_true")
     parser.add_argument("--diagnose-load-vector-cores", type=int, default=0, choices=range(57))
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--startup-timeout", type=int, default=1800)
@@ -339,6 +345,7 @@ def run(args, root):
                 args.diagnose_prefetch_report_wait,
                 args.diagnose_prefetch_poll_budget,
                 args.diagnose_load_vector_cores,
+                args.diagnose_graph_dump,
             ),
             "python",
             env,
