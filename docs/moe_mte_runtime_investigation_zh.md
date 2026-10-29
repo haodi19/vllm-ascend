@@ -251,3 +251,30 @@ KERNEL_TYPE_MIX_AIC_1_2；950 分支的 tiling key 1000 使用 MKSplitCore 实�
 下一步先复用同一份图检查 HcPre 的 block 数、调度模式和 Event 依赖，不重跑模型，
 也不直接修改其跨核同步或调度模式。此次仍沿着“预取 AIV 驻留等待与真实模型算子
 组合导致加载流无法推进”的方向排查，待查对象从路由扩展到快照中实际出现的混合算子。
+
+### HcPre 配置确认及主计算流资源对照
+
+同轮图中 task82 HcPre 的 Numblocks=28、Schem Mode=0，前一任务为 HcPost，
+后一任务为 RmsNorm。stream22/task11 等待的 EVENT_WAIT_13 对应主流 task84 的
+EVENT_RECORD_13，符合主流未完成 HcPre 后，下游事件也无法推进的现象。
+预取完成汇合 EVENT_WAIT_9 位于主流 task118，晚于当前 task82。已导出的 Event
+依赖没有显示主流提前在 task82 等待这次预取 completion；不能据此排除未导出的
+资源依赖、算子内部同步或 Runtime 调度问题。
+
+下一次实验保持路由上限5、原始 Tensor 拷贝和纯 MTE 严格等待，在图捕获期间给
+主计算流设置 Cube 上限14、Vector 上限28，捕获结束后恢复原值。配置默认0关闭。
+这是主计算流资源需求的对照，会影响其他主流算子，不能称为只修改 HcPre。
+不修改 kernel 的 CrossCoreWaitFlag、SyncAll 或调度模式，不更换权重布局。
+设置资源上限不等于独占或预留物理核，也不能保证所有缓存 tiling 都响应这个设置。
+接口含义见 [aclrtSetStreamResLimit](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1947.html)。
+
+```bash
+python -B script/diagnose_mte_graph_mapping.py --npu 5 --routing-cores 5 --compute-cube-cores 14
+```
+
+脚本同时汇总 HcPre、路由与 host_sync_wait 的实际图配置、请求结果、失败快照映射。
+若 HcPre 的实际 block 数未变，则此目标的资源干预没有得到验证，不能用失败反驳假设。
+若 HcPre 确实减核且加载完成，支持主计算图资源需求参与阻塞，但不能唯一归因到
+HcPre，也不作为推理正确性或性能验收。若减核后仍失败，先看任务位置是否再次变化；
+不能仅凭失败继续任意尝试更小核数。当前改动只在蓝区通过模拟接口与回归检查，
+实际限核效果和设备行为等待绿区验证。

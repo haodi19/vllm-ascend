@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -27,6 +28,11 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    compute_cores = config.get("host_sync_diagnose_compute_cube_cores", 0)
+    if type(compute_cores) is not int or not 0 <= compute_cores <= 28:
+        raise ValueError("diagnostic compute cube cores must be an integer in 0..28")
+    if compute_cores and not (config.get("host_sync_backend") == "mte" and config.get("host_sync_diagnose_graph_dump")):
+        raise ValueError("compute core diagnosis requires MTE and graph dump")
     routing_cores = config.get("host_sync_diagnose_routing_vector_cores", 0)
     if type(routing_cores) is not int or not 0 <= routing_cores <= 56:
         raise ValueError("diagnostic routing vector cores must be an integer in 0..56")
@@ -157,6 +163,47 @@ def call_routing_with_vector_limit(operation, npu, cores, *args, **kwargs):
             int(stream.npu_stream)
         finally:
             apply_load_vector_limit(library, pointer, previous.value)
+
+
+@contextmanager
+def diagnostic_compute_limits(npu, cube_cores):
+    """Capture-only stream limits; preserve kernel synchronization and restore on exit."""
+    library = ctypes.CDLL("libascendcl.so")
+    stream = npu.current_stream()
+    pointer = int(stream.npu_stream)
+    getter, setter = library.aclrtGetStreamResLimit, library.aclrtSetStreamResLimit
+    getter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint32)]
+    setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32]
+    getter.restype = setter.restype = ctypes.c_int
+    bind = library.aclrtUseStreamResInCurrentThread
+    bind.argtypes, bind.restype = [ctypes.c_void_p], ctypes.c_int
+    # ACL_RT_DEV_RES_CUBE_CORE=0, VECTOR_CORE=1. Keep the 1:2 mixed-core ratio.
+    limits = ((0, cube_cores), (1, 2 * cube_cores))
+    previous = {}
+    for kind, _ in limits:
+        value = ctypes.c_uint32()
+        code = getter(pointer, kind, ctypes.byref(value))
+        if code:
+            raise RuntimeError(f"compute resource query failed: kind={kind} code={code}")
+        previous[kind] = value.value
+    try:
+        for kind, value in limits:
+            code = setter(pointer, kind, value)
+            if code:
+                raise RuntimeError(f"compute resource set failed: kind={kind} code={code}")
+        code = bind(pointer)
+        if code:
+            raise RuntimeError(f"compute resource binding failed: {code}")
+        print(f"[MOE-MTE COMPUTE_LIMIT] cube={cube_cores} vector={2 * cube_cores} previous={previous}", flush=True)
+        yield
+    finally:
+        try:
+            int(stream.npu_stream)  # Drain Host submission, not device synchronization.
+        finally:
+            errors = [(kind, setter(pointer, kind, value)) for kind, value in previous.items()]
+            errors.append(("bind", bind(pointer)))
+            if any(code for _, code in errors):
+                raise RuntimeError(f"compute resource restore failed: {errors}")
 
 
 def runtime_last_task(library):

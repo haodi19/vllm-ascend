@@ -23,6 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=int, required=True)
     parser.add_argument("--routing-cores", type=int, default=0, choices=range(57))
+    parser.add_argument("--compute-cube-cores", type=int, default=0, choices=range(29))
     args = parser.parse_args()
     # Fail before loading the model if this build has no Python entry point.
     import torch_npu
@@ -62,6 +63,8 @@ def main():
     ]
     if args.routing_cores:
         command += ["--diagnose-routing-vector-cores", str(args.routing_cores)]
+    if args.compute_cube_cores:
+        command += ["--diagnose-compute-cube-cores", str(args.compute_cube_cores)]
     print(f"纯 MTE 图诊断；routing_cores={args.routing_cores}（0不改）；原始拷贝、严格预取等待。", flush=True)
     print(f"完整构建/服务日志保留在 {output}", flush=True)
     with subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT) as proc:
@@ -79,8 +82,12 @@ def main():
     if not output.is_dir():
         raise RuntimeError(f"运行器退出 {code}，没有生成实验目录")
     with report.open("w", encoding="utf-8") as dest:
+        dest.write(f"COMPUTE_CUBE_REQUESTED={args.compute_cube_cores}; Vector=2*Cube；0表示不改\n")
         dest.write(f"ROUTING_CORES_REQUESTED={args.routing_cores}; 以 GRAPH_KERNEL 实际值判断是否生效\n")
         dest.write(f"RUNNER_EXIT={code}\n" + failure_excerpt(text) + "\n")
+        for line in text.splitlines():
+            if "[MOE-MTE COMPUTE_LIMIT]" in line:
+                dest.write(line + "\n")
         summary = output / "summary.txt"
         if summary.is_file():
             for line in summary.read_text(encoding="utf-8", errors="replace").splitlines():
@@ -99,7 +106,7 @@ def main():
                     signatures = set()
                     for event in events:
                         name = event.get("name", "")
-                        if "MoeInitRouting" in name or "host_sync_wait" in name:
+                        if any(marker in name for marker in ("MoeInitRouting", "host_sync_wait", "HcPre")):
                             info = event.get("args", {})
                             signatures.add((name, info.get("Numblocks"), info.get("Schem Mode")))
                     for signature in sorted(signatures, key=str):

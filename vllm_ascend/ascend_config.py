@@ -1021,6 +1021,7 @@ class ExpertOffloadConfig:
         "host_sync_diagnose_load_vector_cores": 0,  # diagnostic only; 0 unchanged, 1..56 load-stream cap
         "host_sync_diagnose_graph_dump": False,  # print captured graph task mapping; diagnostic only
         "host_sync_diagnose_routing_vector_cores": 0,  # 0 unchanged; diagnostic routing-only cap 1..56
+        "host_sync_diagnose_compute_cube_cores": 0,  # Capture-only diagnostic cap 1..28; Vector cap is twice Cube.
         "host_sync_diagnose_graph_dump_dir": "moe_graph_debug",  # local diagnostic artifacts only
         "host_sync_diagnose_split_scale": False,  # diagnostic H2D/D2D split; not a copy optimization
         "host_sync_diagnose_scale_context": False,  # diagnostic independent D2D targets in real callback

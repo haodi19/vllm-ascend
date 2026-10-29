@@ -37,6 +37,7 @@ def configured_source(
     diagnose_graph_dump=False,
     diagnose_graph_dump_dir="moe_graph_debug",
     diagnose_routing_vector_cores=0,
+    diagnose_compute_cube_cores=0,
 ):
     diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
     diagnose_prefetch_report_wait = diagnose_prefetch_report_wait or bool(diagnose_prefetch_poll_budget)
@@ -48,6 +49,8 @@ def configured_source(
     config = json.loads(words[index])
     offload = config["expert_offload_config"]
     offload["host_sync_backend"] = backend
+    if diagnose_compute_cube_cores:
+        offload["host_sync_diagnose_compute_cube_cores"] = diagnose_compute_cube_cores if backend == "mte" else 0
     if diagnose_routing_vector_cores:
         offload["host_sync_diagnose_routing_vector_cores"] = diagnose_routing_vector_cores if backend == "mte" else 0
     if diagnose_graph_dump:
@@ -199,6 +202,7 @@ def main():
     parser.add_argument("--requests", type=int, default=3)
     parser.add_argument("--diagnose-graph-dump", action="store_true")
     parser.add_argument("--diagnose-routing-vector-cores", type=int, default=0, choices=range(57))
+    parser.add_argument("--diagnose-compute-cube-cores", type=int, default=0, choices=range(29))
     parser.add_argument("--diagnose-load-vector-cores", type=int, default=0, choices=range(57))
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--startup-timeout", type=int, default=1800)
@@ -354,6 +358,7 @@ def run(args, root):
                 args.diagnose_graph_dump,
                 directory / "graph_debug",
                 args.diagnose_routing_vector_cores,
+                args.diagnose_compute_cube_cores,
             ),
             "python",
             env,

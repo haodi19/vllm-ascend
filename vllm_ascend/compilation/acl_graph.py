@@ -23,6 +23,7 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.expert_offload.host_sync import diagnostic_compute_limits
 
 from ..utils import weak_ref_tensors
 
@@ -98,6 +99,9 @@ class ACLGraphWrapper:
         self.vllm_config = vllm_config
         offload_config = (vllm_config.additional_config or {}).get("expert_offload_config", {})
         self._moe_graph_dump = bool(offload_config.get("host_sync_diagnose_graph_dump", False))
+        self._moe_compute_cores = offload_config.get("host_sync_diagnose_compute_cube_cores", 0)
+        if self._moe_compute_cores and (offload_config.get("host_sync_backend") != "mte" or not self._moe_graph_dump):
+            raise ValueError("compute core diagnosis requires MTE and graph dump")
         self._moe_graph_dump_dir = offload_config.get("host_sync_diagnose_graph_dump_dir", "moe_graph_debug")
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
@@ -194,6 +198,10 @@ class ACLGraphWrapper:
                 forward_context.capturing = True
                 try:
                     with torch.npu.graph(aclgraph, pool=self.graph_pool):
+                        if self._moe_compute_cores:
+                            # Select the graph's actual capture stream. The outer stack
+                            # restores limits after capture ends, including failures.
+                            stack.enter_context(diagnostic_compute_limits(torch_npu.npu, self._moe_compute_cores))
                         # `output` is managed by pytorch's aclgraph pool
                         output = self.runnable(*args, **kwargs)
                         # Join offloader's copy stream after forward to avoid

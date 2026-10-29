@@ -30,6 +30,44 @@ class MoeHostSyncTests(unittest.TestCase):
         self.module.validate_host_sync_config({})
         self.module.validate_host_sync_config({"host_sync_backend": "callback"})
 
+    def test_compute_limits_restore_both_resources_after_capture_error(self):
+        calls = []
+
+        def get_limit(pointer, kind, output):
+            output._obj.value = (28, 56)[kind]
+            return 0
+
+        def set_limit(pointer, kind, value):
+            calls.append((kind, value))
+            return 0
+
+        library = SimpleNamespace(
+            aclrtGetStreamResLimit=Mock(side_effect=get_limit),
+            aclrtSetStreamResLimit=Mock(side_effect=set_limit),
+            aclrtUseStreamResInCurrentThread=Mock(return_value=0),
+        )
+        npu = SimpleNamespace(current_stream=lambda: SimpleNamespace(npu_stream=123))
+        with (
+            patch.object(self.module.ctypes, "CDLL", return_value=library),
+            patch("builtins.print"),
+            self.assertRaisesRegex(RuntimeError, "capture failed"),
+            self.module.diagnostic_compute_limits(npu, 14),
+        ):
+            self.assertEqual(calls, [(0, 14), (1, 28)])
+            raise RuntimeError("capture failed")
+        self.assertEqual(calls, [(0, 14), (1, 28), (0, 28), (1, 56)])
+        self.assertEqual(library.aclrtUseStreamResInCurrentThread.call_count, 2)
+
+    def test_compute_limits_require_mte_graph_diagnosis(self):
+        for config in (
+            {"host_sync_diagnose_compute_cube_cores": True},
+            {"host_sync_diagnose_compute_cube_cores": 29},
+            {"host_sync_diagnose_compute_cube_cores": 14},
+            {"host_sync_diagnose_compute_cube_cores": 14, "host_sync_backend": "mte"},
+        ):
+            with self.assertRaises(ValueError):
+                self.module.validate_host_sync_config(config)
+
     def test_routing_limit_restores_previous_on_success_and_failure(self):
         for failure in (False, True):
             calls = []
