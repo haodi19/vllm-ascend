@@ -241,7 +241,7 @@ HcPre_c12a9d608e5abdbd1728e849208025ff_1000，类型 KERNEL_AICORE；
 它的图节点。这是诊断工具遗漏，已改为图解析覆盖快照中的全部任务类型，包括
 AICORE、EVENT_WAIT、NOTIFY_WAIT；不在捕获图中的任务仍明确标记缺失。
 
-本地源码的调用链为 DeepSeekV4DecoderLayer.hc_pre → npu_hc_pre_v2 →
+本地 deepseek_v4.py 的调用链为 DeepseekV2DecoderLayer.hc_pre → npu_hc_pre_v2 →
 run_hc_pre_fusion → aclnnHcPre。csrc/moe/hc_pre/op_kernel/hc_pre.cpp 声明
 KERNEL_TYPE_MIX_AIC_1_2；950 分支的 tiling key 1000 使用 MKSplitCore 实现，
 其中有 CrossCoreWaitFlag 和 SyncAll。也就是说，不能把快照的 AICORE 标签解释成
