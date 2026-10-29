@@ -24,6 +24,23 @@ TRACE_CONTEXT_LINES = 40
 LOG_LINE_CHARACTERS = 1500
 
 
+def selected_cases(name):
+    cases = (("native_main", 0), ("native_main_aux", REQUESTED_CUBE_CORES))
+    return cases if name == "both" else tuple(case for case in cases if case[0] == name)
+
+
+def host_memory_snapshot():
+    try:
+        lines = Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return f"HOST_MEMORY unavailable: {exc}"
+    return (
+        "HOST_MEMORY "
+        + "; ".join(line for line in lines if line.startswith(("MemTotal:", "MemAvailable:", "SwapFree:")))
+        + "; 启动前快照，不代表容器限额或峰值需求"
+    )
+
+
 def failure_context(path):
     """Read bounded traceback context; preserve EngineCore errors before API fallout."""
     if not path.is_file():
@@ -234,14 +251,20 @@ def run_case(root, output, npu, aux_cores):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=npu_number)
+    parser.add_argument(
+        "--case",
+        choices=("both", "native_main", "native_main_aux"),
+        default="both",
+        help="默认两组；可仅补跑此前未完成的一组",
+    )
     inspect = parser.add_mutually_exclusive_group()
     inspect.add_argument("--inspect", type=Path, help="只读指定实验目录的启动错误；不加载模型、不写文件")
     inspect.add_argument("--inspect-latest", action="store_true", help="只读最近一次 mte_resource_scope 实验")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     if args.inspect is not None or args.inspect_latest:
-        if args.npu is not None:
-            parser.error("只读检查不接受 --npu；不会重跑模型")
+        if args.npu is not None or args.case != "both":
+            parser.error("只读检查不接受 --npu/--case；不会重跑模型")
         output = args.inspect
         if args.inspect_latest:
             candidates = [path for path in (root / "bench_results").glob("mte_resource_scope_*") if path.is_dir()]
@@ -260,9 +283,13 @@ def main():
     print(f"SUMMARY FILE: {summary}", flush=True)
     with summary.open("w", encoding="utf-8") as dest:
         dest.write("纯 MTE 严格等待、原始权重拷贝。诊断对照，不作为性能或精度验收。\n")
-        dest.write("先用 Torch 原生接口只限制主流；仅在同类 scale 等待复现后增加 DSA 辅流上限。\n")
-        for name, aux_cores in (("native_main", 0), ("native_main_aux", REQUESTED_CUBE_CORES)):
+        if args.case == "both":
+            dest.write("先用 Torch 原生接口只限制主流；仅在同类 scale 等待复现后增加 DSA 辅流上限。\n")
+        else:
+            dest.write(f"单独补跑 {args.case}；需要结合此前主流对照判断，不自动认定两轮环境相同。\n")
+        for name, aux_cores in selected_cases(args.case):
             dest.write(f"\nCASE {name}: main=14/28 routing=5 aux={'14/28' if aux_cores else 'unchanged'}\n")
+            dest.write(host_memory_snapshot() + "\n")
             dest.flush()
             print(f"START {name}; 总时限={CASE_TIMEOUT_SECONDS}s", flush=True)
             code, text = run_case(root, output / name, args.npu, aux_cores)
@@ -276,6 +303,7 @@ def main():
                 break
             if state != "scale_wait_reproduced":
                 dest.write(inspect_failure(output / name) + "\n")
+                dest.write(kernel_failure_context() + "\n")
                 dest.write("未形成有效的同类阻塞对照，停止后续组，避免重复加载模型。\n")
                 break
     print(f"仅返回此文件内容：{summary}", flush=True)

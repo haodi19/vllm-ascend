@@ -130,6 +130,24 @@ class ResourceScopeTests(unittest.TestCase):
             self.assertNotIn("normal boot", text)
             self.assertIn("不能自动关联", text)
 
+    def test_aux_retry_runs_only_aux_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake_script = Path(directory) / "script/diagnose_mte_resource_scope.py"
+            with (
+                patch.object(self.module, "__file__", str(fake_script)),
+                patch.object(sys, "argv", ["diagnose", "--npu", "7", "--case", "native_main_aux"]),
+                patch.object(self.module, "run_case", return_value=(0, "RUNNER_EXIT=0\nMOE_RESULT {}")) as run,
+                patch.object(self.module, "host_memory_snapshot", return_value="HOST_MEMORY test"),
+                patch("builtins.print"),
+            ):
+                self.module.main()
+            run.assert_called_once()
+            _, case_path, npu, cores = run.call_args.args
+            self.assertEqual((case_path.name, npu, cores), ("native_main_aux", 7, 14))
+            summary = (case_path.parent / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("单独补跑 native_main_aux", summary)
+            self.assertIn("request_passed", summary)
+
 
 if __name__ == "__main__":
     unittest.main()
