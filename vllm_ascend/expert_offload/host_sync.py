@@ -27,6 +27,11 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    cores = config.get("host_sync_diagnose_load_vector_cores", 0)
+    if type(cores) is not int or not 0 <= cores <= 56:
+        raise ValueError("diagnostic load vector cores must be an integer in 0..56")
+    if cores and not (config.get("host_sync_diagnose_load") and config.get("host_sync_diagnose_native_wait")):
+        raise ValueError("diagnostic load vector cores requires load and native wait diagnosis")
     budget = config.get("host_sync_diagnose_prefetch_poll_budget", 0)
     if type(budget) is not int or not 0 <= budget <= 10_000_000:
         raise ValueError("host_sync_diagnose_prefetch_poll_budget must be an integer in 0..10000000")
@@ -107,6 +112,22 @@ def runtime_stream_identity(library, pointer):
         return {"pointer": pointer, "code": code, "stream_id": stream_id.value if code == 0 else None}
     except Exception as exc:
         return {"pointer": pointer, "query_error": str(exc)}
+
+
+def apply_load_vector_limit(library, pointer, cores):
+    """Diagnostic stream-local resource request, bound to the calling worker."""
+    vector_core_type = 1  # ACL_RT_DEV_RES_VECTOR_CORE
+    setter = library.aclrtSetStreamResLimit
+    setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint32]
+    setter.restype = ctypes.c_int
+    bind = library.aclrtUseStreamResInCurrentThread
+    bind.argtypes, bind.restype = [ctypes.c_void_p], ctypes.c_int
+    code = setter(pointer, vector_core_type, cores)
+    if code:
+        raise RuntimeError(f"load vector limit set failed: {code}")
+    code = bind(pointer)
+    if code:
+        raise RuntimeError(f"load vector limit thread binding failed: {code}")
 
 
 def runtime_last_task(library):
@@ -277,6 +298,16 @@ class MteHostDispatcher:
         is not a performance measurement. Limit output to eight batches.
         """
         enabled = getattr(self.manager.offload_config, "host_sync_diagnose_load", False)
+        cores = getattr(self.manager.offload_config, "host_sync_diagnose_load_vector_cores", 0)
+        if cores and enabled and self.active_callback is not None and tasks:
+            pointer = int(self.manager.load_stream.npu_stream)
+            apply_load_vector_limit(ctypes.CDLL("libascendcl.so"), pointer, cores)
+            if self.load_diagnostic_batches < 8:
+                print(
+                    f"[MOE-MTE VECTOR_LIMIT] requested={cores} stream={pointer}; "
+                    "verify actual kernel coreDim in Runtime log",
+                    flush=True,
+                )
         if not enabled or self.active_callback is None or not tasks or self.load_diagnostic_batches >= 8:
             return False
         self.load_diagnostic_batches += 1

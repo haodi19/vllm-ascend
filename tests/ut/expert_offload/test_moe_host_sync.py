@@ -30,6 +30,24 @@ class MoeHostSyncTests(unittest.TestCase):
         self.module.validate_host_sync_config({})
         self.module.validate_host_sync_config({"host_sync_backend": "callback"})
 
+    def test_vector_limit_is_diagnostic_only_and_binds_after_set(self):
+        for value in (True, -1, 57):
+            with self.assertRaises(ValueError):
+                self.module.validate_host_sync_config({"host_sync_diagnose_load_vector_cores": value})
+        with self.assertRaises(ValueError):
+            self.module.validate_host_sync_config({"host_sync_diagnose_load_vector_cores": 28})
+        library = SimpleNamespace(
+            aclrtSetStreamResLimit=Mock(return_value=0), aclrtUseStreamResInCurrentThread=Mock(return_value=0)
+        )
+        self.module.apply_load_vector_limit(library, 123, 28)
+        library.aclrtSetStreamResLimit.assert_called_once_with(123, 1, 28)
+        library.aclrtUseStreamResInCurrentThread.assert_called_once_with(123)
+        library.aclrtSetStreamResLimit.return_value = 1
+        library.aclrtUseStreamResInCurrentThread.reset_mock()
+        with self.assertRaises(RuntimeError):
+            self.module.apply_load_vector_limit(library, 123, 28)
+        library.aclrtUseStreamResInCurrentThread.assert_not_called()
+
     def test_bounded_wait_cannot_be_enabled_without_completion_guard(self):
         with self.assertRaisesRegex(ValueError, "completion guard"):
             self.module.validate_host_sync_config({"host_sync_diagnose_prefetch_poll_budget": 1000})

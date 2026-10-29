@@ -23,6 +23,12 @@ class TaskSerialTests(unittest.TestCase):
         self.assertEqual(label, "scale")
         self.assertEqual(record["task_id"], 74901)
 
+    def test_kernel_summary_requires_matching_stream_and_launch_record(self):
+        line = "StreamLaunchKernelV2: stream_id=27, kernel_name=Transpose_test, coreDim=28, taskRation=2"
+        self.assertEqual(self.module.kernel_signature(line, 27), ("Transpose_test", 28))
+        self.assertIsNone(self.module.kernel_signature(line, 2))
+        self.assertIsNone(self.module.kernel_signature(line.replace("StreamLaunchKernelV2:", "other:"), 27))
+
     def test_query_failure_is_not_silently_replaced_with_earlier_task(self):
         for text in (
             "",

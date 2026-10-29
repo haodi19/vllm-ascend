@@ -33,6 +33,7 @@ def configured_source(
     diagnose_scale_context=False,
     diagnose_prefetch_report_wait=False,
     diagnose_prefetch_poll_budget=0,
+    diagnose_load_vector_cores=0,
 ):
     diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
     diagnose_prefetch_report_wait = diagnose_prefetch_report_wait or bool(diagnose_prefetch_poll_budget)
@@ -44,6 +45,8 @@ def configured_source(
     config = json.loads(words[index])
     offload = config["expert_offload_config"]
     offload["host_sync_backend"] = backend
+    if diagnose_load_vector_cores:
+        offload["host_sync_diagnose_load_vector_cores"] = diagnose_load_vector_cores if backend == "mte" else 0
     offload["host_sync_library"] = str(library) if backend == "mte" else ""
     offload["host_sync_scan_mode"] = scan_mode if backend == "mte" else "all"
     offload["host_sync_idle_probe"] = idle_probe if backend == "mte" else "locked"
@@ -74,6 +77,7 @@ def failure_excerpt(text):
         ("[MOE-MTE LAYOUT]", 1),
         ("STREAM_HANDLE_READY", 1),
         ("[MOE-MTE WORKER]", 1),
+        ("[MOE-MTE VECTOR_LIMIT]", 1),
         ("[MOE-MTE DIAGNOSTIC BEGIN]", 1),
         ("active_callback=", 1),
         ("callback=_", 1),
@@ -183,6 +187,7 @@ def main():
     )
     parser.add_argument("--test-script", type=Path, default=REPOSITORY_ROOT / "script/test_graph2.sh")
     parser.add_argument("--requests", type=int, default=3)
+    parser.add_argument("--diagnose-load-vector-cores", type=int, default=0, choices=range(57))
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=300)
@@ -194,6 +199,8 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
+    if args.diagnose_load_vector_cores:
+        args.diagnose_native_wait = True
     if not 0 <= args.diagnose_prefetch_poll_budget <= 10_000_000:
         parser.error("prefetch poll budget must be 0..10000000")
     if args.diagnose_prefetch_poll_budget:
@@ -331,6 +338,7 @@ def run(args, root):
                 args.diagnose_scale_context,
                 args.diagnose_prefetch_report_wait,
                 args.diagnose_prefetch_poll_budget,
+                args.diagnose_load_vector_cores,
             ),
             "python",
             env,

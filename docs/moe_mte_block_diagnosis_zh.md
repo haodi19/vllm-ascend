@@ -479,3 +479,38 @@ python -B script/inspect_mte_task_serial.py bench_results/moe_host_sync_8e2b8992
 ```
 
 本轮要补全具体 kernel 身份及调度参数，沿用已有 DEBUG 日志，无需重新进行推理实验。
+
+## 已确认转置任务身份；用加载流分核检验资源需求假设
+
+后续只读提取明确显示：task_sn=74900 是 524288 字节 H2D，Runtime 已记录
+finishTaskId_=710 并回收该 DMA；task_sn=74901 则是
+`Transpose_int8_int64_high_performance_10001`，coreDim=56、schemMode=0，随后超时。
+这是原始 copy_ 内部触发的设备转置，不是后来增加的 CPU 重排。
+同一函数地址、同样 coreDim 的转置在前一个交接中曾反复提交，前一交接已完成。
+因此，仅转置算子名称或 56 个 block 本身都不足以解释为什么第二次交接阻塞。
+
+之前已知的“scale 拷贝后超时”不能重复算作根因定位进展。本次新增的是具体转置名称
+以及原始 copy_ 内 H2D 已完成的直接日志证据；尚缺的是转置为何不完成的解释。
+
+下一次只改变原生 worker 加载流的 Vector Core 上限为 28，仍使用原始 Tensor
+拷贝、SyncLaunchStream、预取严格 AIV 等待。默认上限配置为 0，不调用分核接口。
+诊断选项为 `--diagnose-load-vector-cores 28`，设置流资源后绑定到当前原生 worker，
+不设置整个进程的资源上限，不改变模型图和等待算子的下发代码。
+接口失败会显式报错。API 成功还不足以证明算子采用新上限，必须核对日志中实际 coreDim。
+
+依据官方接口说明：
+[aclrtSetStreamResLimit](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1947.html)
+设置流资源上限，再用
+[aclrtUseStreamResInCurrentThread](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910beta2/API/runtimeapi/aclcppdevg_03_1949.html)
+在当前线程使用该设置。这不是将某些物理核独占分配给该流。
+
+一次执行并汇总实际加载流 kernel 核数：
+
+```bash
+python -B script/diagnose_mte_vector_limit.py --npu 0
+```
+
+判定标准：实际核数仍是 56，则本轮干预未得到验证；核数降低且仍阻塞，则降低需求
+不足以解除阻塞；核数降低且原始转置/请求完成，则说明分核或其导致的 tiling 改变
+影响了阻塞，下一步才区分这两者。任何结果均不能直接证明具体硬件死锁。
+保留原始输入与配置，结果不用于性能对比；只返回汇总文本。
