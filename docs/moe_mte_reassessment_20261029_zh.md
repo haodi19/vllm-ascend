@@ -4,10 +4,10 @@
 默认关闭诊断。参考仓库 `D:\华为\nano2\vllm-ascend\vLLM-ascend-DSA` 仅只读审阅，
 HEAD 为 `ce6900977e6a25377cd11205e3613ec2ec0208a4`。没有收到辅助流单组补跑的新结果。
 
-**最新：修正版已扫完11个日志快照，仍未得到退出原因；下一步做一次带启动观测的等待位置运行，见第9节。**
+**最新：消费者汇合处等待已取得一次有效有限通过；下一步关闭前8批额外加载诊断，见第10节。**
 根因仍未证实，停止继续枚举核数。等待位置实验检验“等待与消费者之前的真实模型计算重叠”
 是否参与触发，不能直接区分资源调度、模型算子内部停滞和轮询访存影响。
-第1–8节保留实验设计、首次运行命令与离线取证记录；后续操作以第9节为准。
+第1–9节保留实验设计、首次运行命令与启动取证记录；后续操作以第10节为准。
 
 ## 1. 原项目与当前改造的完整顺序
 
@@ -345,3 +345,75 @@ Host/MTE构建和既有回归流程。启动通过后继续1次预热、3次有�
 13个修改或新增Python文件通过Ruff检查与格式检查；model_runner的8项既有Ruff问题已与HEAD
 按规则和消息对照，没有新增，未扩大范围重排该文件。`git diff --check`通过。
 `format.sh ci`已执行，因本地缺少pre-commit未能启动全套检查。
+
+## 10. 等待位置有效通过：下一步去掉最初8批加载诊断
+
+用户返回 `mte_wait_placement_c4cac7ed/summary.txt`，对应上一节命令及提交 `4f583c33`。
+这次已经进入原阻塞问题的机制对照，不是又一次启动支线取证：
+
+- `WRAPPER_EXIT=0`、`RUNNER_EXIT=0`、`RESULT=finite_requests_passed`；1次预热和3次有限请求完成。
+  三次请求的输出摘要同为 `21e9f347a4cd40b1d4c2263761c4737c6543bdc4027b2c3ade06ce19f176621a`，
+  每次prompt为5 tokens、completion为5 tokens。没有本次匹配的callback输出对照，不能宣称精度等价。
+- 有效配置为MTE、早发布/消费者join等待、原始Torch拷贝、`all/locked/yield` worker策略；
+  保留加载诊断与native诊断等待，没有限核。实际图仍有28核辅助流MatMul、56核routing与1核wait。
+- `WAIT_PLACEMENT_RECORDS=86`、`CAPTURE_END_RECORDS=1`；capture1发布和汇合均为42个槽，pending为0。
+  `capture_biruq2yk/graph_dump`检出42对结构。第一对为publish `[63,21,1]` →
+  主流gate record `[63,23,118]` → 预取流gate wait `[63,21,2]` → strict wait `[63,21,3]` →
+  mapping `[63,21,4]` → done record `[63,21,5]` → 主流done wait `[63,23,119]`。
+  这是捕获依赖结构证据，不是各kernel的实际起止时间或全部generation的执行轨迹。
+  摘要内capture_end重复展示来自首尾摘录重叠，实际计数只有1；本轮已去掉该展示重复。
+- 已显示的batch8、layer4 `w2_weight_scale[L4,E37->S22]`及scale_refresh均完成。
+  原scale布局仍存在：CPU连续、NPU目标stride为 `[2,64,1]`。这证明该次原始布局路径可以完成，
+  不是把原Transpose拷贝换成连续目标后得到的通过。
+
+启动观测完整：18条阶段标记无异常或未闭合阶段，EngineCore PID93533、API PID92955。
+runner先记录 `cleanup_begin reason=completed`，其后父进程发出terminate请求，再观测到EngineCore
+`exitcode=-15 (SIGTERM)`。不能把这次结束判为再次启动崩溃。原先PID91939为何提前退出仍未解释，
+本次启动成功不表示已修复其根因。
+
+`MOE_RESULT.engine_error_seen=true`需要单独保留边界：现有实现只是全文包含 `EngineDeadError` 的检查，
+用户摘要未给出该字符串所在行。已有顺序证据支持结束时发生了主动清理，但不足以把该字符串也归因于清理。
+新运行会保留原布尔值，并输出其在唯一cleanup标记前后的行数、首尾样例；没有唯一标记时位置为null。
+这些是合并日志中的位置，不是精确事件时刻或因果归属。也补充已有callback计数及errors/dropped，
+不增加设备查询或同步。
+
+### 10.1 当前判断与优先级
+
+1. **优先验证通过是否依赖初始加载诊断。** `diagnose_load()`只对最初8个有任务的加载批次执行
+   prior-stream、逐项copy和scale_refresh的额外同步；之后本来就走普通批量加载。
+   本次说明后续普通路径可以推进，仍未验证最初8批也不需要这些额外同步。
+   下一组只关闭这条诊断执行路径，恢复从第一批开始的普通提交；不是取消协议完成条件。
+2. **等待窗口仍是有依据的方向，具体机制未证实。** 历史report等待/有界等待对照与本次join等待通过，
+   共同支持提前驻留的严格AIV等待与真实前段计算的重叠参与触发。设备资源调度、轮询访存干扰、
+   内部依赖/时序仍没有被区分。本轮同时延后了映射写回，也不能只凭本轮把作用完全归给wait。
+   当前主机可用内存等外部状态与早先失败运行不同，尚不是同环境下完整匹配的因果A/B。
+3. **普通加载通过后，再做callback正确性对照与覆盖扩展。** 现有三次相同输出只说明该短请求重复一致。
+   后续需要冷热缓存、不同token_rows/捕获尺寸与多次generation的正确性检查，再考虑性能。
+   当前启动观测、graph dump、Runtime debug和计时标记仍在，不能拿request_mean_us作性能结论。
+
+暂不重跑辅助流限核组或旧主流失败组，也不再离线提取旧启动日志；这些不是当前优先证据缺口。
+若关闭初始加载诊断后失败，应先区分启动失败与已发布请求停滞，再根据worker快照/捕获依赖定位。
+没有逐项记录时，不能仅凭失败就说再次卡在同一个scale/Transpose任务；同样不能直接称为资源死锁。
+
+### 10.2 下一次只运行这一组
+
+新增脚本选项 `--no-load-diagnostics`，仅用于MTE等待位置实验：明确把继承配置中的
+`host_sync_diagnose_load`和`host_sync_diagnose_native_wait`覆盖为false，拒绝同时请求逐项诊断、
+改写scale拷贝或加载限核。普通模式下若仍出现 `[MOE-MTE LOAD]`，运行器不会输出成功结果。
+生产路径、默认选项和协议实现未改；保留最终 `_synchronize_h2d()`、callback返回后done发布、
+严格generation wait、映射写回及主流done join。保持启动观测、图转储、核数、worker与请求设置。
+
+```bash
+cd /home/l00992607/vllm-ascend-worker-poll
+git pull --ff-only origin dev/moeoffload-worker-poll
+python -B script/diagnose_mte_wait_placement.py --npu 7 --trace-startup --no-load-diagnostics
+```
+
+仍只启动一次模型，1次预热+3次有限请求，不自动追加其他组。返回新建summary的检查脱敏文本。
+预期 `LOAD_DIAGNOSTICS_REQUESTED=False`、有效配置上述两项为false、`LOAD_DIAGNOSTIC_RECORDS=0`，
+并检查捕获pending为0、结构配对、请求结果、callback计数与实际退出顺序。零条诊断日志本身不是成功证据。
+
+本轮142项相关CPU测试中140项通过，2项因Windows符号链接权限/POSIX信号支持跳过。
+覆盖选项逐层传递、继承true值显式覆盖、冲突拒绝、原负载保留及错误日志位置边界。
+修改的5个Python文件Ruff检查与格式检查通过，`git diff --check`通过。
+`format.sh ci`仍因缺少pre-commit无法启动完整检查；新增无逐项诊断模式的NPU结果待上述命令返回。

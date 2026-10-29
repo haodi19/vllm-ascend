@@ -19,6 +19,8 @@ from run_host_sync_stage2 import target_cmake_args
 from run_host_sync_stage3 import select_build_directory
 from run_verified_cpp_tests import SummaryTee, inference, launch_spec
 
+MAX_ENGINE_ERROR_LINE_CHARS = 800
+
 
 def configured_source(
     source,
@@ -41,7 +43,12 @@ def configured_source(
     diagnose_dsa_cube_cores=0,
     diagnose_native_stream_limits=False,
     diagnose_prefetch_wait_at_join=False,
+    no_load_diagnostics=False,
 ):
+    if no_load_diagnostics and any(
+        (diagnose_load, diagnose_native_wait, diagnose_split_scale, diagnose_scale_context, diagnose_load_vector_cores)
+    ):
+        raise ValueError("no-load-diagnostics conflicts with per-load diagnosis")
     diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
     diagnose_prefetch_report_wait = diagnose_prefetch_report_wait or bool(diagnose_prefetch_poll_budget)
     start = re.search(r"(?m)^vllm\s+serve\s+", source)
@@ -84,6 +91,19 @@ def configured_source(
         offload["host_sync_diagnose_prefetch_report_wait"] = backend == "mte"
     if diagnose_prefetch_poll_budget:
         offload["host_sync_diagnose_prefetch_poll_budget"] = diagnose_prefetch_poll_budget if backend == "mte" else 0
+    if no_load_diagnostics:
+        if any(
+            offload.get(key)
+            for key in (
+                "host_sync_diagnose_split_scale",
+                "host_sync_diagnose_scale_context",
+                "host_sync_diagnose_load_vector_cores",
+            )
+        ):
+            raise ValueError("no-load-diagnostics cannot inherit altered scale copies or load core limits")
+        # Override inherited launch-script values explicitly, not just CLI defaults.
+        offload["host_sync_diagnose_load"] = False
+        offload["host_sync_diagnose_native_wait"] = False
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -143,7 +163,40 @@ def assess_profile_report(report, service_log):
         report["profile_status"] = "unverified"
     report["profile_errors"] = list(dict.fromkeys(errors))[:4]
     report["engine_error_seen"] = "EngineDeadError" in service_log
+    report["engine_error_log_positions"] = engine_error_log_positions(service_log)
     return report
+
+
+def engine_error_log_positions(service_log):
+    """Describe merged-log position, not error timing or cause."""
+    lines = service_log.splitlines()
+    boundaries = []
+    for index, line in enumerate(lines):
+        if "[MOE-MTE RUNNER]" not in line:
+            continue
+        try:
+            record = json.loads(line.split("[MOE-MTE RUNNER]", 1)[1].strip())
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("event") == "cleanup_begin":
+            boundaries.append(index)
+    errors = [index for index, line in enumerate(lines) if "EngineDeadError" in line]
+    boundary = boundaries[0] if len(boundaries) == 1 else None
+    return dict(
+        cleanup_marker_unique=boundary is not None,
+        before_cleanup=sum(index < boundary for index in errors) if boundary is not None else None,
+        after_cleanup=sum(index > boundary for index in errors) if boundary is not None else None,
+        total=len(errors),
+        examples=[
+            dict(
+                line=index + 1,
+                text=lines[index][:MAX_ENGINE_ERROR_LINE_CHARS],
+                truncated=len(lines[index]) > MAX_ENGINE_ERROR_LINE_CHARS,
+            )
+            for index in (errors[:1] + errors[-1:] if len(errors) > 1 else errors)
+        ],
+        basis="merged log order only; not causal attribution",
+    )
 
 
 def prepare_runtime_artifacts(source, target):
@@ -183,6 +236,11 @@ def main():
         help="Diagnostic: keep early publication, defer strict prefetch wait to consumer join",
     )
     parser.add_argument("--skip-profile", action="store_true", help="Run finite requests without starting profiler")
+    parser.add_argument(
+        "--no-load-diagnostics",
+        action="store_true",
+        help="Use ordinary batched loads from the first batch; retain required completion waits",
+    )
     parser.add_argument(
         "--trace-startup", action="store_true", help="Observe process exits for the wait-at-join diagnosis"
     )
@@ -238,6 +296,19 @@ def main():
     args = parser.parse_args()
     if args.trace_startup and (args.backend != "mte" or not args.diagnose_prefetch_wait_at_join):
         parser.error("--trace-startup requires --backend mte --diagnose-prefetch-wait-at-join")
+    if args.no_load_diagnostics:
+        if args.backend != "mte" or not args.diagnose_prefetch_wait_at_join:
+            parser.error("--no-load-diagnostics requires --backend mte --diagnose-prefetch-wait-at-join")
+        if any(
+            (
+                args.diagnose_load_stages,
+                args.diagnose_native_wait,
+                args.diagnose_split_scale,
+                args.diagnose_scale_context,
+                args.diagnose_load_vector_cores,
+            )
+        ):
+            parser.error("--no-load-diagnostics conflicts with per-load diagnosis")
     if args.diagnose_load_vector_cores:
         args.diagnose_native_wait = True
     if not 0 <= args.diagnose_prefetch_poll_budget <= 10_000_000:
@@ -401,6 +472,7 @@ def run(args, root):
                 args.diagnose_dsa_cube_cores,
                 args.diagnose_native_stream_limits,
                 args.diagnose_prefetch_wait_at_join,
+                getattr(args, "no_load_diagnostics", False),
             ),
             "python",
             env,
@@ -408,6 +480,8 @@ def run(args, root):
         log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
         assess_profile_report(reports[backend], log)
         if backend == "mte":
+            if getattr(args, "no_load_diagnostics", False) and "[MOE-MTE LOAD]" in log:
+                raise RuntimeError("Per-load diagnostic records appeared despite --no-load-diagnostics")
             expected_policy = (
                 f"[MOE-MTE WORKER] scan={args.worker_scan} probe={args.worker_probe} idle={args.worker_idle}"
             )
@@ -433,6 +507,10 @@ def run(args, root):
                     "profile_status": reports[backend]["profile_status"],
                     "profile_errors": reports[backend]["profile_errors"],
                     "engine_error_seen": reports[backend]["engine_error_seen"],
+                    "engine_error_log_positions": reports[backend]["engine_error_log_positions"],
+                    "callbacks": reports[backend]["count"],
+                    "callback_errors": reports[backend]["errors"],
+                    "callback_dropped": reports[backend]["dropped"],
                 }
             ),
             flush=True,

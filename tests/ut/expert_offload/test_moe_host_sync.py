@@ -80,7 +80,8 @@ class MoeHostSyncTests(unittest.TestCase):
                 values[stream.npu_stream]["vector_core_num"] = vector_num
 
         npu = SimpleNamespace(
-            current_stream=lambda: main, get_stream_limit=lambda stream: dict(values[stream.npu_stream]),
+            current_stream=lambda: main,
+            get_stream_limit=lambda stream: dict(values[stream.npu_stream]),
             set_stream_limit=setter,
         )
 
@@ -89,7 +90,8 @@ class MoeHostSyncTests(unittest.TestCase):
             raise RuntimeError("op failed")
 
         with (
-            patch("builtins.print"), self.assertRaisesRegex(RuntimeError, "op failed"),
+            patch("builtins.print"),
+            self.assertRaisesRegex(RuntimeError, "op failed"),
             self.module.diagnostic_compute_limits(npu, 14, (("dsa_aux", aux, 10),), native_limits=True),
         ):
             self.assertEqual(values[123], {"cube_core_num": 14, "vector_core_num": 28})
@@ -115,7 +117,8 @@ class MoeHostSyncTests(unittest.TestCase):
             set_stream_limit=setter,
         )
         with (
-            patch("builtins.print"), self.assertRaisesRegex(RuntimeError, "aux set failed"),
+            patch("builtins.print"),
+            self.assertRaisesRegex(RuntimeError, "aux set failed"),
             self.module.diagnostic_compute_limits(npu, 14, (("dsa_aux", aux, 14),), native_limits=True),
         ):
             self.fail("must not reach capture body after a setter failure")
@@ -158,10 +161,13 @@ class MoeHostSyncTests(unittest.TestCase):
 
             library = SimpleNamespace(aclrtGetStreamResLimit=Mock(side_effect=get_limit))
             npu = SimpleNamespace(current_stream=lambda: SimpleNamespace(npu_stream=123))
-            with patch.object(self.module.ctypes, "CDLL", return_value=library), patch.object(
-                self.module,
-                "apply_load_vector_limit",
-                side_effect=lambda lib, ptr, cores, calls=calls: calls.append(cores),
+            with (
+                patch.object(self.module.ctypes, "CDLL", return_value=library),
+                patch.object(
+                    self.module,
+                    "apply_load_vector_limit",
+                    side_effect=lambda lib, ptr, cores, calls=calls: calls.append(cores),
+                ),
             ):
                 if failure:
                     with self.assertRaisesRegex(RuntimeError, "operator failed"):
@@ -218,6 +224,25 @@ class MoeHostSyncTests(unittest.TestCase):
         report = {"profile_status": "timeout", "mstx_trace_occurrences": 0}
         self.runner.assess_profile_report(report, "")
         self.assertEqual(report["profile_status"], "timeout")
+
+    def test_engine_error_log_positions_preserve_raw_flag_and_do_not_guess_cause(self):
+        cleanup = '[MOE-MTE RUNNER] {"event": "cleanup_begin", "reason": "completed"}'
+        report = {}
+        self.runner.assess_profile_report(report, "EngineDeadError before\n" + cleanup + "\nEngineDeadError after")
+        self.assertTrue(report["engine_error_seen"])
+        positions = report["engine_error_log_positions"]
+        self.assertTrue(positions["cleanup_marker_unique"])
+        self.assertEqual((positions["before_cleanup"], positions["after_cleanup"]), (1, 1))
+        self.assertEqual([entry["line"] for entry in positions["examples"]], [1, 3])
+        for text in ("EngineDeadError", cleanup + "\n" + cleanup + "\nEngineDeadError"):
+            positions = self.runner.engine_error_log_positions(text)
+            self.assertFalse(positions["cleanup_marker_unique"])
+            self.assertIsNone(positions["before_cleanup"])
+            self.assertIsNone(positions["after_cleanup"])
+        positions = self.runner.engine_error_log_positions(cleanup + "\nEngineDeadError")
+        self.assertEqual((positions["before_cleanup"], positions["after_cleanup"]), (0, 1))
+        positions = self.runner.engine_error_log_positions("EngineDeadError " + "x" * 1000)
+        self.assertTrue(positions["examples"][0]["truncated"])
 
     def test_acl_error_detail_handles_null_and_missing_api(self):
         for raw, expected in ((b"task detail", "task detail"), (None, "<no recent ACL error>")):

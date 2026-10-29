@@ -162,7 +162,7 @@ def wrapper_cleanup_marker(process, log, reason):
         )
 
 
-def run_once(root, run_dir, npu, trace_startup=False):
+def run_once(root, run_dir, npu, trace_startup=False, no_load_diagnostics=False):
     command = [
         sys.executable,
         "-B",
@@ -175,6 +175,8 @@ def run_once(root, run_dir, npu, trace_startup=False):
     ]
     if trace_startup:
         command.append("--trace-startup")
+    if no_load_diagnostics:
+        command.append("--no-load-diagnostics")
     with (run_dir.parent / "wrapper.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command, cwd=root, stdout=log, stderr=subprocess.STDOUT, start_new_session=(sys.platform == "linux")
@@ -211,6 +213,7 @@ def append_evidence(dest, run_dir, code, trace_startup=False):
             dest.write(line[:2000] + "\n")
     service_path = run_dir / "mte/inference_python.log"
     service = service_path.read_text(encoding="utf-8", errors="replace") if service_path.is_file() else ""
+    dest.write(f"LOAD_DIAGNOSTIC_RECORDS={sum('[MOE-MTE LOAD]' in line for line in service.splitlines())}\n")
     if trace_startup:
         wrapper_path = run_dir.parent / "wrapper.log"
         wrapper = wrapper_path.read_text(encoding="utf-8", errors="replace") if wrapper_path.is_file() else ""
@@ -219,7 +222,7 @@ def append_evidence(dest, run_dir, code, trace_startup=False):
     # End-of-capture records prove that no split publication was left unjoined.
     end_records = [line for line in placements if '"phase": "capture_end"' in line]
     dest.write(f"WAIT_PLACEMENT_RECORDS={len(placements)}; CAPTURE_END_RECORDS={len(end_records)}\n")
-    for line in placements[:2] + end_records[-6:] + placements[-2:]:
+    for line in dict.fromkeys(placements[:2] + end_records[-6:] + placements[-2:]):
         dest.write(line[:2000] + "\n")
     dest.write("\n".join(graph_evidence(run_dir)) + "\n")
     if state == "inconclusive":
@@ -238,6 +241,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", required=True, type=npu_number)
     parser.add_argument("--trace-startup", action="store_true", help="Trace this single run's startup and child exits")
+    parser.add_argument(
+        "--no-load-diagnostics",
+        action="store_true",
+        help="Remove only the per-load diagnostic path; keep strict protocol waits",
+    )
     args = parser.parse_args()
     if sys.platform != "linux":
         parser.error("请在绿区 Linux NPU 容器运行")
@@ -250,11 +258,17 @@ def main():
         if args.trace_startup:
             dest.write("一次带启动观测的等待位置运行；阶段日志、崩溃栈与子进程退出状态，启动成功后继续原定请求。\n")
         dest.write("等待位置设置：早发布，预取严格等待与映射写回延后到主流消费者汇合点。\n")
-        dest.write("不改核数、原始拷贝、worker策略和加载流；保留逐项诊断同步，不作性能比较。\n")
+        dest.write("不改核数、原始拷贝、worker策略和加载流，不作性能比较。\n")
+        dest.write(f"LOAD_DIAGNOSTICS_REQUESTED={not args.no_load_diagnostics}\n")
+        dest.write(
+            "从第一批恢复普通批量加载；保留加载流最终同步、严格generation wait和消费者join。\n"
+            if args.no_load_diagnostics
+            else "保留前8批逐项诊断同步。\n"
+        )
         dest.write("1次预热+3次有限请求；跳过profiler；不重跑原主流组或辅助流组。\n")
         dest.write(host_memory_snapshot() + "\n")
         dest.flush()
-        code = run_once(root, output / "consumer_join", args.npu, args.trace_startup)
+        code = run_once(root, output / "consumer_join", args.npu, args.trace_startup, args.no_load_diagnostics)
         append_evidence(dest, output / "consumer_join", code, args.trace_startup)
     print(f"仅返回检查脱敏后的文件内容：{summary}", flush=True)
 

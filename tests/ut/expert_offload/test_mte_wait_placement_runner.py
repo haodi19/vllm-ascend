@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import shlex
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,11 @@ class WaitPlacementRunnerTests(unittest.TestCase):
             )
             cls.runner = importlib.util.module_from_spec(runner_spec)
             runner_spec.loader.exec_module(cls.runner)
+            mapping_spec = importlib.util.spec_from_file_location(
+                "mapping_runner_test", cls.root / "script/diagnose_mte_graph_mapping.py"
+            )
+            cls.mapping = importlib.util.module_from_spec(mapping_spec)
+            mapping_spec.loader.exec_module(cls.mapping)
 
     @staticmethod
     def node(stream, task, name, kind="KERNEL_AIVEC"):
@@ -113,12 +119,107 @@ class WaitPlacementRunnerTests(unittest.TestCase):
             process = Mock()
             process.wait.return_value = 1
             with patch.object(self.module.subprocess, "Popen", return_value=process) as launch:
-                self.assertEqual(self.module.run_once(root, root / "consumer_join", 7, trace_startup=True), 1)
+                self.assertEqual(
+                    self.module.run_once(root, root / "consumer_join", 7, trace_startup=True, no_load_diagnostics=True),
+                    1,
+                )
             launch.assert_called_once()
             command = launch.call_args.args[0]
             self.assertIn("--trace-startup", command)
+            self.assertIn("--no-load-diagnostics", command)
             self.assertIn("--prefetch-wait-at-join", command)
             self.assertNotIn("--native-stream-limits", command)
+
+    def test_graph_runner_removes_native_diagnostic_request_and_keeps_workload(self):
+        graph = SimpleNamespace(enable_debug_mode=lambda: None, debug_dump=lambda self, path: None)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "case"
+
+            def launch(command, **kwargs):
+                output.mkdir()
+                return contextlib.nullcontext(Mock(wait=Mock(return_value=0)))
+
+            with (
+                patch.dict(sys.modules, {"torch_npu": SimpleNamespace(npu=SimpleNamespace(NPUGraph=graph))}),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "mapping",
+                        "--npu",
+                        "7",
+                        "--prefetch-wait-at-join",
+                        "--trace-startup",
+                        "--no-load-diagnostics",
+                        "--output-dir",
+                        str(output),
+                    ],
+                ),
+                patch.object(self.mapping.subprocess, "Popen", side_effect=launch) as launched,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(self.mapping.main(), 0)
+            launched.assert_called_once()
+            command = launched.call_args.args[0]
+            self.assertNotIn("--diagnose-native-wait", command)
+            for flag in (
+                "--no-load-diagnostics",
+                "--diagnose-prefetch-wait-at-join",
+                "--diagnose-graph-dump",
+                "--skip-profile",
+                "--trace-startup",
+            ):
+                self.assertIn(flag, command)
+            self.assertEqual(command[command.index("--requests") + 1], "3")
+            self.assertEqual(command[command.index("--warmup-requests") + 1], "1")
+
+    def test_no_load_diagnostics_overrides_inherited_flags_without_changing_other_config(self):
+        offload = dict(
+            expert_offload=True,
+            expert_prefetch_enabled=True,
+            host_sync_diagnose_graph_dump=True,
+            host_sync_diagnose_load=True,
+            host_sync_diagnose_native_wait=True,
+        )
+        source = "vllm serve /model --additional-config " + shlex.quote(json.dumps(dict(expert_offload_config=offload)))
+        configs = []
+        for disabled in (False, True):
+            words = shlex.split(
+                self.runner.configured_source(
+                    source, "mte", "/lib.so", diagnose_prefetch_wait_at_join=True, no_load_diagnostics=disabled
+                )
+            )
+            config = json.loads(words[words.index("--additional-config") + 1])["expert_offload_config"]
+            self.assertEqual(config.pop("host_sync_diagnose_load"), not disabled)
+            self.assertEqual(config.pop("host_sync_diagnose_native_wait"), not disabled)
+            self.assertTrue(config["host_sync_diagnose_prefetch_wait_at_join"])
+            configs.append(config)
+        self.assertEqual(configs[0], configs[1])
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self.runner.configured_source(source, "mte", "/lib.so", no_load_diagnostics=True, diagnose_native_wait=True)
+
+    def test_no_load_option_rejects_conflicting_diagnostics_before_launch(self):
+        with (
+            patch.object(
+                sys,
+                "argv",
+                [
+                    "runner",
+                    "--npu",
+                    "7",
+                    "--backend",
+                    "mte",
+                    "--diagnose-prefetch-wait-at-join",
+                    "--no-load-diagnostics",
+                    "--diagnose-native-wait",
+                ],
+            ),
+            contextlib.redirect_stderr(io.StringIO()),
+            patch.object(self.runner, "run") as run,
+            self.assertRaises(SystemExit),
+        ):
+            self.runner.main()
+        run.assert_not_called()
 
     def test_wrapper_cleanup_survives_diagnostic_log_failure(self):
         log, process = Mock(), Mock(pid=123)
