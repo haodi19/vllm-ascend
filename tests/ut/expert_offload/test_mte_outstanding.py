@@ -23,6 +23,15 @@ class OutstandingTests(unittest.TestCase):
         ]
         self.assertEqual(self.module.snapshot_targets(lines), {(23, 64)})
 
+    def test_graph_snapshot_includes_mixed_kernel_and_waits(self):
+        lines = [
+            "PrintStreamTimeoutSnapshotInfo:stream_id=21, task_id=2, taskType=66 (KERNEL_AIVEC).",
+            "PrintStreamTimeoutSnapshotInfo:stream_id=23, task_id=82, taskType=0 (KERNEL_AICORE), kernel_name=HcPre.",
+            "PrintStreamTimeoutSnapshotInfo:stream_id=22, task_id=11, taskType=111 (EVENT_WAIT).",
+            "PrintStreamTimeoutSnapshotInfo: get stream wait timeout snapshot suc",
+        ]
+        self.assertEqual(self.module.snapshot_targets(lines, all_types=True), {(21, 2), (23, 82), (22, 11)})
+
     def test_last_submission_survives_later_timeout_lookup(self):
         lines = ["AllocTaskInfo: stream_id=23 task_id=64 task_sn=1"] + ["noise"] * 50
         lines += ["StreamLaunchKernelV2: kernel_name=target", "DavidSendTask: stream_id=23 task_id=64 task_sn=2"] + [

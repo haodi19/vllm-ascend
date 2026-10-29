@@ -50,6 +50,15 @@ class GraphReaderTests(unittest.TestCase):
         self.assertIn("EVENT_RECORD_9", out.getvalue())
         self.assertNotIn('"name": "compute_2"', out.getvalue())
 
+    def test_graph_reader_reports_aicore_hcpre_metadata(self):
+        event = self.node(63, 23, 82, "HcPre_1000")
+        event["args"].update({"Task Type": "KERNEL_AICORE", "Numblocks": 28, "Schem Mode": 1})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.module.report_graph([event], {(23, 82)}, compact=True)
+        self.assertIn('"name": "HcPre_1000"', out.getvalue())
+        self.assertIn('"Numblocks": 28', out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -99,7 +99,7 @@ def main():
                 for line in source:
                     if "PrintStreamTimeoutSnapshotInfo:" in line:
                         snapshot_lines.add(line.strip())
-                        targets.update(snapshot_targets([line]))
+                        targets.update(snapshot_targets([line], all_types=True))
     print(f"本轮 PID={pid}; targets={sorted(targets)}；仅使用本轮快照，不套用旧进程编号。")
     print(f"SNAPSHOT_LINES={len(snapshot_lines)}；若有多个超时时刻，以下目标为并集，不能视作同一瞬间。")
     for line in sorted(snapshot_lines)[:30]:

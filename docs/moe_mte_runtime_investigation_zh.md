@@ -227,3 +227,27 @@ eager 下，expert_offload_manager.py 的预取分支在非 capturing 时直接�
 _prefetch_host_cb，不经过 MteHostDispatcher.launch；按需分支同样直接调用 CPU 函数。
 因此 eager 或 eager 加同步下发可作为原始算子路径的辅助对照，但会移除待查的图内
 驻留等待组合；即使通过，也不能证明纯 MTE 图路径已修复。
+
+### 减核后主计算流的快照位置变化
+
+PID=77262 的同一时刻快照显示，主计算流23当前任务为82，名称
+HcPre_c12a9d608e5abdbd1728e849208025ff_1000，类型 KERNEL_AICORE；
+预取流21仍为 task2 host_sync_wait，加载流27仍为 task699。
+因此减小路由 block 数后，主计算流快照位置已经越过此前的路由 task64。
+这支持“干预影响了主计算流推进”的判断，但没有消除加载等待，不能将路由宣布为唯一根因。
+快照本身也不区分 HcPre 尚未获调度与已开始执行后的内部等待。
+
+旧解析器沿用了仅选 KERNEL_AIVEC 的过滤条件，导致打印了原始 HcPre 快照却未匹配
+它的图节点。这是诊断工具遗漏，已改为图解析覆盖快照中的全部任务类型，包括
+AICORE、EVENT_WAIT、NOTIFY_WAIT；不在捕获图中的任务仍明确标记缺失。
+
+本地源码的调用链为 DeepSeekV4DecoderLayer.hc_pre → npu_hc_pre_v2 →
+run_hc_pre_fusion → aclnnHcPre。csrc/moe/hc_pre/op_kernel/hc_pre.cpp 声明
+KERNEL_TYPE_MIX_AIC_1_2；950 分支的 tiling key 1000 使用 MKSplitCore 实现，
+其中有 CrossCoreWaitFlag 和 SyncAll。也就是说，不能把快照的 AICORE 标签解释成
+不需要 Vector 核。绿区二进制是否与此源码完全一致、实际执行是否卡在其中某个等待，
+仍未验证，不能直接把源码中的等待指令当作已经捕获的阻塞位置。
+
+下一步先复用同一份图检查 HcPre 的 block 数、调度模式和 Event 依赖，不重跑模型，
+也不直接修改其跨核同步或调度模式。此次仍沿着“预取 AIV 驻留等待与真实模型算子
+组合导致加载流无法推进”的方向排查，待查对象从路由扩展到快照中实际出现的混合算子。

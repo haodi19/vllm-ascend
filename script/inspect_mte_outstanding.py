@@ -17,11 +17,13 @@ def task_pair(line):
     return (int(stream.group(1)), int(task.group(1))) if stream and task else None
 
 
-def snapshot_targets(lines):
+def snapshot_targets(lines, all_types=False):
     return {
         task_pair(line)
         for line in lines
-        if "PrintStreamTimeoutSnapshotInfo:" in line and "KERNEL_AIVEC" in line and task_pair(line)
+        if "PrintStreamTimeoutSnapshotInfo:" in line
+        and (all_types or "KERNEL_AIVEC" in line)
+        and task_pair(line)
     }
 
 
