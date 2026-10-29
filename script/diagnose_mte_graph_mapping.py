@@ -131,6 +131,21 @@ def main():
             dest.write(line + "\n")
         if not count:
             dest.write("未命中图打印记录；需区分日志位置/格式或接口输出，不解释为图没有任务。\n")
+        if "[MOE-MTE ACL_DETAIL]" in text:
+            dest.write("\n=== 本轮超时快照与图内任务匹配 ===\n")
+            dest.flush()
+            try:
+                mapped = subprocess.run(
+                    [sys.executable, "-B", str(root / "script/inspect_mte_graph_dump.py"), str(output), "--compact"],
+                    cwd=root,
+                    stdout=dest,
+                    stderr=subprocess.STDOUT,
+                    timeout=120,
+                    check=False,
+                )
+                dest.write(f"SNAPSHOT_MAPPING_EXIT={mapped.returncode}\n")
+            except subprocess.TimeoutExpired:
+                dest.write("SNAPSHOT_MAPPING_TIMEOUT；保留原始日志，不解释为没有任务映射。\n")
     print(f"仅返回此文件：{report}", flush=True)
     return code
 

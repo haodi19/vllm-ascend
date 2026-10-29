@@ -201,3 +201,29 @@ Numblocks、Schem Mode，以及请求结果或失败位置。判断规则为：
   不重复宣称原 scale 拷贝的位置是新发现。
 
 此诊断包含额外 ACL 调用、Host 提交队列排空和 Runtime DEBUG，不用于性能收益比较。
+
+### 路由降为5个 block 仍超时，以及同步下发对照的边界
+
+`mte_graph_mapping_6180ccf9`（PID=77262）请求路由上限5。图文件确认
+MoeInitRoutingV3 为5个 block、模式1，host_sync_wait 仍为1个 block、模式0。
+第二次交接仍停在预取 layer1 的 w13_weight_scale 原始拷贝后的等待，
+加载流27/task699 返回507046；w13 和 w2 已分别完成，slot2 的 request=1、done=0。
+这次核数干预有效但未解除阻塞，不能再用“56个 block 必须占满核”作为充分解释。
+本轮摘要没有主计算流超时快照，不能沿用 PID=74275 的 task64 身份判断仍是路由在等待。
+
+下一步只读本轮 Runtime 快照并关联本轮图，区分主计算流是否推进到其他算子。
+解析脚本增加精简模式；运行诊断脚本也自动附带该映射，避免下次再次单独补采。
+多个快照时刻的目标并集不代表同一瞬间，输出保留原始快照时间以便核对。
+
+```bash
+python -B script/inspect_mte_graph_dump.py bench_results/mte_graph_mapping_6180ccf9 --compact
+```
+
+`ASCEND_LAUNCH_BLOCKING=1` 用于强制算子同步执行、改善异步错误的调用栈定位，
+并关闭 Torch NPU task queue，见
+[官方环境变量说明](https://github.com/Ascend/pytorch/blob/master/docs/zh/api/environment_variable/op_execution/ASCEND_LAUNCH_BLOCKING.md)。
+本分支 platform.py 明确拒绝该设置与 ACL 图同时启用，因此不绕过校验直接测试原图。
+eager 下，expert_offload_manager.py 的预取分支在非 capturing 时直接调用
+_prefetch_host_cb，不经过 MteHostDispatcher.launch；按需分支同样直接调用 CPU 函数。
+因此 eager 或 eager 加同步下发可作为原始算子路径的辅助对照，但会移除待查的图内
+驻留等待组合；即使通过，也不能证明纯 MTE 图路径已修复。

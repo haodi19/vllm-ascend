@@ -44,7 +44,7 @@ def event_candidates(nodes, event):
     ]
 
 
-def report_graph(events, targets):
+def report_graph(events, targets, compact=False):
     nodes = [event for event in events if isinstance(event, dict) and identity(event) is not None]
     print(f"nodes={len(nodes)}; models={sorted({identity(node)[0] for node in nodes})}")
     print("Task Type counts=" + json.dumps(Counter(node.get("args", {}).get("Task Type") for node in nodes)))
@@ -60,7 +60,8 @@ def report_graph(events, targets):
             )
             index = next(i for i, node in enumerate(track) if node is event)
             print("MATCH " + describe(event))
-            window = track[max(0, index - 5) : index + 7]
+            radius = 1 if compact else 5
+            window = track[max(0, index - radius) : index + (2 if compact else 7)]
             for node in window:
                 print("  NEIGHBOR " + describe(node))
                 candidates = event_candidates(nodes, node)
@@ -84,17 +85,25 @@ def report_graph(events, targets):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path)
+    parser.add_argument("--compact", action="store_true", help="只输出目标及紧邻节点，保留 Event 依赖候选")
     parser.add_argument("--log-root", type=Path, default=Path.home() / "ascend/log/debug/plog")
     args = parser.parse_args()
     service = (args.run_dir / "mte/inference_python.log").read_text(encoding="utf-8", errors="replace")
     pid, stream, task = failure_identity(service)
     targets = {(stream, task)}
     pid_pattern = re.compile(rf"(?<!\d){pid}(?!\d)")
-    for path in sorted(args.log_root.glob("*")):
-        if path.is_file() and pid_pattern.search(path.name):
+    snapshot_lines = set()
+    for path in sorted(args.log_root.rglob("*")):
+        if path.is_file() and pid_pattern.search(path.name) and path.suffix not in (".gz", ".zip"):
             with path.open(encoding="utf-8", errors="replace") as source:
-                targets.update(snapshot_targets(source))
+                for line in source:
+                    if "PrintStreamTimeoutSnapshotInfo:" in line:
+                        snapshot_lines.add(line.strip())
+                        targets.update(snapshot_targets([line]))
     print(f"本轮 PID={pid}; targets={sorted(targets)}；仅使用本轮快照，不套用旧进程编号。")
+    print(f"SNAPSHOT_LINES={len(snapshot_lines)}；若有多个超时时刻，以下目标为并集，不能视作同一瞬间。")
+    for line in sorted(snapshot_lines)[:30]:
+        print("SNAPSHOT " + line[:1600])
     print("图 dump 表达捕获结构；ts/dur 不作为实测时延、开始执行或完成证据。")
     paths = sorted((args.run_dir / "mte/graph_debug").rglob("graph_dump*"))
     for path in paths:
@@ -106,7 +115,7 @@ def main():
             events = data.get("traceEvents", []) if isinstance(data, dict) else data
             if not isinstance(events, list):
                 raise ValueError("不是事件列表")
-            report_graph(events, targets)
+            report_graph(events, targets, compact=args.compact)
         except (ValueError, UnicodeError) as exc:
             print(f"UNREADABLE_GRAPH {exc}")
     if not paths:

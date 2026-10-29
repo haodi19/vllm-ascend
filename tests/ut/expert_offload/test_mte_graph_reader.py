@@ -38,6 +38,18 @@ class GraphReaderTests(unittest.TestCase):
         self.assertIn("host_sync_wait_2", out.getvalue())
         self.assertIn("NOT_IN_THIS_GRAPH", out.getvalue())
 
+    def test_compact_keeps_target_and_remote_event_candidate(self):
+        nodes = [self.node(63, 23, task, f"compute_{task}") for task in range(15)]
+        nodes[0]["name"] = "EVENT_WAIT_9"
+        nodes[7]["name"] = "MoeInitRoutingV3"
+        nodes.append(self.node(63, 21, 4, "EVENT_RECORD_9"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.module.report_graph(nodes, {(23, 7)}, compact=True)
+        self.assertIn("MoeInitRoutingV3", out.getvalue())
+        self.assertIn("EVENT_RECORD_9", out.getvalue())
+        self.assertNotIn('"name": "compute_2"', out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
