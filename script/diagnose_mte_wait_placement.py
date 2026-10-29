@@ -2,6 +2,7 @@
 """仅运行一次预取等待位置诊断，保留严格完成条件，汇总捕获结构与有限请求结果。"""
 
 import argparse
+import contextlib
 import json
 import re
 import shlex
@@ -22,6 +23,7 @@ from diagnose_mte_resource_scope import (
 )
 from inspect_mte_graph_dump import event_candidates, identity
 from run_host_sync_stage1 import npu_number
+from summarize_mte_startup import startup_evidence
 
 MAX_GRAPH_EXAMPLES = 2
 
@@ -141,7 +143,26 @@ def effective_configuration(text):
     return "EFFECTIVE_CONFIG " + json.dumps(result, ensure_ascii=False)
 
 
-def run_once(root, run_dir, npu):
+def wrapper_cleanup_marker(process, log, reason):
+    # Observation must not prevent the existing process-group cleanup.
+    with contextlib.suppress(Exception):
+        print(
+            "[MOE-MTE RUNNER] "
+            + json.dumps(
+                dict(
+                    event="wrapper_cleanup_begin",
+                    wrapper_pid=process.pid,
+                    reason=reason,
+                    wall_time_ns=time.time_ns(),
+                    monotonic_ns=time.monotonic_ns(),
+                )
+            ),
+            file=log,
+            flush=True,
+        )
+
+
+def run_once(root, run_dir, npu, trace_startup=False):
     command = [
         sys.executable,
         "-B",
@@ -152,6 +173,8 @@ def run_once(root, run_dir, npu):
         "--output-dir",
         str(run_dir),
     ]
+    if trace_startup:
+        command.append("--trace-startup")
     with (run_dir.parent / "wrapper.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command, cwd=root, stdout=log, stderr=subprocess.STDOUT, start_new_session=(sys.platform == "linux")
@@ -163,14 +186,18 @@ def run_once(root, run_dir, npu):
                     return process.wait(timeout=PROGRESS_SECONDS)
                 except subprocess.TimeoutExpired:
                     print(f"WAIT consumer_join: {time.monotonic() - started:.0f}s", flush=True)
+            if trace_startup:
+                wrapper_cleanup_marker(process, log, "total_timeout")
             stop_owned_process_group(process)
             return None
         except BaseException:
+            if trace_startup:
+                wrapper_cleanup_marker(process, log, "interrupted")
             stop_owned_process_group(process)
             raise
 
 
-def append_evidence(dest, run_dir, code):
+def append_evidence(dest, run_dir, code, trace_startup=False):
     report_path = run_dir / "graph_diagnosis.txt"
     report = report_path.read_text(encoding="utf-8", errors="replace") if report_path.is_file() else ""
     state = request_outcome(report, code)
@@ -184,6 +211,10 @@ def append_evidence(dest, run_dir, code):
             dest.write(line[:2000] + "\n")
     service_path = run_dir / "mte/inference_python.log"
     service = service_path.read_text(encoding="utf-8", errors="replace") if service_path.is_file() else ""
+    if trace_startup:
+        wrapper_path = run_dir.parent / "wrapper.log"
+        wrapper = wrapper_path.read_text(encoding="utf-8", errors="replace") if wrapper_path.is_file() else ""
+        dest.write("\n".join(startup_evidence(service, wrapper)) + "\n")
     placements = [line for line in service.splitlines() if "[MOE-MTE WAIT_PLACEMENT]" in line]
     # End-of-capture records prove that no split publication was left unjoined.
     end_records = [line for line in placements if '"phase": "capture_end"' in line]
@@ -192,6 +223,8 @@ def append_evidence(dest, run_dir, code):
         dest.write(line[:2000] + "\n")
     dest.write("\n".join(graph_evidence(run_dir)) + "\n")
     if state == "inconclusive":
+        if trace_startup and not service:
+            dest.write(failure_context(runner_summary) + "\n")
         dest.write(failure_context(service_path) + "\n")
         dest.write(failure_context(run_dir.parent / "wrapper.log") + "\n")
         dest.write(kernel_failure_context() + "\n")
@@ -204,6 +237,7 @@ def append_evidence(dest, run_dir, code):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", required=True, type=npu_number)
+    parser.add_argument("--trace-startup", action="store_true", help="Trace this single run's startup and child exits")
     args = parser.parse_args()
     if sys.platform != "linux":
         parser.error("请在绿区 Linux NPU 容器运行")
@@ -213,13 +247,15 @@ def main():
     summary = output / "summary.txt"
     print(f"SUMMARY FILE: {summary}", flush=True)
     with summary.open("w", encoding="utf-8") as dest:
-        dest.write("单次新实验：早发布，预取严格等待与映射写回延后到主流消费者汇合点。\n")
+        if args.trace_startup:
+            dest.write("一次带启动观测的等待位置运行；阶段日志、崩溃栈与子进程退出状态，启动成功后继续原定请求。\n")
+        dest.write("等待位置设置：早发布，预取严格等待与映射写回延后到主流消费者汇合点。\n")
         dest.write("不改核数、原始拷贝、worker策略和加载流；保留逐项诊断同步，不作性能比较。\n")
         dest.write("1次预热+3次有限请求；跳过profiler；不重跑原主流组或辅助流组。\n")
         dest.write(host_memory_snapshot() + "\n")
         dest.flush()
-        code = run_once(root, output / "consumer_join", args.npu)
-        append_evidence(dest, output / "consumer_join", code)
+        code = run_once(root, output / "consumer_join", args.npu, args.trace_startup)
+        append_evidence(dest, output / "consumer_join", code, args.trace_startup)
     print(f"仅返回检查脱敏后的文件内容：{summary}", flush=True)
 
 

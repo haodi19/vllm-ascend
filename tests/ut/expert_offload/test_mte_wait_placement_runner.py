@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU tests for capture-evidence checks and the single-run diagnostic wrapper."""
 
+import contextlib
 import importlib.util
 import io
 import json
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -103,6 +105,60 @@ class WaitPlacementRunnerTests(unittest.TestCase):
             self.assertIn("--prefetch-wait-at-join", command)
             self.assertNotIn("--compute-cube-cores", command)
             self.assertNotIn("--dsa-cube-cores", command)
+            self.assertNotIn("--trace-startup", command)
+
+    def test_startup_trace_still_launches_one_wait_placement_case(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = Mock()
+            process.wait.return_value = 1
+            with patch.object(self.module.subprocess, "Popen", return_value=process) as launch:
+                self.assertEqual(self.module.run_once(root, root / "consumer_join", 7, trace_startup=True), 1)
+            launch.assert_called_once()
+            command = launch.call_args.args[0]
+            self.assertIn("--trace-startup", command)
+            self.assertIn("--prefetch-wait-at-join", command)
+            self.assertNotIn("--native-stream-limits", command)
+
+    def test_wrapper_cleanup_survives_diagnostic_log_failure(self):
+        log, process = Mock(), Mock(pid=123)
+        log.write.side_effect = OSError("diagnostic output unavailable")
+        with (
+            patch.object(Path, "open", return_value=contextlib.nullcontext(log)),
+            patch.object(self.module.subprocess, "Popen", return_value=process),
+            patch.object(self.module, "CASE_TIMEOUT_SECONDS", 0),
+            patch.object(self.module, "stop_owned_process_group") as cleanup,
+        ):
+            self.assertIsNone(self.module.run_once(Path("tree"), Path("tree/case"), 7, trace_startup=True))
+        cleanup.assert_called_once_with(process)
+        log.write.assert_called_once()
+
+    def test_failed_observer_preflight_stops_before_build_or_model(self):
+        output = io.StringIO()
+        with (
+            patch.object(self.runner, "run_step", return_value=False),
+            patch.object(self.runner, "prepare_runtime_artifacts") as artifacts,
+            patch.object(self.runner, "inference") as inference,
+            contextlib.redirect_stdout(output),
+        ):
+            code = self.runner.run(SimpleNamespace(trace_startup=True), Path("unused"))
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED: startup observation preflight", output.getvalue())
+        self.assertIn("model not launched", output.getvalue())
+        artifacts.assert_not_called()
+        inference.assert_not_called()
+
+    def test_startup_option_requires_the_same_mte_wait_placement_case(self):
+        for backend in ("callback", "mte"):
+            with (
+                self.subTest(backend=backend),
+                patch.object(sys, "argv", ["runner", "--npu", "7", "--backend", backend, "--trace-startup"]),
+                contextlib.redirect_stderr(io.StringIO()),
+                patch.object(self.runner, "run") as run,
+                self.assertRaises(SystemExit),
+            ):
+                self.runner.main()
+            run.assert_not_called()
 
     def test_success_summary_keeps_absent_structure_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -112,6 +168,24 @@ class WaitPlacementRunnerTests(unittest.TestCase):
             self.module.append_evidence(output, root, 0)
             self.assertIn("finite_requests_passed", output.getvalue())
             self.assertIn("GATE_GRAPH_UNVERIFIED", output.getvalue())
+
+    def test_startup_observation_and_request_result_remain_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "graph_diagnosis.txt").write_text("RUNNER_EXIT=0\nMOE_RESULT {}", encoding="utf-8")
+            (root / "mte").mkdir()
+            service = "(EngineCore pid=123) loading\n[MOE-MTE PROCESS] " + json.dumps(
+                dict(event="exit", child_pid=123, observer_pid=12, returncode=-15, signal="SIGTERM", monotonic_ns=30)
+            )
+            service += "\n[MOE-MTE RUNNER] " + json.dumps(dict(event="cleanup_begin", api_pid=12, monotonic_ns=20))
+            (root / "mte/inference_python.log").write_text(service, encoding="utf-8")
+            output = io.StringIO()
+            self.module.append_evidence(output, root, 0, trace_startup=True)
+            summary = output.getvalue()
+        self.assertIn("RESULT=finite_requests_passed", summary)
+        self.assertIn('"returncode": -15', summary)
+        self.assertIn('"observed_after_runner_cleanup": true', summary)
+        self.assertIn("STARTUP_TRACE_STATUS=UNVERIFIED", summary)  # No arm markers: do not claim complete coverage.
 
     def test_runner_config_enables_only_mte_and_preserves_model(self):
         source = 'vllm serve /model --additional-config \'{"expert_offload_config": {"expert_offload": true}}\''
@@ -128,6 +202,8 @@ class WaitPlacementRunnerTests(unittest.TestCase):
         self.assertNotIn("secret", text)
         self.assertIn("UNAVAILABLE", self.module.effective_configuration(command + "\n" + command))
         self.assertIn("UNAVAILABLE", self.module.effective_configuration(command + " '"))
+        traced = command.replace("vllm serve", "python -B /tree/script/mte_startup_bootstrap.py --diagnostic serve")
+        self.assertEqual(self.module.effective_configuration(command), self.module.effective_configuration(traced))
 
 
 if __name__ == "__main__":

@@ -184,6 +184,9 @@ def main():
     )
     parser.add_argument("--skip-profile", action="store_true", help="Run finite requests without starting profiler")
     parser.add_argument(
+        "--trace-startup", action="store_true", help="Observe process exits for the wait-at-join diagnosis"
+    )
+    parser.add_argument(
         "--diagnose-prefetch-poll-budget",
         type=int,
         default=0,
@@ -233,6 +236,8 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
+    if args.trace_startup and (args.backend != "mte" or not args.diagnose_prefetch_wait_at_join):
+        parser.error("--trace-startup requires --backend mte --diagnose-prefetch-wait-at-join")
     if args.diagnose_load_vector_cores:
         args.diagnose_native_wait = True
     if not 0 <= args.diagnose_prefetch_poll_budget <= 10_000_000:
@@ -274,6 +279,13 @@ def main():
 
 
 def run(args, root):
+    if getattr(args, "trace_startup", False):
+        for name in ("test_mte_startup_bootstrap.py", "test_startup_diagnostics.py"):
+            if not run_step(
+                "startup observation CPU regression", [sys.executable, "-B", f"tests/ut/expert_offload/{name}"], 120
+            ):
+                print(f"FAILED: startup observation preflight {name}; model not launched", flush=True)
+                return 1
     if args.runtime_source is not None:
         prepare_runtime_artifacts(args.runtime_source, REPOSITORY_ROOT)
     backends = ("callback", "mte") if args.backend == "both" else (args.backend,)
@@ -356,6 +368,7 @@ def run(args, root):
             strict_profile=False,
             mstx=True,
             skip_profile=args.skip_profile,
+            trace_startup=getattr(args, "trace_startup", False),
         )
         print(f"\n=== REAL MOE HOST BACKEND: {backend} ===", flush=True)
         print(

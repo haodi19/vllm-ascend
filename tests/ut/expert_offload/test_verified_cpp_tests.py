@@ -164,6 +164,60 @@ class TestVerifiedRunner(unittest.TestCase):
         cls.module = runpy.run_path(str(REPO / "script/run_verified_cpp_tests.py"))
         cls.source = (REPO / "script/test_graph2.sh").read_text(encoding="utf-8")
 
+    def test_startup_entry_keeps_all_validated_serve_options(self):
+        _, command, _, _ = self.module["launch_spec"](self.source, "python", 7, 8155, 18155)
+        before = list(command)
+        traced = self.module["startup_trace_command"](command)
+        self.assertEqual(command, before)
+        self.assertEqual(traced[4:], command[1:])
+        self.assertEqual(traced[:2], [sys.executable, "-B"])
+        self.assertEqual(Path(traced[2]), REPO / "script/mte_startup_bootstrap.py")
+        self.assertEqual(traced[3], "--diagnostic")
+        with self.assertRaisesRegex(ValueError, "validated"):
+            self.module["startup_trace_command"](["bash", "serve", "model"])
+
+    def test_startup_exit_keeps_error_and_marks_cleanup_before_signaling(self):
+        fn = self.module["_inference"]
+        for enabled, broken_log in ((False, False), (True, False), (True, True)):
+            with self.subTest(enabled=enabled, broken_log=broken_log):
+                args = types.SimpleNamespace(
+                    npu=7,
+                    port=8155,
+                    timing_port=18155,
+                    profile_run_dir=Path("profile"),
+                    startup_timeout=20,
+                    trace_startup=enabled,
+                )
+                process = Mock(pid=123, returncode=1)
+                process.poll.return_value = 1
+                service, output = io.StringIO(), io.StringIO()
+                log = Mock() if broken_log else service
+                if broken_log:
+                    log.write.side_effect = OSError("diagnostic output unavailable")
+
+                def cleanup(child, expected=process, log=service, traced=enabled and not broken_log):
+                    self.assertIs(child, expected)
+                    self.assertEqual("cleanup_begin" in log.getvalue(), traced)
+
+                with (
+                    patch.dict(
+                        fn.__globals__,
+                        {"assert_port_free": Mock(), "stop_owned_service": cleanup, "wait_service_ports_free": Mock()},
+                    ),
+                    patch("subprocess.Popen", return_value=process) as launch,
+                    contextlib.redirect_stdout(output),
+                    self.assertRaisesRegex(RuntimeError, "Service exited during startup: 1"),
+                ):
+                    fn(args, self.source, "python", {}, log)
+                shell = launch.call_args.args[0][-1]
+                self.assertEqual("mte_startup_bootstrap.py" in shell, enabled)
+                if enabled:
+                    record = json.loads(output.getvalue().split("[MOE-MTE RUNNER] ", 1)[1].splitlines()[0])
+                    self.assertEqual(record["api_pid"], 123)
+                    self.assertEqual(record["api_returncode"], 1)
+                    self.assertEqual(record["reason"], "RuntimeError")
+                    self.assertNotIn("engine_pid", record)
+
     def test_profile_stop_failures_do_not_block_second_backend(self):
         fn = self.module["run_tests"]
         started, stopped = [], []

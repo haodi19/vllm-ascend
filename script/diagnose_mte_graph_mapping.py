@@ -27,8 +27,11 @@ def main():
     parser.add_argument("--dsa-cube-cores", type=int, default=0, choices=range(29))
     parser.add_argument("--native-stream-limits", action="store_true")
     parser.add_argument("--prefetch-wait-at-join", action="store_true")
+    parser.add_argument("--trace-startup", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
+    if args.trace_startup and not args.prefetch_wait_at_join:
+        parser.error("--trace-startup requires --prefetch-wait-at-join")
     if args.dsa_cube_cores and not args.compute_cube_cores:
         parser.error("--dsa-cube-cores requires --compute-cube-cores")
     if args.native_stream_limits and not args.compute_cube_cores:
@@ -91,6 +94,8 @@ def main():
     if args.prefetch_wait_at_join:
         command += ["--diagnose-prefetch-wait-at-join", "--skip-profile"]
         command[command.index("--requests") + 1] = "3"
+    if args.trace_startup:
+        command += ["--trace-startup"]
     print(f"纯 MTE 图诊断；routing_cores={args.routing_cores}（0不改）；原始拷贝、严格预取等待。", flush=True)
     print(f"完整构建/服务日志保留在 {output}", flush=True)
     with subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT) as proc:

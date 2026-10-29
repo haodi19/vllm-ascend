@@ -139,6 +139,7 @@ from vllm_ascend.expert_offload.expert_offload_manager import (
     get_expert_offload_manager,
 )
 from vllm_ascend.expert_offload.decode_stats import get_decode_stats
+from vllm_ascend.expert_offload.startup_diagnostics import StartupDiagnostics
 from vllm_ascend.ops.rotary_embedding import set_cos_and_sin, update_cos_sin
 from vllm_ascend.ops.triton.spec_decode.ngram import triton_ngram_spec_decode
 from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
@@ -3832,6 +3833,8 @@ class NPUModelRunner(GPUModelRunner):
     def load_model(self) -> None:
         load_model_start_time = time.perf_counter()
         logger.info("Starting to load model %s...", self.model_config.model)
+        startup = StartupDiagnostics.from_config(self.vllm_config)
+        startup.arm("runner.faulthandler")
 
         if self.ascend_config.mix_placement:
             # TODO: Enabling the mix placement in deepseek_v2.py
@@ -3841,7 +3844,7 @@ class NPUModelRunner(GPUModelRunner):
             rocm_aiter_ops.is_fusion_moe_shared_experts_enabled = mock_true
             rocm_aiter_ops.is_fused_moe_enabled = mock_true
 
-        with DeviceMemoryProfiler() as m:  # noqa: SIM117
+        with startup.stage("runner.model_load_profile"), DeviceMemoryProfiler() as m:  # noqa: SIM117
             if self.eplb_enable:
                 def mock_pass(param1, param2):
                     return
@@ -3869,7 +3872,7 @@ class NPUModelRunner(GPUModelRunner):
                 logger.info("Loading drafter model...")
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
-                with get_tp_context(self.drafter):
+                with get_tp_context(self.drafter), startup.stage("runner.drafter_load_model"):
                     self.drafter.load_model(self.model)
 
             pp_group = get_pp_group()
@@ -3931,6 +3934,8 @@ class NPUModelRunner(GPUModelRunner):
 
             if self.lora_config:
                 self.model = self.load_lora_model(self.model, self.vllm_config, self.device)
+            startup.mark("runner.memory_profile_exit", "begin")
+        startup.mark("runner.memory_profile_exit", "end")
         self.model_memory_usage = m.consumed_memory
         logger.info("Loading model weights took %.4f GB", m.consumed_memory / float(2**30))
 
@@ -3945,14 +3950,15 @@ class NPUModelRunner(GPUModelRunner):
         
         # wrap the model with full graph wrapper if needed.
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
-            self.update_stream: torch.npu.Stream = torch.npu.Stream()
-            self.model = ACLGraphWrapper(
-                self.model,
-                self.vllm_config,
-                runtime_mode=CUDAGraphMode.FULL,
-                use_eagle=self.use_eagle,
-                enable_enpu=self.enable_enpu,
-            )
+            with startup.stage("runner.full_graph_wrapper"):
+                self.update_stream: torch.npu.Stream = torch.npu.Stream()
+                self.model = ACLGraphWrapper(
+                    self.model,
+                    self.vllm_config,
+                    runtime_mode=CUDAGraphMode.FULL,
+                    use_eagle=self.use_eagle,
+                    enable_enpu=self.enable_enpu,
+                )
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()

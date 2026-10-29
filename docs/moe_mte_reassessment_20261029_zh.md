@@ -4,10 +4,10 @@
 默认关闭诊断。参考仓库 `D:\华为\nano2\vllm-ascend\vLLM-ascend-DSA` 仅只读审阅，
 HEAD 为 `ce6900977e6a25377cd11205e3613ec2ec0208a4`。没有收到辅助流单组补跑的新结果。
 
-**最新：首次离线取证存在timeout参数误筛和日志前缀遗漏；先用修正版重读原日志，见第8节。**
+**最新：修正版已扫完11个日志快照，仍未得到退出原因；下一步做一次带启动观测的等待位置运行，见第9节。**
 根因仍未证实，停止继续枚举核数。等待位置实验检验“等待与消费者之前的真实模型计算重叠”
 是否参与触发，不能直接区分资源调度、模型算子内部停滞和轮询访存影响。
-第1–7节保留实验设计、首次运行命令与首次离线取证记录；后续操作以第8节为准。
+第1–8节保留实验设计、首次运行命令与离线取证记录；后续操作以第9节为准。
 
 ## 1. 原项目与当前改造的完整顺序
 
@@ -280,3 +280,68 @@ python -B script/inspect_mte_startup_exit.py bench_results/mte_wait_placement_50
 覆盖本次实际参数日志、3000条普通参数噪声、跨文件fatal优先、无日期fatal与清理错误共存、
 文件首部错误、短日期和进程信号等边界。Ruff检查与格式检查通过，`git diff --check`通过。
 `format.sh ci`已执行，仍因未安装pre-commit而无法启动全套检查。
+
+## 9. 离线取证结束：一次带启动观测的模型运行
+
+用户返回v2摘要 `mte_startup_inspect_c6260bcc1f8b4cd0abe3d69cb168fae2`。
+11个日志的 `snapshot_bytes=scanned_bytes=end_size`，无未选文件、无文本截断、无日期缺失候选。
+目标窗口内fatal为0；2条error仍是20:35:39的同一次format-29回退。
+20条symptom主要是 `CtxGetSysParamOpt ret=0x7110014` 和 `GetFaultEvent` 查询记录。
+查询行为本身不是故障发生记录；未把这些返回值解释为致命原因。保留的首次/末次记录之外仍有
+2条symptom未展示，但完整扫描没有检出额外fatal/error。API退出后有其Runtime卸载记录，
+仍不能代替EngineCore的实际退出状态。
+
+本轮结论是：所选已有日志不足以解释启动退出。停止重复离线提取，也不再修改筛选器来制造进展。
+此前两轮离线命令属于启动退出支线，没有增加原始scale阻塞机制的直接证据。
+下一步仅运行一组：沿用早发布、消费者join处严格等待的配置，同时补齐启动观测。
+
+本次实现与审阅边界：
+
+- `--trace-startup` 仅允许配合MTE等待位置诊断。服务的模型、MTP、捕获尺寸、核数、worker策略、
+  原始拷贝和已有逐项同步保持原实验设置；原命令的serve参数和shell设置完整保留。
+- 诊断入口先核对PATH中的原 `vllm` console声明的Python与当前解释器真实路径一致。
+  不一致、找不到入口或不能识别shebang时在导入vLLM前退出，不以另一Python环境继续实验。
+- API进程只观察标准库multiprocessing已有的start、poll以及terminate/kill请求。
+  fork/spawn/forkserver的实际poll实现均覆盖，包装函数保留原调用参数、次数、返回值和异常；
+  不增加轮询线程或主动waitpid。观察保持到解释器退出清理，记录父进程取得的真实退出状态。
+- 阶段helper由既有 `host_sync_diagnose_prefetch_wait_at_join=true` 启用；默认生产配置关闭。
+  这意味着不带新CLI标志的等待位置诊断也会有阶段标记，但只有新CLI入口会安装进程观察。
+  helper只用CPU，标记topk共享、lm_head共享、原有equal、drafter加载、内存统计退出及主wrapper构造。
+  原 `torch.equal` 每层仍调用一次，没有新增tensor读取、设备同步或权重打印。
+- API和EngineCore分别启用FD2/all_threads的faulthandler。它不能捕获SIGKILL，不能保证覆盖所有
+  原生信号处理路径，因此仍需父进程退出状态。标记写失败不改变模型异常或阻止原进程清理。
+- 汇总关联明确的EngineCore PID，分别列出父进程signal请求、runner/外层清理与退出观测顺序。
+  退出观测时刻不是实际死亡时刻；清理后的负退出码不自动归为自然故障，没有请求记录也不排除外部kill。
+
+阶段日志与进程观察均做了独立交叉审阅。模型runner只增加加载边界标记，不改变执行分支与顺序。
+`runner.memory_profile_exit` 的begin只在加载体正常走到底时出现；缺少该begin不能反推异常清理时
+Profiler没有执行退出函数。未闭合阶段只能缩小最后可见CPU代码范围，不能直接认定对应NPU算子有错。
+
+绿区下一步命令（会启动一次模型，不是再次读取旧日志）：
+
+```bash
+cd /home/l00992607/vllm-ascend-worker-poll
+git pull --ff-only origin dev/moeoffload-worker-poll
+python -B script/diagnose_mte_wait_placement.py --npu 7 --trace-startup
+```
+
+入口先运行新增CPU观察回归检查（Linux覆盖真实fork/spawn/forkserver及SIGKILL状态），然后沿用
+Host/MTE构建和既有回归流程。启动通过后继续1次预热、3次有限请求，仍跳过profiler，不自动追加第二组。
+仅返回新建 `bench_results/mte_wait_placement_*/summary.txt` 的检查脱敏文本。
+
+判读优先级：
+
+1. **观测未启用/前置检查失败**：`STARTUP_TRACE_STATUS=UNVERIFIED`，检查明确FAILED记录与入口异常。
+   没有EngineCore退出码时必须保持 `NOT_OBSERVED`，不得使用API返回码补齐。
+2. **再次启动退出**：看EngineCore真实退出状态、清理请求顺序、最后未闭合阶段和崩溃栈。
+   Python异常、原生信号、外部终止/父进程清理按证据分别处理，再做最小修复；不转去限核。
+3. **启动通过并完成捕获/请求**：回到第6节的GATE_PAIR、严格等待和有限请求结果判据。
+   本轮启动成功不代表此前启动问题根因已修复；启动支线暂时不挡住主线即可继续原阻塞实验。
+
+本轮仍没有真实NPU结果，不作精度或性能结论。
+
+蓝区相关138项CPU测试中136项通过，2项因Windows符号链接权限/POSIX信号支持跳过；
+绿区入口会重跑新增的观察与阶段回归，覆盖Linux实际启动方式和SIGKILL退出状态。
+13个修改或新增Python文件通过Ruff检查与格式检查；model_runner的8项既有Ruff问题已与HEAD
+按规则和消息对照，没有新增，未扩大范围重排该文件。`git diff --check`通过。
+`format.sh ci`已执行，因本地缺少pre-commit未能启动全套检查。

@@ -146,6 +146,31 @@ def bash_command(prefix, words):
     return ["bash", "-c", prefix + "\nexec " + shlex.join(words)]
 
 
+def startup_trace_command(command):
+    """Change only the entry point; retain every serve argument and shell setting."""
+    if command[:2] != ["vllm", "serve"]:
+        raise ValueError("Startup tracing requires the validated vllm serve command")
+    return [sys.executable, "-B", str(REPO / "script/mte_startup_bootstrap.py"), "--diagnostic", *command[1:]]
+
+
+def startup_cleanup_marker(child, log, reason):
+    record = dict(
+        event="cleanup_begin",
+        pid=os.getpid(),
+        api_pid=child.pid,
+        api_returncode=child.returncode,
+        reason=reason,
+        wall_time_ns=time.time_ns(),
+        monotonic_ns=time.monotonic_ns(),
+    )
+    line = "[MOE-MTE RUNNER] " + json.dumps(record)
+    with contextlib.suppress(Exception):
+        print(line, flush=True)
+    if log is not None:
+        with contextlib.suppress(Exception):
+            print(line, file=log, flush=True)
+
+
 def run_console(command, env, log_path):
     """Keep noisy child output in a log and only publish numeric timing rows."""
     means = {}
@@ -371,6 +396,8 @@ def _inference(args, source, backend, env, log):
     prefix, command, model, _ = launch_spec(
         source, backend, args.npu, args.port, args.timing_port, profile_dir, mstx=getattr(args, "mstx", False)
     )
+    if getattr(args, "trace_startup", False):
+        command = startup_trace_command(command)
     assert_port_free(args.port)
     assert_port_free(args.timing_port)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -445,6 +472,9 @@ def _inference(args, source, backend, env, log):
                         print(f"GAP ANALYSIS NOT VERIFIED: {exc}", flush=True)
         return report
     finally:
+        if getattr(args, "trace_startup", False):
+            error_type = sys.exc_info()[0]
+            startup_cleanup_marker(child, log, error_type.__name__ if error_type else "completed")
         with progress(f"{backend} service cleanup and port release; up to 50s"):
             stop_owned_service(child)
             wait_service_ports_free(args)

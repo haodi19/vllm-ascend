@@ -48,6 +48,7 @@ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, update_full_graph_params
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_lmhead_tp_group
+from vllm_ascend.expert_offload.startup_diagnostics import StartupDiagnostics
 from vllm_ascend.models.deepseek_v4_dspark import DSparkDeepseekV4ForCausalLM
 from vllm_ascend.models.kimi_k3_dspark import K3DSparkForCausalLM
 from vllm_ascend.models.llama_eagle3_vwn import Eagle3VwnLlamaForCausalLM
@@ -181,9 +182,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         # incomplete metadata, so force the draft to eager when compress is on;
         # the target model can still use FULL_DECODE_ONLY graph.
         self.use_cuda_graph = (
-            self.runner._use_aclgraph()
-            and not self.speculative_config.enforce_eager
-            and not self.use_compress
+            self.runner._use_aclgraph() and not self.speculative_config.enforce_eager and not self.use_compress
         )
         self._raise_if_padded_drafter_batch_disabled_and_full_graph_enabled()
 
@@ -457,6 +456,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     def load_model(self, model: nn.Module) -> None:
         assert get_pp_group().is_last_rank, f"{self.method} drafter must be loaded on the last pipeline stage."
+        startup = StartupDiagnostics.from_config(self.vllm_config)
+        startup.arm("draft.faulthandler")
 
         target_attn_layer_names = set(get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys())
 
@@ -533,8 +534,10 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # share embed_tokens with the target model if needed
         self._maybe_share_embeddings(target_language_model)
-        self._maybe_share_topk_indices(target_language_model)
-        self._maybe_share_lm_head(model)
+        with startup.stage("draft.share_topk_indices"):
+            self._maybe_share_topk_indices(target_language_model)
+        with startup.stage("draft.share_lm_head"):
+            self._maybe_share_lm_head(model)
         # The draft FC, embedding, and lm_head boundaries are now aligned.
         # Release the temporary full-precision rotation before graph capture.
         self._quarot_rotation = None
@@ -645,6 +648,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     # share lm_head with the target model if needed
     def _maybe_share_lm_head(self, model: nn.Module) -> None:
+        startup = StartupDiagnostics.from_config(self.vllm_config)
         # some model definition do not define lm_head explicitly
         # and reuse embed_tokens for lm_head, e.g., CohereForCausalLM
         if self.method in ("eagle", "dflash", "dspark"):
@@ -699,7 +703,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
             for _, layer_module in self.model.model.layers.items():
-                if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
+                with startup.stage("draft.lm_head_equal"):
+                    equal = torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight)
+                if equal:
                     layer_module.shared_head.head = model.lm_head
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
