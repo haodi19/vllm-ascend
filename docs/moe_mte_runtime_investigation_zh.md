@@ -325,3 +325,23 @@ python -B script/diagnose_mte_resource_scope.py --npu 7
 只返回输出目录的 summary.txt。每组图、完整日志和配置留在本机。图摘要包含流编号，
 用于确认辅助 MatMul 的实际 block 数；不再只看命令参数。无诊断参数时沿用原逻辑，
 旧 ctypes 主流实验也保留可重现。
+
+### 原生控核主流对照仍阻塞，辅助流对照启动失败
+
+PID85186 的 native_main 对照中，Torch 原生控核已打印主流14/28，图内 HcPre14、
+路由5、辅助 MatMul28。仍在 slot4 等待 completion 时返回507046；图映射仍为
+预取 host_sync_wait、辅助 MatMul、主流 KvCompressEpilog。换用原生控核接口没有
+解除这次阻塞，不能据此排除其他资源调度问题。
+
+native_main_aux 在服务启动阶段退出，未取得图导出或实际辅助流核数记录。
+该组不能用于判断辅助流限核的效果，也不能直接归入原来的 scale 阻塞。
+上一版精简摘要过滤了异常调用栈，现补充 EngineCore 调用栈、末尾错误及日志尾部；
+优先读取已有日志，明确启动失败原因后再决定是否重跑。
+
+```bash
+python -B script/diagnose_mte_resource_scope.py --inspect-latest
+```
+
+此命令只在控制台输出最近一次实验的辅助组日志片段，不导入 Torch、不初始化设备、
+不运行模型、不写文件。也可用 `--inspect 实验目录` 明确指定目标。调用栈片段本身
+不自动视为根因证明；若进程没有留下异常，还需进一步区分外部终止与未捕获的退出。

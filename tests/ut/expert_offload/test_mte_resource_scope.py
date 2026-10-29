@@ -3,6 +3,7 @@
 
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -54,6 +55,51 @@ class ResourceScopeTests(unittest.TestCase):
         self.assertIn("RESOURCE_API=torch", result)
         self.assertIn("MatMulV3", result)
         self.assertNotIn("noise", result)
+
+    def test_engine_trace_is_not_lost_behind_api_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "service.log"
+            path.write_text(
+                "(EngineCore pid=1) Traceback (most recent call last):\n"
+                "(EngineCore pid=1)   File helper.py, line 7\n"
+                "(EngineCore pid=1) ValueError: invalid stream\n"
+                + "ordinary log\n"
+                * 100
+                + "(APIServer pid=2) Traceback (most recent call last):\n"
+                "(APIServer pid=2) RuntimeError: Engine core initialization failed\n",
+                encoding="utf-8",
+            )
+            text = self.module.failure_context(path)
+            self.assertIn("File helper.py, line 7", text)
+            self.assertIn("ValueError: invalid stream", text)
+            self.assertLess(len(text.splitlines()), 70)
+
+    def test_truncated_trace_keeps_terminal_error_and_missing_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "service.log"
+            self.assertIn("LOG MISSING", self.module.failure_context(path))
+            path.write_text(
+                "Traceback (most recent call last):\n" + " frame\n" * 70 + "RuntimeError: final cause\n",
+                encoding="utf-8",
+            )
+            self.assertIn("RuntimeError: final cause", self.module.failure_context(path))
+
+    def test_read_only_mode_never_runs_case_or_creates_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            service = root / "native_main_aux/mte/inference_python.log"
+            service.parent.mkdir(parents=True)
+            service.write_text("RuntimeError: startup cause\n", encoding="utf-8")
+            before = set(root.rglob("*"))
+            with (
+                patch.object(sys, "argv", ["diagnose", "--inspect", str(root)]),
+                patch.object(self.module, "run_case") as run,
+                patch("builtins.print") as output,
+            ):
+                self.module.main()
+            run.assert_not_called()
+            self.assertIn("startup cause", str(output.call_args_list))
+            self.assertEqual(before, set(root.rglob("*")))
 
 
 if __name__ == "__main__":

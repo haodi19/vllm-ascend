@@ -4,10 +4,12 @@
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,6 +20,49 @@ PROGRESS_SECONDS = 15
 CLEANUP_SECONDS = 45
 REQUESTED_CUBE_CORES = 14
 REQUESTED_ROUTING_CORES = 5
+TRACE_CONTEXT_LINES = 40
+LOG_LINE_CHARACTERS = 1500
+
+
+def failure_context(path):
+    """Read bounded traceback context; preserve EngineCore errors before API fallout."""
+    if not path.is_file():
+        return f"LOG MISSING: {path}"
+    engine_blocks, other_blocks = deque(maxlen=2), deque(maxlen=1)
+    tail, errors = deque(maxlen=12), deque(maxlen=8)
+    active = None
+    with path.open(encoding="utf-8", errors="replace") as source:
+        for number, line in enumerate(source, 1):
+            line = line.rstrip()[:LOG_LINE_CHARACTERS]
+            record = f"{number}: {line}"
+            tail.append(record)
+            if "Traceback (most recent call last)" in line:
+                active = []
+                (engine_blocks if "EngineCore" in line else other_blocks).append(active)
+            if active is not None and len(active) < TRACE_CONTEXT_LINES:
+                active.append(record)
+            if re.search(r"\b\w*(?:Error|Exception):|Killed|SIGKILL|SIGSEGV|out of memory", line, re.I):
+                errors.append(record)
+    blocks = engine_blocks or other_blocks
+    sections = [f"READ ONLY LOG: {path}"]
+    if blocks:
+        sections.append("异常调用栈片段（优先 EngineCore；不自动判定根因）：")
+        sections.extend(record for block in blocks for record in block)
+    if errors:
+        sections.append("末尾错误行：")
+        sections.extend(errors)
+    sections.append("日志尾部：")
+    sections.extend(tail)
+    return "\n".join(sections)
+
+
+def inspect_failure(output):
+    case = output / "native_main_aux" if (output / "native_main_aux").is_dir() else output
+    return (
+        failure_context(case / "mte/inference_python.log")
+        + "\n"
+        + failure_context(case.parent / f"{case.name}.wrapper.log")
+    )
 
 
 def classify_report(text, exit_code):
@@ -154,9 +199,26 @@ def run_case(root, output, npu, aux_cores):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--npu", type=npu_number, required=True)
+    parser.add_argument("--npu", type=npu_number)
+    inspect = parser.add_mutually_exclusive_group()
+    inspect.add_argument("--inspect", type=Path, help="只读指定实验目录的启动错误；不加载模型、不写文件")
+    inspect.add_argument("--inspect-latest", action="store_true", help="只读最近一次 mte_resource_scope 实验")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
+    if args.inspect is not None or args.inspect_latest:
+        if args.npu is not None:
+            parser.error("只读检查不接受 --npu；不会重跑模型")
+        output = args.inspect
+        if args.inspect_latest:
+            candidates = [path for path in (root / "bench_results").glob("mte_resource_scope_*") if path.is_dir()]
+            if not candidates:
+                parser.error("没有找到 mte_resource_scope 实验；可用 --inspect 指定目录")
+            output = max(candidates, key=lambda path: path.stat().st_mtime_ns)
+        print("只读已有日志；不导入 Torch、不初始化 NPU、不启动模型、不写文件。")
+        print(inspect_failure(output.resolve()))
+        return
+    if args.npu is None:
+        parser.error("运行实验必须指定 --npu；只读已有结果使用 --inspect-latest")
     output = root / "bench_results" / f"mte_resource_scope_{uuid4().hex[:8]}"
     output.mkdir(parents=True, exist_ok=False)
     summary = output / "summary.txt"
@@ -178,6 +240,7 @@ def main():
                 dest.write("本组请求通过，停止扩大改动；仍须检查输出正确性，不视为已证明根因。\n")
                 break
             if state != "scale_wait_reproduced":
+                dest.write(inspect_failure(output / name) + "\n")
                 dest.write("未形成有效的同类阻塞对照，停止后续组，避免重复加载模型。\n")
                 break
     print(f"仅返回此文件内容：{summary}", flush=True)
