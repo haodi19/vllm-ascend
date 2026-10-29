@@ -514,3 +514,24 @@ python -B script/diagnose_mte_vector_limit.py --npu 0
 不足以解除阻塞；核数降低且原始转置/请求完成，则说明分核或其导致的 tiling 改变
 影响了阻塞，下一步才区分这两者。任何结果均不能直接证明具体硬件死锁。
 保留原始输入与配置，结果不用于性能对比；只返回汇总文本。
+
+## 加载流 28 核诊断结果：仍在相同预取位置超时
+
+`mte_vector_limit_8260e005` 中，第二次交接 layer=1、slot=2，w13 与 w2 拷贝完成，
+w13_weight_scale 提交后仍返回 507046。Runtime 超时为 stream=27、task=699，
+提交序号为 74861。对应下发上下文显示 `blockDim=28`，因此本次不是设置接口成功而
+实际仍使用 56 核的无效干预。
+
+结论仅为：将加载任务的 blockDim 从 56 减到 28 不足以解除当前阻塞。
+不能据此排除所有资源竞争，也不能将此前的“预取 AIV 等待参与触发阻塞”结论推翻。
+本轮没有找到根因。停止继续枚举核数。
+
+下一步只读同一进程的 DEBUG 日志，检查超时快照中其他 AIVEC 任务的最近下发上下文，
+尝试区分设备等待算子与模型算子。默认读取 `/root/ascend/log/debug/plog`，
+不再次运行模型。循环 task 位置会复用，脚本保留最近下发候选而不以超时查询覆盖它；
+邻近不同线程的记录不能自动建立 kernel 映射。若为图内重映射任务且日志没有相应
+下发记录，明确标记 NO_SUBMISSION，不能继续猜测其身份。
+
+```bash
+python -B script/inspect_mte_outstanding.py bench_results/mte_vector_limit_8260e005
+```
