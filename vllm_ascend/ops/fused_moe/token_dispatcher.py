@@ -363,6 +363,9 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         if type(cores) is not int or not 0 <= cores <= 56:
             raise ValueError("diagnostic routing vector cores must be an integer in 0..56")
         self._routing_vector_cores = cores
+        self._native_routing_limits = bool(
+            offload.get("host_sync_diagnose_native_stream_limits") or offload.get("host_sync_diagnose_dsa_cube_cores")
+        )
         if cores:
             if offload.get("host_sync_backend") != "mte":
                 raise ValueError("routing core diagnosis requires MTE")
@@ -436,7 +439,8 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         routing_operation = DeviceOperator.npu_moe_init_routing
         if self._routing_vector_cores:
             routing_operation = partial(
-                call_routing_with_vector_limit, routing_operation, torch_npu.npu, self._routing_vector_cores
+                call_routing_with_vector_limit, routing_operation, torch_npu.npu, self._routing_vector_cores,
+                native_limits=self._native_routing_limits,
             )
         sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = routing_operation(
             hidden_states,

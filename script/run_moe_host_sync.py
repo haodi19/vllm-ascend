@@ -38,6 +38,8 @@ def configured_source(
     diagnose_graph_dump_dir="moe_graph_debug",
     diagnose_routing_vector_cores=0,
     diagnose_compute_cube_cores=0,
+    diagnose_dsa_cube_cores=0,
+    diagnose_native_stream_limits=False,
 ):
     diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
     diagnose_prefetch_report_wait = diagnose_prefetch_report_wait or bool(diagnose_prefetch_poll_budget)
@@ -49,6 +51,10 @@ def configured_source(
     config = json.loads(words[index])
     offload = config["expert_offload_config"]
     offload["host_sync_backend"] = backend
+    if diagnose_native_stream_limits:
+        offload["host_sync_diagnose_native_stream_limits"] = backend == "mte"
+    if diagnose_dsa_cube_cores:
+        offload["host_sync_diagnose_dsa_cube_cores"] = diagnose_dsa_cube_cores if backend == "mte" else 0
     if diagnose_compute_cube_cores:
         offload["host_sync_diagnose_compute_cube_cores"] = diagnose_compute_cube_cores if backend == "mte" else 0
     if diagnose_routing_vector_cores:
@@ -203,6 +209,8 @@ def main():
     parser.add_argument("--diagnose-graph-dump", action="store_true")
     parser.add_argument("--diagnose-routing-vector-cores", type=int, default=0, choices=range(57))
     parser.add_argument("--diagnose-compute-cube-cores", type=int, default=0, choices=range(29))
+    parser.add_argument("--diagnose-dsa-cube-cores", type=int, default=0, choices=range(29))
+    parser.add_argument("--diagnose-native-stream-limits", action="store_true")
     parser.add_argument("--diagnose-load-vector-cores", type=int, default=0, choices=range(57))
     parser.add_argument("--warmup-requests", type=int, default=1)
     parser.add_argument("--startup-timeout", type=int, default=1800)
@@ -359,6 +367,8 @@ def run(args, root):
                 directory / "graph_debug",
                 args.diagnose_routing_vector_cores,
                 args.diagnose_compute_cube_cores,
+                args.diagnose_dsa_cube_cores,
+                args.diagnose_native_stream_limits,
             ),
             "python",
             env,

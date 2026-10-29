@@ -28,6 +28,16 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    aux_cores = config.get("host_sync_diagnose_dsa_cube_cores", 0)
+    if type(aux_cores) is not int or not 0 <= aux_cores <= 28:
+        raise ValueError("diagnostic DSA cube cores must be an integer in 0..28")
+    if aux_cores and not config.get("host_sync_diagnose_compute_cube_cores"):
+        raise ValueError("DSA core diagnosis requires compute core diagnosis")
+    native_limits = config.get("host_sync_diagnose_native_stream_limits", False)
+    if not isinstance(native_limits, bool):
+        raise ValueError("native stream limit diagnosis must be boolean")
+    if native_limits and not config.get("host_sync_diagnose_compute_cube_cores"):
+        raise ValueError("native stream limit diagnosis requires compute core diagnosis")
     compute_cores = config.get("host_sync_diagnose_compute_cube_cores", 0)
     if type(compute_cores) is not int or not 0 <= compute_cores <= 28:
         raise ValueError("diagnostic compute cube cores must be an integer in 0..28")
@@ -141,8 +151,19 @@ def apply_load_vector_limit(library, pointer, cores):
         raise RuntimeError(f"load vector limit thread binding failed: {code}")
 
 
-def call_routing_with_vector_limit(operation, npu, cores, *args, **kwargs):
+def call_routing_with_vector_limit(operation, npu, cores, *args, native_limits=False, **kwargs):
     """Diagnostic only: restrict routing tiling, flush submission, restore stream cap."""
+    if native_limits:
+        stream = npu.current_stream()
+        previous = npu.get_stream_limit(stream)
+        try:
+            npu.set_stream_limit(stream, vector_num=cores)
+            return operation(*args, **kwargs)
+        finally:
+            try:
+                int(stream.npu_stream)
+            finally:
+                npu.set_stream_limit(stream, vector_num=previous["vector_core_num"])
     library = ctypes.CDLL("libascendcl.so")
     stream = npu.current_stream()
     pointer = int(stream.npu_stream)
@@ -166,8 +187,12 @@ def call_routing_with_vector_limit(operation, npu, cores, *args, **kwargs):
 
 
 @contextmanager
-def diagnostic_compute_limits(npu, cube_cores):
+def diagnostic_compute_limits(npu, cube_cores, additional_stream_limits=(), *, native_limits=False):
     """Capture-only stream limits; preserve kernel synchronization and restore on exit."""
+    if native_limits or additional_stream_limits:
+        with diagnostic_native_stream_limits(npu, cube_cores, additional_stream_limits):
+            yield
+        return
     library = ctypes.CDLL("libascendcl.so")
     stream = npu.current_stream()
     pointer = int(stream.npu_stream)
@@ -204,6 +229,45 @@ def diagnostic_compute_limits(npu, cube_cores):
             errors.append(("bind", bind(pointer)))
             if any(code for _, code in errors):
                 raise RuntimeError(f"compute resource restore failed: {errors}")
+
+
+@contextmanager
+def diagnostic_native_stream_limits(npu, cube_cores, additional_stream_limits):
+    """Use Torch's queue-aware core control; limit scope belongs to this diagnostic process."""
+    if not all(callable(getattr(npu, name, None)) for name in ("get_stream_limit", "set_stream_limit")):
+        raise RuntimeError("native resource diagnosis requires torch_npu.npu get/set_stream_limit")
+    targets = [("main", npu.current_stream(), cube_cores), *additional_stream_limits]
+    saved = []
+    pointers = set()
+    for label, stream, cores in targets:
+        pointer = int(stream.npu_stream)
+        if pointer in pointers:
+            raise ValueError("compute diagnostic streams must be distinct")
+        pointers.add(pointer)
+        saved.append((label, stream, cores, dict(npu.get_stream_limit(stream))))
+    try:
+        for label, stream, cores, previous in saved:
+            npu.set_stream_limit(stream, cube_num=cores, vector_num=2 * cores)
+            print(
+                f"[MOE-MTE COMPUTE_LIMIT] api=torch stream={label} pointer={int(stream.npu_stream)} "
+                f"cube={cores} vector={2 * cores} previous={previous}", flush=True,
+            )
+        yield
+    finally:
+        try:
+            for _, stream, _, _ in saved:
+                int(stream.npu_stream)  # Flush Host queue before restoring settings.
+        finally:
+            errors = []
+            for label, stream, _, previous in reversed(saved):
+                try:
+                    npu.set_stream_limit(
+                        stream, cube_num=previous["cube_core_num"], vector_num=previous["vector_core_num"]
+                    )
+                except Exception as exc:
+                    errors.append(f"{label}: {exc}")
+            if errors:
+                raise RuntimeError(f"native resource restoration failed: {errors}")
 
 
 def runtime_last_task(library):

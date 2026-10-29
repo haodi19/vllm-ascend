@@ -278,3 +278,50 @@ python -B script/diagnose_mte_graph_mapping.py --npu 5 --routing-cores 5 --compu
 HcPre，也不作为推理正确性或性能验收。若减核后仍失败，先看任务位置是否再次变化；
 不能仅凭失败继续任意尝试更小核数。当前改动只在蓝区通过模拟接口与回归检查，
 实际限核效果和设备行为等待绿区验证。
+
+### 主流限制生效，阻塞推进到 DSA 辅助分支
+
+`mte_graph_mapping_7bc223a9`（PID=83599，物理卡7）中，HcPre 实际14个 block，
+路由5个 block，host_sync_wait 仍为1个 block。完成交接数为3，未完成项变为
+slot4、预取 layer2；此前一次输出为完成1项、slot2、layer1。本次仍在原始
+w13_weight_scale 的同步等待返回507046，不能称为已修复。
+两轮物理卡不同，也不能把推进一层换算为性能收益或单凭一次实验认定确定因果。
+
+本轮快照和图结构为：
+
+| 流/任务 | 算子 | block / 模式 |
+| --- | --- | --- |
+| 21/7 | host_sync_wait | 1 / 0 |
+| 22/39 | MatMulV3 BF16 | 28 / 1 |
+| 23/195 | KvCompressEpilog | 1 / 0 |
+| 27/801 | scale 拷贝后未完成的 AIVEC 任务 | 图外加载流 |
+
+主流193记录 Event37，辅助流22等待后执行 MatMul、记录 Event38；主流194动态量化、
+195写压缩KV，再在196等待 Event38。这与 dsa_v1.py 的 decode 索引器分支一致：
+辅助流做 weights_proj，主流做 query 量化和 KV scatter，随后汇合。
+本地 KvCompressEpilog 实现没有轮询 Host generation 或等待这个 MatMul 输出的循环；
+只有有界数据处理和本地流水线同步。不能描述成“它在内部等辅助 MatMul”。
+
+上一轮仅设置主计算流的上限；dsv4_dsa_overlap_stream 创建的独立辅助流没有被限核，
+其 MatMul 仍为28个 block。因此下面先验证控核接口，再控制辅助流，不改变图的并行拓扑。
+
+复核官方 Torch NPU 2.10 源码发现，set_stream_limit 除设置 ACL 资源外还启用框架的
+core control；原始 ctypes 调用不会设置这一框架状态。异步任务队列的资源处理受该状态
+控制，不能假定仅设置某个 ACL 流就覆盖 Torch 所有下发路径。
+参考 [NPUFunctions.cpp](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/core/npu/NPUFunctions.cpp)、
+[NPUStream.cpp](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/core/npu/NPUStream.cpp)。
+绿区为开发构建，最终以实际图配置为准。新接口恢复各流原资源数值，但框架 core control
+会保留在本次诊断进程内；每组使用独立服务进程，不能混入性能比较。
+
+合并脚本先跑 native_main：使用 Torch get/set_stream_limit，主流14/28、路由5，
+不设置辅助流上限。仅当这组重现已知 scale 等待且图配置有效时，再跑 native_main_aux：
+在相同接口和主流设置下，增加辅助流14/28。MTE严格等待、原始copy和DSA并行均保留。
+若第一组已通过，停止第二组，先分析框架控核接口的影响；启动失败或配置不生效也停止。
+
+```bash
+python -B script/diagnose_mte_resource_scope.py --npu 7
+```
+
+只返回输出目录的 summary.txt。每组图、完整日志和配置留在本机。图摘要包含流编号，
+用于确认辅助 MatMul 的实际 block 数；不再只看命令参数。无诊断参数时沿用原逻辑，
+旧 ctypes 主流实验也保留可重现。

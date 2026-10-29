@@ -24,18 +24,32 @@ def main():
     parser.add_argument("--npu", type=int, required=True)
     parser.add_argument("--routing-cores", type=int, default=0, choices=range(57))
     parser.add_argument("--compute-cube-cores", type=int, default=0, choices=range(29))
+    parser.add_argument("--dsa-cube-cores", type=int, default=0, choices=range(29))
+    parser.add_argument("--native-stream-limits", action="store_true")
+    parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
+    if args.dsa_cube_cores and not args.compute_cube_cores:
+        parser.error("--dsa-cube-cores requires --compute-cube-cores")
+    if args.native_stream_limits and not args.compute_cube_cores:
+        parser.error("--native-stream-limits requires --compute-cube-cores")
     # Fail before loading the model if this build has no Python entry point.
     import torch_npu
 
     graph = torch_npu.npu.NPUGraph
+    if args.native_stream_limits or args.dsa_cube_cores:
+        if not all(callable(getattr(torch_npu.npu, name, None)) for name in ("get_stream_limit", "set_stream_limit")):
+            raise RuntimeError("缺少 Torch get/set_stream_limit；未启动模型")
+        inspect.signature(torch_npu.npu.set_stream_limit).bind(None, cube_num=14, vector_num=28)
+        inspect.signature(torch_npu.npu.get_stream_limit).bind(None)
     if not all(callable(getattr(graph, name, None)) for name in ("enable_debug_mode", "debug_dump")):
         raise RuntimeError("当前 Torch NPU 没有图调试入口；未启动模型")
     signature = inspect.signature(graph.debug_dump)
     signature.bind(None, "diagnostic_graph_path")
     print(f"NPUGraph.debug_dump signature={signature}; 已检查路径参数，尚未调用设备接口", flush=True)
     root = Path(__file__).resolve().parents[1]
-    output = root / "bench_results" / f"mte_graph_mapping_{uuid4().hex[:8]}"
+    output = (args.output_dir or root / "bench_results" / f"mte_graph_mapping_{uuid4().hex[:8]}").resolve()
+    if output.exists():
+        raise ValueError(f"诊断目录已存在，拒绝覆盖：{output}")
     env = os.environ.copy()
     env["ASCEND_MODULE_LOG_LEVEL"] = "RUNTIME=0"
     command = [
@@ -65,6 +79,10 @@ def main():
         command += ["--diagnose-routing-vector-cores", str(args.routing_cores)]
     if args.compute_cube_cores:
         command += ["--diagnose-compute-cube-cores", str(args.compute_cube_cores)]
+    if args.dsa_cube_cores:
+        command += ["--diagnose-dsa-cube-cores", str(args.dsa_cube_cores)]
+    if args.native_stream_limits:
+        command += ["--diagnose-native-stream-limits"]
     print(f"纯 MTE 图诊断；routing_cores={args.routing_cores}（0不改）；原始拷贝、严格预取等待。", flush=True)
     print(f"完整构建/服务日志保留在 {output}", flush=True)
     with subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT) as proc:
@@ -82,6 +100,8 @@ def main():
     if not output.is_dir():
         raise RuntimeError(f"运行器退出 {code}，没有生成实验目录")
     with report.open("w", encoding="utf-8") as dest:
+        dest.write(f"RESOURCE_API={'torch' if args.native_stream_limits or args.dsa_cube_cores else 'raw_acl'}\n")
+        dest.write(f"DSA_CUBE_REQUESTED={args.dsa_cube_cores}; Vector=2*Cube；0表示不改\n")
         dest.write(f"COMPUTE_CUBE_REQUESTED={args.compute_cube_cores}; Vector=2*Cube；0表示不改\n")
         dest.write(f"ROUTING_CORES_REQUESTED={args.routing_cores}; 以 GRAPH_KERNEL 实际值判断是否生效\n")
         dest.write(f"RUNNER_EXIT={code}\n" + failure_excerpt(text) + "\n")
@@ -106,9 +126,9 @@ def main():
                     signatures = set()
                     for event in events:
                         name = event.get("name", "")
-                        if any(marker in name for marker in ("MoeInitRouting", "host_sync_wait", "HcPre")):
+                        if any(marker in name for marker in ("MoeInitRouting", "host_sync_wait", "HcPre", "MatMulV3")):
                             info = event.get("args", {})
-                            signatures.add((name, info.get("Numblocks"), info.get("Schem Mode")))
+                            signatures.add((info.get("Stream Id"), name, info.get("Numblocks"), info.get("Schem Mode")))
                     for signature in sorted(signatures, key=str):
                         dest.write("GRAPH_KERNEL " + json.dumps(signature) + "\n")
                 except (ValueError, UnicodeError, TypeError, AttributeError) as exc:

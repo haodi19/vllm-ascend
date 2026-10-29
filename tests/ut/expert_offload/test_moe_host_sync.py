@@ -68,6 +68,79 @@ class MoeHostSyncTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.module.validate_host_sync_config(config)
 
+    def test_native_limits_restore_each_stream_and_routing_override(self):
+        main, aux = SimpleNamespace(npu_stream=123), SimpleNamespace(npu_stream=456)
+        values = {123: {"cube_core_num": 28, "vector_core_num": 56}, 456: {"cube_core_num": 20, "vector_core_num": 40}}
+        original = {key: dict(value) for key, value in values.items()}
+
+        def setter(stream, cube_num=-1, vector_num=-1):
+            if cube_num != -1:
+                values[stream.npu_stream]["cube_core_num"] = cube_num
+            if vector_num != -1:
+                values[stream.npu_stream]["vector_core_num"] = vector_num
+
+        npu = SimpleNamespace(
+            current_stream=lambda: main, get_stream_limit=lambda stream: dict(values[stream.npu_stream]),
+            set_stream_limit=setter,
+        )
+
+        def operation():
+            self.assertEqual(values[123]["vector_core_num"], 5)
+            raise RuntimeError("op failed")
+
+        with (
+            patch("builtins.print"), self.assertRaisesRegex(RuntimeError, "op failed"),
+            self.module.diagnostic_compute_limits(npu, 14, (("dsa_aux", aux, 10),), native_limits=True),
+        ):
+            self.assertEqual(values[123], {"cube_core_num": 14, "vector_core_num": 28})
+            self.assertEqual(values[456], {"cube_core_num": 10, "vector_core_num": 20})
+            try:
+                self.module.call_routing_with_vector_limit(operation, npu, 5, native_limits=True)
+            finally:
+                self.assertEqual(values[123]["vector_core_num"], 28)
+        self.assertEqual(values, original)
+
+    def test_native_partial_set_failure_still_restores_both_streams(self):
+        main, aux = SimpleNamespace(npu_stream=123), SimpleNamespace(npu_stream=456)
+        restored = []
+
+        def setter(stream, cube_num, vector_num):
+            if stream is aux and cube_num == 14:
+                raise RuntimeError("aux set failed")
+            restored.append((stream.npu_stream, cube_num, vector_num))
+
+        npu = SimpleNamespace(
+            current_stream=lambda: main,
+            get_stream_limit=lambda stream: {"cube_core_num": 28, "vector_core_num": 56},
+            set_stream_limit=setter,
+        )
+        with (
+            patch("builtins.print"), self.assertRaisesRegex(RuntimeError, "aux set failed"),
+            self.module.diagnostic_compute_limits(npu, 14, (("dsa_aux", aux, 14),), native_limits=True),
+        ):
+            self.fail("must not reach capture body after a setter failure")
+        self.assertEqual(restored[-2:], [(456, 28, 56), (123, 28, 56)])
+
+    def test_native_limits_missing_api_or_alias_fails_before_mutation(self):
+        with (
+            self.assertRaisesRegex(RuntimeError, "get/set_stream_limit"),
+            self.module.diagnostic_compute_limits(SimpleNamespace(), 14, native_limits=True),
+        ):
+            self.fail("must not yield")
+        stream = SimpleNamespace(npu_stream=123)
+        setter = Mock()
+        npu = SimpleNamespace(
+            current_stream=lambda: stream,
+            get_stream_limit=lambda stream: {"cube_core_num": 28, "vector_core_num": 56},
+            set_stream_limit=setter,
+        )
+        with (
+            self.assertRaisesRegex(ValueError, "distinct"),
+            self.module.diagnostic_compute_limits(npu, 14, (("alias", stream, 14),), native_limits=True),
+        ):
+            self.fail("must not yield")
+        setter.assert_not_called()
+
     def test_routing_limit_restores_previous_on_success_and_failure(self):
         for failure in (False, True):
             calls = []

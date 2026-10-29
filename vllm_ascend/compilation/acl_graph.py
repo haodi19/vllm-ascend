@@ -100,6 +100,10 @@ class ACLGraphWrapper:
         offload_config = (vllm_config.additional_config or {}).get("expert_offload_config", {})
         self._moe_graph_dump = bool(offload_config.get("host_sync_diagnose_graph_dump", False))
         self._moe_compute_cores = offload_config.get("host_sync_diagnose_compute_cube_cores", 0)
+        self._moe_dsa_cores = offload_config.get("host_sync_diagnose_dsa_cube_cores", 0)
+        self._moe_native_limits = bool(offload_config.get("host_sync_diagnose_native_stream_limits", False))
+        if self._moe_dsa_cores and not self._moe_compute_cores:
+            raise ValueError("DSA core diagnosis requires compute core diagnosis")
         if self._moe_compute_cores and (offload_config.get("host_sync_backend") != "mte" or not self._moe_graph_dump):
             raise ValueError("compute core diagnosis requires MTE and graph dump")
         self._moe_graph_dump_dir = offload_config.get("host_sync_diagnose_graph_dump_dir", "moe_graph_debug")
@@ -199,9 +203,21 @@ class ACLGraphWrapper:
                 try:
                     with torch.npu.graph(aclgraph, pool=self.graph_pool):
                         if self._moe_compute_cores:
+                            additional_limits = ()
+                            if self._moe_dsa_cores:
+                                # Lazy: importing attention during model inspection
+                                # can create circular imports. Reuse the existing stream.
+                                from vllm_ascend.attention.dsa_v1 import dsv4_dsa_overlap_stream
+
+                                additional_limits = (("dsa_aux", dsv4_dsa_overlap_stream(), self._moe_dsa_cores),)
                             # Select the graph's actual capture stream. The outer stack
                             # restores limits after capture ends, including failures.
-                            stack.enter_context(diagnostic_compute_limits(torch_npu.npu, self._moe_compute_cores))
+                            stack.enter_context(
+                                diagnostic_compute_limits(
+                                    torch_npu.npu, self._moe_compute_cores, additional_limits,
+                                    native_limits=self._moe_native_limits,
+                                )
+                            )
                         # `output` is managed by pytorch's aclgraph pool
                         output = self.runnable(*args, **kwargs)
                         # Join offloader's copy stream after forward to avoid
