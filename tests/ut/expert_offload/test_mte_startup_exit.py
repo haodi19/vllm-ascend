@@ -58,7 +58,7 @@ class StartupExitTests(unittest.TestCase):
         self.assertIn("AMBIGUOUS_PROCESS_SET=True", report)
         self.assertIn("PROCESS_EXIT=NOT_ESTABLISHED", report)
 
-    def test_native_requires_exact_time_and_does_not_treat_submit_as_fault(self):
+    def test_native_requires_exact_time_and_preserves_original_line_numbers(self):
         window = (dt.datetime(2026, 10, 29, 20, 35, 29), dt.datetime(2026, 10, 29, 20, 35, 59))
         lines = [
             "[ERROR] 2026-10-29-11:16:17 old task failed",
@@ -70,11 +70,107 @@ class StartupExitTests(unittest.TestCase):
             "undated failed task",
             "[INFO] 2026-10-29-20:35:45 process exit code=0",
         ]
-        faults, tail, count = self.module.native_candidates(lines, window)
-        self.assertEqual(faults, [2, 3])
-        self.assertEqual(tail, [2, 7])
-        self.assertEqual(count, 3)
-        self.assertEqual(self.module.native_candidates(lines, None), ([], [], 0))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plog.log"
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            result = self.module.scan_native(path, window)
+        self.assertEqual([record["line"] for record in result["records"]], [3])
+        self.assertEqual(result["records"][0]["context"], [(4, "    native stack frame")])
+        self.assertEqual(result["normal_tail"][-1], (8, lines[7]))
+        self.assertEqual(result["window_lines"], 3)
+        self.assertGreaterEqual(result["undated_faults"], 1)
+        self.assertNotIn("previous day failure", str(result["records"]))
+
+    def test_runtime_timeout_parameters_are_not_failures(self):
+        lines = (
+            "[DEBUG] RUNTIME(91939,):2026-10-29-20:35:40.511.143 [api_error.cc:1091] 91939 "
+            "StreamSynchronize:stream synchronize entry, stream_id=61, timeout=-1ms.",
+            "[INFO] RUNTIME(91939,):2026-10-29-20:35:44.321.547 [david_event_task_v200_base.cc:138] "
+            "92009 ConstructDavidSqeForEventRecordTask: event_record: device_id=7, stream_id=61, "
+            "task_id=1415, task_sn=11708, subType=event record use single notify, timeout=0s.",
+            "[DEBUG] RUNTIME(91939,):2026-10-29-20:35:44.487.322 StreamSynchronize entry, timeout=60000ms.",
+            "[INFO] RUNTIME(91939,):2026-10-29-20:35:29.104.128 [api_error.cc:1104] 91939 "
+            "StreamSynchronize: stream synchronize exit, stream_id=61, result=0x0",
+            "[DEBUG] 2026-10-29-20:35:44 set timeout value 500 ms",
+        )
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertFalse(self.module.is_fault(line))
+                self.assertIsNone(self.module.fault_kind(line))
+
+    def test_actual_failure_with_timeout_parameter_is_preserved(self):
+        for line in (
+            "[ERROR] RUNTIME(91939,):2026-10-29-20:35:44.490.000 Device exception; timeout=0s.",
+            "[ERROR] RUNTIME(91939,):2026-10-29-20:35:44.490.000 StreamSynchronize failed; timeout=-1ms.",
+            "[WARNING] 2026-10-29-20:35:44 task timed out, timeout=60000ms",
+            "2026-10-29-20:35:44 stream timeout occurred",
+            "2026-10-29-20:35:44 wait timeout",
+            "2026-10-29-20:35:44 task timeout",
+            "2026-10-29-20:35:44 sync timeout",
+            "Fatal Python error: Segmentation fault",
+            "process exitcode=-11",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(self.module.is_fault(line))
+                self.assertIsNotNone(self.module.fault_kind(line))
+
+    def test_process_signals_require_exit_evidence_not_event_parameters(self):
+        for line in (
+            "native worker received SIGTERM",
+            "native worker received SIGBUS",
+            "native worker received SIGILL",
+            "native worker received SIGFPE",
+            "Received signal 15",
+            "Received signal=11",
+            "killed by signal=11",
+            "process exited with signal 15",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.module.fault_kind(line), "fatal")
+        for line in ("event signal=11", "event signal 11"):
+            with self.subTest(line=line):
+                self.assertFalse(self.module.is_fault(line))
+
+    def test_timeout_noise_cannot_hide_real_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.service(root)
+            native = root / "native"
+            native.mkdir()
+            normal = (
+                "[DEBUG] RUNTIME(91939,):2026-10-29-20:35:44.100.000 "
+                "StreamSynchronize:stream synchronize entry, stream_id=61, timeout=-1ms.\n"
+            )
+            actual = (
+                "[ERROR] RUNTIME(91939,):2026-10-29-20:35:44.200.000 "
+                "Runtime synchronize failed: FAILURE_BETWEEN_NORMAL_PARAMETERS\n"
+            )
+            (native / "plog-91939.log").write_text(normal * 1500 + actual + normal * 1500, encoding="utf-8")
+            with patch.object(self.module, "kernel_excerpt", return_value=[]):
+                report = self.module.collect(root, [native])
+        self.assertIn("FAILURE_BETWEEN_NORMAL_PARAMETERS", report)
+        fault_lines = [line for line in report.splitlines() if "NATIVE_FAULT_CANDIDATE" in line]
+        self.assertFalse(any("stream synchronize entry" in line for line in fault_lines))
+
+    def test_errors_in_other_files_cannot_exhaust_fatal_budget(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.service(root)
+            native = root / "native"
+            native.mkdir()
+            (native / "plog-91939-a.log").write_text(
+                "2026-10-29-20:35:44 Fatal Python error: Segmentation fault FATAL_EXIT_MARKER\n",
+                encoding="utf-8",
+            )
+            for index in range(5):
+                (native / f"plog-91939-z{index}.log").write_text(
+                    "[ERROR] 2026-10-29-20:35:43 a preceding unrelated query failed\n" * 30,
+                    encoding="utf-8",
+                )
+            with patch.object(self.module, "kernel_excerpt", return_value=[]):
+                report = self.module.collect(root, [native])
+        self.assertIn("FATAL_EXIT_MARKER", report)
+        self.assertIn("PROCESS_EXIT=NOT_ESTABLISHED", report)
 
     def test_pid_boundaries_missing_root_and_empty_set(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -117,15 +213,81 @@ class StartupExitTests(unittest.TestCase):
         self.assertNotIn("NATIVE_FAULT_CANDIDATE", report)
         self.assertIn("CAUSE=NOT_ESTABLISHED", report)
 
-    def test_tail_offset_reports_unread_bytes_and_discards_partial_line(self):
+    def test_full_scan_preserves_error_in_file_prefix(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "plog.log"
-            path.write_bytes(b"prefix-long-line\nnext\nlast\n")
-            with patch.object(self.module, "TAIL_BYTES", 13):
-                size, offset, lines = self.module.read_tail(path)
-        self.assertEqual(size, 27)
-        self.assertEqual(offset, 17)
-        self.assertEqual(lines, ["next", "last"])
+            content = (
+                "[ERROR] 2026-10-29-20:35:44 prefix failure 原始首行\n"
+                + "[INFO] 2026-10-29-20:35:44 successful submission\n" * 512
+            ).encode("utf-8")
+            path.write_bytes(content)
+            window = (dt.datetime(2026, 10, 29, 20, 35, 29), dt.datetime(2026, 10, 29, 20, 35, 59))
+            result = self.module.scan_native(path, window)
+        self.assertEqual(result["size"], len(content))
+        self.assertEqual(result["bytes_read"], len(content))
+        self.assertEqual(result["lines"], 513)
+        self.assertEqual(result["records"][0]["line"], 1)
+        self.assertIn("prefix failure", result["records"][0]["text"])
+
+    def test_short_native_dates_use_service_window_year(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plog.log"
+            path.write_text(
+                "WARNING 10-28 20:35:44 earlier day failed\nERROR 10-29 20:35:44 same day failed\n",
+                encoding="utf-8",
+            )
+            window = (dt.datetime(2026, 10, 29, 20, 35, 29), dt.datetime(2026, 10, 29, 20, 35, 59))
+            result = self.module.scan_native(path, window)
+        self.assertEqual(result["window_lines"], 1)
+        self.assertEqual([record["line"] for record in result["records"]], [2])
+        self.assertEqual(result["undated_faults"], 0)
+
+    def test_undated_fatal_is_visible_without_window_attribution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plog.log"
+            path.write_text(
+                "Fatal Python error: Segmentation fault\n[INFO] 2026-10-29-20:35:44 task submitted\n",
+                encoding="utf-8",
+            )
+            window = (dt.datetime(2026, 10, 29, 20, 35, 29), dt.datetime(2026, 10, 29, 20, 35, 59))
+            result = self.module.scan_native(path, window)
+        self.assertEqual(result["records"], [])
+        self.assertEqual(result["undated_faults"], 1)
+        self.assertEqual(result["undated_records"], [(1, "Fatal Python error: Segmentation fault")])
+
+    def test_undated_cleanup_errors_do_not_hide_uncorrelated_fatal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.service(root)
+            native = root / "native"
+            native.mkdir()
+            (native / "plog-91939.log").write_text(
+                "Fatal Python error: Segmentation fault UNDATED_FATAL_MARKER\n"
+                + "cleanup failed\n" * 5
+                + "[INFO] 2026-10-29-20:35:44 task submitted\n",
+                encoding="utf-8",
+            )
+            with patch.object(self.module, "kernel_excerpt", return_value=[]):
+                report = self.module.collect(root, [native])
+        undated = [line for line in report.splitlines() if "NATIVE_UNDATED_UNCORRELATED" in line]
+        self.assertTrue(any("UNDATED_FATAL_MARKER" in line for line in undated))
+        attributed = [line for line in report.splitlines() if "NATIVE_FAULT_CANDIDATE" in line]
+        self.assertFalse(any("UNDATED_FATAL_MARKER" in line for line in attributed))
+        self.assertIn("PROCESS_EXIT=NOT_ESTABLISHED", report)
+
+    def test_native_count_covers_errors_omitted_from_bounded_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "plog.log"
+            path.write_text(
+                "".join(f"[ERROR] 2026-10-29-20:35:44 query failed marker={index}\n" for index in range(200)),
+                encoding="utf-8",
+            )
+            window = (dt.datetime(2026, 10, 29, 20, 35, 29), dt.datetime(2026, 10, 29, 20, 35, 59))
+            result = self.module.scan_native(path, window)
+        self.assertEqual(result["counts"]["error"], 200)
+        self.assertLess(len(result["records"]), 200)
+        self.assertEqual(result["records"][0]["line"], 1)
+        self.assertEqual(result["records"][-1]["line"], 200)
 
     def test_unprefixed_native_failure_is_preserved(self):
         lines = ["(EngineCore pid=1) INFO 10-29 20:35:40 ready"]
@@ -139,9 +301,9 @@ class StartupExitTests(unittest.TestCase):
         report = "\n".join(self.module.service_excerpt(lines, "1", "2"))
         self.assertIn("{'core': -11}", report)
         for line in ("exitcode=-11", "exit code 137", "Received signal 11", "killed by signal 9"):
-            self.assertIsNotNone(self.module.FAULT.search(line))
+            self.assertTrue(self.module.is_fault(line))
         for line in ("process exit code=0", "Submit task=137"):
-            self.assertIsNone(self.module.FAULT.search(line))
+            self.assertFalse(self.module.is_fault(line))
 
     def test_kernel_excludes_old_error_and_does_not_claim_pid_identity(self):
         window = (dt.datetime(2026, 10, 29, 20, 35, 29), dt.datetime(2026, 10, 29, 20, 35, 59))
@@ -170,7 +332,7 @@ class StartupExitTests(unittest.TestCase):
             native.mkdir()
             (native / "plog-91939.log").write_text("", encoding="utf-8")
             with (
-                patch.object(self.module, "read_tail", side_effect=PermissionError("denied")),
+                patch.object(self.module, "scan_native", side_effect=PermissionError("denied")),
                 patch.object(self.module, "kernel_excerpt", return_value=[]),
             ):
                 report = self.module.collect(root, [native])
@@ -206,7 +368,7 @@ class StartupExitTests(unittest.TestCase):
 
     def test_only_standard_library_imports_and_no_unbounded_commands(self):
         tree = ast.parse(self.source.read_text(encoding="utf-8"))
-        allowed = {"argparse", "datetime", "os", "re", "subprocess", "uuid", "pathlib"}
+        allowed = {"argparse", "collections", "datetime", "os", "re", "subprocess", "uuid", "pathlib"}
         imports = {
             alias.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
         }

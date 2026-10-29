@@ -7,13 +7,17 @@ import os
 import re
 import subprocess
 import uuid
+from collections import deque
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-TAIL_BYTES = 16 * 1024 * 1024
 MAX_FILES = 12
 API_RESERVED_FILES = 3
 MAX_REPORT_LINES = 180
+SAMPLES_PER_END = 8
+MAX_FAULT_RECORDS = 24
+MAX_LOG_TEXT = 1400
+FAULT_KINDS = ("fatal", "error", "symptom")
 FULL_TIME = re.compile(r"(?<!\d)(\d{4}-\d{2}-\d{2})[ T-](\d{2}:\d{2}:\d{2})(?!\d)")
 SHORT_TIME = re.compile(r"(?<![\d-])(\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})(?!\d)")
 ENGINE_PID = re.compile(r"\bEngineCore\w*\s+pid=(\d+)")
@@ -22,11 +26,43 @@ TEXT_LOG_NAME = re.compile(r"\.log(?:[._-]\d+)*$", re.I)
 FAULT = re.compile(
     r"\[ERROR\]|\[MOE-MTE FATAL\]|Traceback|Fatal Python|(?:Error|Exception):|"
     r"\b(?:fatal|fault|segfault|aborted?|failed|failure|terminate(?:d)?|killed|SIGKILL|SIGSEGV|SIGABRT)\b|"
-    r"timeout|timed out|out of memory|signal\s+(?:6|9|11)\b|"
+    r"timed out|\b(?:wait|task|sync|synchronize|execution)\s+timeout\b|"
+    r"\btimeout\s+(?:occurred|expired|error|failure)\b|out of memory|"
     r"\bexit(?:[_ ]?(?:code|status))?\s*[:=]?\s*-?[1-9]\d*\b|"
     r"\bexited\s+(?:with\s+)?(?:code\s*[:=]?\s*)?-?[1-9]\d*\b",
     re.I,
 )
+TIMEOUT_PARAMETER = re.compile(r"\btimeout(?:_ms)?\s*[:=]\s*[+-]?\d+(?:\.\d+)?\s*(?:ms|us|s)?\b", re.I)
+FATAL = re.compile(
+    r"\bfatal\b|segmentation fault|\bsegfault\b|"
+    r"\b(?:SIGKILL|SIGSEGV|SIGABRT|SIGBUS|SIGILL|SIGFPE|SIGTERM|aborted|killed)\b|"
+    r"terminate called|out of memory|"
+    r"(?:received|killed by|(?:exited|terminated) (?:with|by))\s+signal\s*[:=]?\s*[1-9]\d*\b|"
+    r"\bexit(?:[_ ]?(?:code|status))?\s*[:=]?\s*-?[1-9]\d*\b|"
+    r"\bexited\s+(?:with\s+)?(?:code\s*[:=]?\s*)?-?[1-9]\d*\b",
+    re.I,
+)
+ERROR_LEVEL = re.compile(r"\[(?:ERROR|CRITICAL)\]|\b(?:ERROR|CRITICAL)\s+\d{2}-\d{2}|(?:Error|Exception):")
+RETURN_STATUS = re.compile(r"\b(?:result|ret|error_code|errcode)\s*[:=]\s*(-?(?:0x[0-9a-f]+|\d+))\b", re.I)
+
+
+def fault_kind(line):
+    # Numeric timeout fields describe a call/event configuration, including positive
+    # deadlines. Removing only that field still preserves an ERROR on the same line.
+    message = TIMEOUT_PARAMETER.sub("", line)
+    if FATAL.search(message):
+        return "fatal"
+    if ERROR_LEVEL.search(message):
+        return "error"
+    if FAULT.search(message) or any(
+        int(match[1], 16 if "x" in match[1].lower() else 10) != 0 for match in RETURN_STATUS.finditer(message)
+    ):
+        return "symptom"
+    return None
+
+
+def is_fault(line):
+    return fault_kind(line) is not None
 
 
 def timestamp(line, year=None):
@@ -60,10 +96,7 @@ def identity(lines):
     api_times = [
         value
         for line in lines
-        if (match := API_PID.search(line))
-        and match[1] == api
-        and FAULT.search(line)
-        and (value := timestamp(line, year))
+        if (match := API_PID.search(line)) and match[1] == api and is_fault(line) and (value := timestamp(line, year))
     ]
     last_engine = engine_times[-1] if engine_times else None
     last_api = api_times[-1] if api_times else None
@@ -105,8 +138,16 @@ def service_excerpt(lines, engine, api):
                 emitted.add(index)
 
     selected = [i for i, line in enumerate(lines) if (match := ENGINE_PID.search(line)) and match[1] == engine]
-    add_context("SERVICE_ENGINE_TAIL（最后 40 行，原文件行号；下文重复行只保留一次）:", selected[-40:])
-    faults = [i for i, line in enumerate(lines) if FAULT.search(line) and not API_PID.search(line)]
+    selected = [i for i in selected if lines[i].partition(")")[2].strip()]
+    api_faults = [
+        i for i, line in enumerate(lines) if (match := API_PID.search(line)) and match[1] == api and is_fault(line)
+    ]
+    add_context(
+        "SERVICE_API_FINAL_ERROR_CONTEXT（保留 Failed core proc(s)/退出状态文本）:",
+        context_indices(lines, api_faults[-3:], radius=1, limit=8),
+    )
+    add_context("SERVICE_ENGINE_TAIL（最后 12 条非空记录，原文件行号）:", selected[-12:])
+    faults = [i for i, line in enumerate(lines) if is_fault(line) and not API_PID.search(line)]
     add_context(
         "SERVICE_NON_API_FAULT_CONTEXT（含无进程前缀行；历史候选不能自动归因）:",
         context_indices(lines, faults),
@@ -121,16 +162,9 @@ def service_excerpt(lines, engine, api):
     )
     if api_trace is not None:
         add_context(
-            "FIRST_API_TRACE_CONTEXT（前后 12 行）:",
-            range(max(0, api_trace - 12), min(len(lines), api_trace + 13)),
+            "FIRST_API_TRACE_CONTEXT（前后 3 行）:",
+            range(max(0, api_trace - 3), min(len(lines), api_trace + 4)),
         )
-    api_faults = [
-        i for i, line in enumerate(lines) if (match := API_PID.search(line)) and match[1] == api and FAULT.search(line)
-    ]
-    add_context(
-        "SERVICE_API_FINAL_ERROR_CONTEXT（保留 Failed core proc(s)/退出状态文本）:",
-        context_indices(lines, api_faults[-3:], radius=1, limit=8),
-    )
     return result
 
 
@@ -175,31 +209,84 @@ def select_files(files, engine, api):
     return selected[:MAX_FILES]
 
 
-def read_tail(path):
+def scan_native(path, window):
+    """Scan the entire initial file snapshot; retain bounded samples, not all text."""
+    counts = dict.fromkeys(FAULT_KINDS, 0)
+    samples = {kind: [] for kind in FAULT_KINDS}
+    undated_counts = dict.fromkeys(FAULT_KINDS, 0)
+    undated_samples = {kind: [] for kind in FAULT_KINDS}
+    evidence = dict(
+        size=0,
+        bytes_read=0,
+        lines=0,
+        window_lines=0,
+        first_time=None,
+        last_time=None,
+        counts=counts,
+        undated_faults=0,
+        truncated=0,
+        parameter_only=0,
+    )
+    normal_tail = deque(maxlen=2)
+    pending = None
+
+    def display(line):
+        if len(line) > MAX_LOG_TEXT:
+            evidence["truncated"] += 1
+            return line[:MAX_LOG_TEXT] + " [TEXT_TRUNCATED]"
+        return line
+
     with path.open("rb") as source:
-        size = source.seek(0, 2)
-        offset = max(0, size - TAIL_BYTES)
-        source.seek(offset)
-        if offset:
-            source.readline()  # 跳过首个不完整行，不伪造原始行号。
-        offset = source.tell()
-        return size, offset, source.read().decode("utf-8", errors="replace").splitlines()
-
-
-def native_candidates(lines, window):
-    if window is None:
-        return [], [], 0
-    start, end = window
-    in_window = [i for i, line in enumerate(lines) if (value := timestamp(line)) and start <= value <= end]
-    faults = [i for i in in_window if FAULT.search(lines[i])]
-    # 不把无日期记录/其他日期的错误塞进本轮上下文；只有邻接无时间栈行可作附件。
-    context = set(faults)
-    for index in faults:
-        for following in range(index + 1, min(len(lines), index + 3)):
-            if FULL_TIME.search(lines[following]) or SHORT_TIME.search(lines[following]):
+        evidence["size"] = source.seek(0, 2)
+        source.seek(0)
+        while evidence["bytes_read"] < evidence["size"]:
+            raw = source.readline(evidence["size"] - evidence["bytes_read"])
+            if not raw:
                 break
-            context.add(following)
-    return sorted(context), in_window[-2:], len(in_window)
+            evidence["bytes_read"] += len(raw)
+            evidence["lines"] += 1
+            number = evidence["lines"]
+            line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            value = timestamp(line, window[1].year if window else None)
+            dated = FULL_TIME.search(line) or SHORT_TIME.search(line)
+            if value is not None:
+                evidence["first_time"] = min(evidence["first_time"] or value, value)
+                evidence["last_time"] = max(evidence["last_time"] or value, value)
+            if dated:
+                pending = None  # Even an invalid/old date stops an attached stack.
+            if value is None:
+                if not dated and pending is not None and len(pending["context"]) < 2:
+                    pending["context"].append((number, display(line)))
+                kind = fault_kind(line) if not dated else None
+                if kind is not None:
+                    evidence["undated_faults"] += 1
+                    undated_counts[kind] += 1
+                    retained = undated_samples[kind]
+                    if len(retained) == 2:
+                        retained.pop()
+                    retained.append(dict(line=number, text=display(line), kind=kind, context=[]))
+                continue
+            if window is None or not window[0] <= value <= window[1]:
+                continue
+            evidence["window_lines"] += 1
+            kind = fault_kind(line)
+            if kind is None:
+                evidence["parameter_only"] += bool(TIMEOUT_PARAMETER.search(line))
+                normal_tail.append((number, display(line)))
+                continue
+            counts[kind] += 1
+            pending = dict(line=number, text=display(line), kind=kind, context=[])
+            retained = samples[kind]
+            if len(retained) == 2 * SAMPLES_PER_END:
+                retained.pop(SAMPLES_PER_END)
+            retained.append(pending)
+        evidence["end_size"] = source.seek(0, 2)
+    evidence["records"] = [record for kind in FAULT_KINDS for record in samples[kind]]
+    evidence["normal_tail"] = list(normal_tail)
+    evidence["undated_counts"] = undated_counts
+    evidence["undated_samples"] = [record for kind in FAULT_KINDS for record in undated_samples[kind]]
+    evidence["undated_records"] = [(record["line"], record["text"]) for record in evidence["undated_samples"]]
+    return evidence
 
 
 def kernel_excerpt(window, pids):
@@ -222,7 +309,7 @@ def kernel_excerpt(window, pids):
     records = []
     for line in result.stdout.splitlines():
         value = timestamp(line)
-        if value is None or not window[0] <= value <= window[1] or not FAULT.search(line):
+        if value is None or not window[0] <= value <= window[1] or not is_fault(line):
             continue
         same_pid = any(re.search(rf"(?<!\d){re.escape(pid)}(?!\d)", line) for pid in pids)
         records.append(f"KERNEL_WINDOW_CANDIDATE pid_text_match={same_pid}: {line}")
@@ -242,6 +329,7 @@ def collect(run_dir, log_roots=None):
         window = None
     pids = [pid for pid in (engine, api) if pid]
     result = [
+        "INSPECTOR_VERSION=2; mode=full_file_snapshot; timeout参数不作故障，fatal/error/symptom分别计数与排序。",
         f"READ_ONLY_INPUT={service}; service_lines={len(lines)}",
         f"ENGINE_PIDS={engines}; API_PIDS={apis}; selected_engine={engine}; selected_api={api}",
         f"AMBIGUOUS_PROCESS_SET={ambiguous}；多 Engine/API PID 时仅展示服务文本，不自动关联原生/kernel 日志。",
@@ -274,41 +362,60 @@ def collect(run_dir, log_roots=None):
     selected_files = select_files(files, engine, api)
     result.append(
         f"NATIVE_ROOTS={roots}; PID命名文件={len(files)}; 未扫描文件={max(0, len(files) - MAX_FILES)}; "
-        f"最多 {MAX_FILES} 文件/每文件末 {TAIL_BYTES} 字节；目录深度≤5，不跟随链接、不读压缩日志。"
+        f"最多 {MAX_FILES} 文件，从首字节扫描至打开时大小；目录深度≤5，不跟随链接、不读压缩日志。"
     )
     result.append(f"NATIVE_FILE_QUOTA=Engine 优先，API 预留 {API_RESERVED_FILES} 文件；空余配额可互用。")
-    fault_budget, tail_budget = 20, 10
-    for path in selected_files:
+    totals = dict.fromkeys(FAULT_KINDS, 0)
+    collected = []
+    for file_id, path in enumerate(selected_files, 1):
         try:
-            size, offset, native_lines = read_tail(path)
-            faults, tail, matched = native_candidates(native_lines, window)
+            evidence = scan_native(path, window)
         except OSError as error:
             result.append(f"NATIVE_UNREADABLE {path}: {error}")
             continue
+        collected.append((file_id, evidence))
+        for kind in FAULT_KINDS:
+            totals[kind] += evidence["counts"][kind]
         result.append(
-            f"NATIVE_LOG={path}; bytes={size}; 未扫描前缀字节={offset}; "
-            f"tail_lines={len(native_lines)}; window_lines={matched}; fault_context_lines={len(faults)}; "
-            f"tail_L={'读取区间行号，原始行号未知' if offset else '原始行号'}"
+            f"NATIVE_LOG id={file_id}: {path}; snapshot_bytes={evidence['size']}; "
+            f"scanned_bytes={evidence['bytes_read']}; end_size={evidence['end_size']}; "
+            f"lines={evidence['lines']}; window_lines={evidence['window_lines']}; "
+            f"counts={evidence['counts']}; parameter_only={evidence['parameter_only']}; "
+            f"undated_faults={evidence['undated_faults']}; text_truncated={evidence['truncated']}; "
+            f"time_range={evidence['first_time']}..{evidence['last_time']}"
         )
-        count = min(6, fault_budget)
-        front, back = (count + 1) // 2, count // 2
-        # 保留首尾候选，避免退出后的连续清理错误挤掉最初的故障记录。
-        shown_faults = list(dict.fromkeys(faults[:front] + (faults[-back:] if back else [])))
-        shown_tail = tail[-tail_budget:] if tail_budget else []
-        for index in shown_faults:
-            result.append(f"NATIVE_FAULT_CANDIDATE tail_L{index + 1}: {native_lines[index]}")
-        for index in shown_tail:
-            result.append(f"NATIVE_NORMAL_TAIL（只说明最后记录）tail_L{index + 1}: {native_lines[index]}")
-        if len(shown_faults) < len(faults):
-            result.append(f"NATIVE_OMITTED_FAULT_CONTEXT={len(faults) - len(shown_faults)}; file={path}")
-        fault_budget -= len(shown_faults)
-        tail_budget -= len(shown_tail)
+    # Classify across all files before spending the display budget. Otherwise an
+    # earlier file's routine ERROR lines can hide another file's crash or exit.
+    candidates = [
+        (file_id, record, correlated)
+        for file_id, evidence in collected
+        for key, correlated in (("records", True), ("undated_samples", False))
+        for record in evidence[key]
+    ]
+    candidates.sort(key=lambda item: FAULT_KINDS.index(item[1]["kind"]))
+    shown = candidates[:MAX_FAULT_RECORDS]
+    undated_total = sum(evidence["undated_faults"] for _, evidence in collected)
+    result.append(
+        f"NATIVE_WINDOW_COUNTS={totals}; "
+        f"NATIVE_OMITTED_FAULT_RECORDS={sum(totals.values()) - sum(item[2] for item in shown)}; "
+        f"NATIVE_UNDATED_TOTAL={undated_total}; "
+        f"NATIVE_OMITTED_UNDATED_RECORDS={undated_total - sum(not item[2] for item in shown)}; "
+        "计数仅为分类候选；非零result/ret也不自动证明失败。L均为原始行号。"
+    )
+    for file_id, record, correlated in shown:
+        label = "NATIVE_FAULT_CANDIDATE" if correlated else "NATIVE_UNDATED_UNCORRELATED"
+        result.append(f"{label} kind={record['kind']} file={file_id} L{record['line']}: {record['text']}")
+        for number, line in record["context"]:
+            result.append(f"NATIVE_ATTACHED_CONTEXT file={file_id} L{number}: {line}")
+    for file_id, evidence in collected:
+        for number, line in evidence["normal_tail"][-1:]:
+            result.append(f"NATIVE_NORMAL_TAIL（仅最后普通记录）file={file_id} L{number}: {line}")
     result.extend(kernel_excerpt(window, pids))
     result.extend(service_excerpt(lines, engine, api))
     footer = [
         "CAUSE=NOT_ESTABLISHED；上述仅为时间/PID 范围内候选，普通 Submit/同步日志及退出码 0 不证明退出原因。",
         "边界：未恢复已退出 EngineCore 的 waitpid 状态；未读 cgroup 累计值、进程环境、tensor 或 coredump。",
-        "原日志完整保留在绿区；未命中不排除轮转、尾部截断、非 PID 文件、日期缺失、时区或 namespace 差异。",
+        "原日志完整保留在绿区；未命中不排除轮转、未选文件、扫描中增长/缩短、日期缺失、时区或 namespace 差异。",
     ]
     omitted = max(0, len(result) - (MAX_REPORT_LINES - len(footer) - 1))
     result = result[: MAX_REPORT_LINES - len(footer) - 1]
