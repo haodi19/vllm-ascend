@@ -15,6 +15,7 @@ class GraphDumpPlacementTests(unittest.TestCase):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "debug_dump"
         ]
         self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0].args), 1, "Torch NPU 2.10 requires debug_path")
         ancestors = []
         node = calls[0]
         while node in parents:

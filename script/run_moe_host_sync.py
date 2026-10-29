@@ -35,6 +35,7 @@ def configured_source(
     diagnose_prefetch_poll_budget=0,
     diagnose_load_vector_cores=0,
     diagnose_graph_dump=False,
+    diagnose_graph_dump_dir="moe_graph_debug",
 ):
     diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
     diagnose_prefetch_report_wait = diagnose_prefetch_report_wait or bool(diagnose_prefetch_poll_budget)
@@ -48,6 +49,7 @@ def configured_source(
     offload["host_sync_backend"] = backend
     if diagnose_graph_dump:
         offload["host_sync_diagnose_graph_dump"] = backend == "mte"
+        offload["host_sync_diagnose_graph_dump_dir"] = str(diagnose_graph_dump_dir)
     if diagnose_load_vector_cores:
         offload["host_sync_diagnose_load_vector_cores"] = diagnose_load_vector_cores if backend == "mte" else 0
     offload["host_sync_library"] = str(library) if backend == "mte" else ""
@@ -346,6 +348,7 @@ def run(args, root):
                 args.diagnose_prefetch_poll_budget,
                 args.diagnose_load_vector_cores,
                 args.diagnose_graph_dump,
+                directory / "graph_debug",
             ),
             "python",
             env,

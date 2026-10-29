@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import tempfile
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -96,6 +98,7 @@ class ACLGraphWrapper:
         self.vllm_config = vllm_config
         offload_config = (vllm_config.additional_config or {}).get("expert_offload_config", {})
         self._moe_graph_dump = bool(offload_config.get("host_sync_diagnose_graph_dump", False))
+        self._moe_graph_dump_dir = offload_config.get("host_sync_diagnose_graph_dump_dir", "moe_graph_debug")
         self.runtime_mode = runtime_mode
         self.compilation_config = vllm_config.compilation_config
 
@@ -226,8 +229,14 @@ class ACLGraphWrapper:
                     raise
 
             if self._moe_graph_dump:
-                logger.warning("[MOE-MTE GRAPH_DUMP_BEGIN] mode=%s batch=%s", self.runtime_mode, batch_descriptor)
-                aclgraph.debug_dump()
+                dump_root = Path(self._moe_graph_dump_dir)
+                dump_root.mkdir(parents=True, exist_ok=True)
+                dump_path = str(Path(tempfile.mkdtemp(prefix="capture_", dir=dump_root)) / "graph_dump")
+                logger.warning(
+                    "[MOE-MTE GRAPH_DUMP_BEGIN] mode=%s batch=%s path=%s",
+                    self.runtime_mode, batch_descriptor, dump_path,
+                )
+                aclgraph.debug_dump(dump_path)
                 logger.warning("[MOE-MTE GRAPH_DUMP_END] mode=%s batch=%s", self.runtime_mode, batch_descriptor)
 
             # here we always use weak ref for the workspaces

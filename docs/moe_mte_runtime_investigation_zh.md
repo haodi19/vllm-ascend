@@ -130,3 +130,15 @@ python -B script/diagnose_mte_graph_mapping.py --npu 7
 本轮不分核、不替换等待、不重排权重。完整日志保留本地，只返回 graph_diagnosis.txt。
 该文件报告图打印开始/结束次数及 Runtime 候选记录。接口调用失败、工具输出不包含
 映射或日志被轮转均需明确区分，不能将“开启图打印”本身写成已定位根因。
+
+### 图打印首轮启动失败及修正
+
+PID=71190 的首轮图打印诊断在捕获完成后报错：
+`NPUGraph.debug_dump() missing 1 required positional argument: 'debug_path'`。
+这是诊断代码使用了不匹配当前 Torch NPU 的无参数调用所致，并非原来的加载流阻塞。
+本轮服务没有启动完成，不能纳入原阻塞的正反实验结果。
+
+已改为显式传入路径，在实验目录 mte/graph_debug 下为每次捕获分配独立路径。
+启动脚本先用 inspect.signature 绑定路径参数，再启动模型。参数签名检查不能代替
+设备接口功能验证；本地只验证调用结构与默认路径回归。摘要列出图产物和小段文本预览，
+无需传输原始文件。

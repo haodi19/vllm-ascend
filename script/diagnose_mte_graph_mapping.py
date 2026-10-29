@@ -2,6 +2,7 @@
 """纯 MTE 复现并打印捕获图任务信息，生成精简定位文本。"""
 
 import argparse
+import inspect
 import os
 import re
 import subprocess
@@ -27,6 +28,9 @@ def main():
     graph = torch_npu.npu.NPUGraph
     if not all(callable(getattr(graph, name, None)) for name in ("enable_debug_mode", "debug_dump")):
         raise RuntimeError("当前 Torch NPU 没有图调试入口；未启动模型")
+    signature = inspect.signature(graph.debug_dump)
+    signature.bind(None, "diagnostic_graph_path")
+    print(f"NPUGraph.debug_dump signature={signature}; 已检查路径参数，尚未调用设备接口", flush=True)
     root = Path(__file__).resolve().parents[1]
     output = root / "bench_results" / f"mte_graph_mapping_{uuid4().hex[:8]}"
     env = os.environ.copy()
@@ -75,6 +79,15 @@ def main():
         starts = sum("[MOE-MTE GRAPH_DUMP_BEGIN]" in line for line in text.splitlines())
         ends = sum("[MOE-MTE GRAPH_DUMP_END]" in line for line in text.splitlines())
         dest.write(f"GRAPH_DUMP begin={starts} end={ends}; 接口返回不保证所需映射已包含\n")
+        graph_root = output / "mte/graph_debug"
+        for path in sorted(graph_root.rglob("*")):
+            if path.is_file():
+                dest.write(f"GRAPH_FILE {path.relative_to(output)} bytes={path.stat().st_size}\n")
+                # Text preview only; binary artifacts stay in the green environment.
+                with path.open("rb") as source:
+                    head = source.read(4096)
+                if b"\0" not in head:
+                    dest.write(head.decode("utf-8", errors="replace")[:2000] + "\n")
         for line in text.splitlines():
             if graph_record(line):
                 dest.write(line[:1800] + "\n")
