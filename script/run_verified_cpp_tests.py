@@ -23,6 +23,12 @@ import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+VERIFICATION_PROMPTS = (
+    "Explain why the sky appears blue during the day in two sentences.",
+    "计算17乘以23，并简要说明计算过程。",
+    "Write a Python function that returns the sum of the squares of a list of integers.",
+)
+VERIFICATION_MAX_TOKENS = 32
 METRICS = (
     "total",
     "observe",
@@ -390,6 +396,14 @@ def inference(args, source, backend, env):
         return _inference(args, source, backend, env, log)
 
 
+def completion_payloads(args, model):
+    prompts = VERIFICATION_PROMPTS if getattr(args, "verification_suite", False) else ("The future of AI is",)
+    return [
+        dict(model=model, prompt=prompts[index % len(prompts)], max_tokens=args.max_tokens, temperature=0)
+        for index in range(args.requests)
+    ]
+
+
 def _inference(args, source, backend, env, log):
     profile_enabled = not getattr(args, "skip_profile", False)
     profile_dir = args.profile_run_dir / backend
@@ -424,32 +438,47 @@ def _inference(args, source, backend, env, log):
                     if time.monotonic() >= deadline:
                         raise RuntimeError("Service readiness timed out") from None
                     time.sleep(2)
-        payload = dict(model=model, prompt="The future of AI is", max_tokens=args.max_tokens, temperature=0)
+        payloads = completion_payloads(args, model)
+        request_specs = [
+            dict(
+                prompt_sha256=hashlib.sha256(payload["prompt"].encode()).hexdigest(),
+                max_tokens=payload["max_tokens"],
+                temperature=payload["temperature"],
+            )
+            for payload in payloads
+        ]
+        prompt_mode = "verification suite" if getattr(args, "verification_suite", False) else "identical prompt"
         print(
             f"Service ready. Warmup={args.warmup_requests}; measured requests={args.requests}; "
-            f"max_tokens={args.max_tokens}; temperature=0; identical prompt; sequential requests.",
+            f"max_tokens={args.max_tokens}; temperature=0; {prompt_mode}; sequential requests.",
             flush=True,
         )
+        print("REQUEST_PLAN " + json.dumps(request_specs), flush=True)
 
-        def completion():
+        def completion(payload, phase="measured"):
             begin = time.perf_counter_ns()
             result = request(opener, args.port, "/v1/completions", payload, timeout=args.request_timeout)
             elapsed = (time.perf_counter_ns() - begin) / 1000
             if "choices" not in result or "usage" not in result:
                 raise RuntimeError("Completion did not include choices/usage")
+            if getattr(args, "verification_suite", False) and getattr(args, "output_dir", None):
+                with (args.output_dir / "completion_records.jsonl").open("a", encoding="utf-8") as records:
+                    records.write(
+                        json.dumps(dict(phase=phase, payload=payload, response=result), ensure_ascii=False) + "\n"
+                    )
             text = "".join(item.get("text", "") for item in result["choices"])
             return elapsed, result["usage"], hashlib.sha256(text.encode()).hexdigest()
 
         with progress(f"{backend} warmup: {args.warmup_requests} requests"):
-            for _ in range(args.warmup_requests):
-                completion()
+            for index in range(args.warmup_requests):
+                completion(payloads[index % len(payloads)], phase="warmup")
         if profile_enabled:
             request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
         requests = []
         try:
             request(opener, args.timing_port, "/start", {})
             with progress(f"{backend} measured inference: {args.requests} requests"):
-                requests = [completion() for _ in range(args.requests)]
+                requests = [completion(payload) for payload in payloads]
         finally:
             try:
                 report = request(opener, args.timing_port, "/stop", {}, timeout=40)
@@ -461,6 +490,7 @@ def _inference(args, source, backend, env, log):
             finally:
                 profile_status = finish_profile(opener, args, profile_dir) if profile_enabled else "skipped"
         report["profile_status"] = profile_status
+        report["request_specs"] = request_specs
         if getattr(args, "mstx", False) and profile_enabled:
             report["mstx_trace_occurrences"] = inspect_mstx_trace(profile_dir)
             if profile_status == "complete":

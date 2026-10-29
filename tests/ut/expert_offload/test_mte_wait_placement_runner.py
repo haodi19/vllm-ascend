@@ -113,6 +113,45 @@ class WaitPlacementRunnerTests(unittest.TestCase):
             self.assertNotIn("--dsa-cube-cores", command)
             self.assertNotIn("--trace-startup", command)
 
+    def test_verification_routes_both_backends_and_preserves_evidence_on_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process = Mock(wait=Mock(return_value=0))
+            with patch.object(self.module.subprocess, "Popen", return_value=process) as launch:
+                self.module.run_once(root, root / "case", 7, True, True, True)
+            command = launch.call_args.args[0]
+            self.assertEqual(command[command.index("--backend") + 1], "both")
+            self.assertEqual(launch.call_args.kwargs["env"]["ASCEND_MODULE_LOG_LEVEL"], "RUNTIME=0")
+            for flag in (
+                "--verification-suite",
+                "--no-load-diagnostics",
+                "--diagnose-prefetch-wait-at-join",
+                "--skip-profile",
+            ):
+                self.assertIn(flag, command)
+            (root / "summary.txt").write_text(
+                "=== REAL MOE HOST BACKEND: callback ===\nEffective serve command: vllm serve /model\n"
+                'MOE_RESULT {"host_backend": "callback"}\n'
+                "=== REAL MOE HOST BACKEND: mte ===\nEffective serve command: vllm serve /model\n"
+                'MOE_RESULT {"host_backend": "mte"}\nPAIR_RESULT {"status": "passed"}\n',
+                encoding="utf-8",
+            )
+            for code, expected in ((0, "finite_output_match"), (1, "inconclusive_or_mismatch")):
+                log = root / "callback/inference_python.log"
+                log.parent.mkdir(exist_ok=True)
+                log.write_text("RuntimeError: synthetic callback failure", encoding="utf-8")
+                output = io.StringIO()
+                self.module.append_evidence(output, root, code, verify_callback=True)
+                self.assertIn("RESULT=" + expected, output.getvalue())
+                self.assertEqual(output.getvalue().count("EFFECTIVE_CONFIG "), 2)
+                self.assertIn("GATE_GRAPH_UNVERIFIED", output.getvalue())
+                if code:
+                    self.assertIn("synthetic callback failure", output.getvalue())
+            (root / "summary.txt").write_text('PAIR_RESULT {"status":', encoding="utf-8")
+            output = io.StringIO()
+            self.module.append_evidence(output, root, 0, verify_callback=True)
+            self.assertIn("RESULT=inconclusive_or_mismatch", output.getvalue())
+
     def test_startup_trace_still_launches_one_wait_placement_case(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

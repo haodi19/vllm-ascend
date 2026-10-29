@@ -19,6 +19,12 @@ def graph_record(line):
     return bool(re.search(r"DebugPrint|DebugDump|PrintModel|ModelPrint|PrintTaskInfo|PrintStreamInfo", line, re.I))
 
 
+def diagnostic_environment():
+    env = os.environ.copy()
+    env["ASCEND_MODULE_LOG_LEVEL"] = "RUNTIME=0"
+    return env
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=int, required=True)
@@ -61,8 +67,7 @@ def main():
     output = (args.output_dir or root / "bench_results" / f"mte_graph_mapping_{uuid4().hex[:8]}").resolve()
     if output.exists():
         raise ValueError(f"诊断目录已存在，拒绝覆盖：{output}")
-    env = os.environ.copy()
-    env["ASCEND_MODULE_LOG_LEVEL"] = "RUNTIME=0"
+    env = diagnostic_environment()
     command = [
         sys.executable,
         "-B",

@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -17,7 +18,7 @@ from inspect_mte_runtime_task import inspect_run
 from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, run_step
 from run_host_sync_stage2 import target_cmake_args
 from run_host_sync_stage3 import select_build_directory
-from run_verified_cpp_tests import SummaryTee, inference, launch_spec
+from run_verified_cpp_tests import VERIFICATION_MAX_TOKENS, VERIFICATION_PROMPTS, SummaryTee, inference, launch_spec
 
 MAX_ENGINE_ERROR_LINE_CHARS = 800
 
@@ -199,6 +200,49 @@ def engine_error_log_positions(service_log):
     )
 
 
+def compare_verification_reports(reports):
+    """Reject missing/empty results before interpreting any output match."""
+    for backend in ("callback", "mte"):
+        report = reports[backend]
+        if report.get("errors") != 0 or report.get("dropped") != 0 or report.get("count", 0) <= 0:
+            raise ValueError(f"{backend}: missing or failed callback accounting")
+        for field in ("request_specs", "digests", "usage"):
+            if len(report.get(field, [])) != len(VERIFICATION_PROMPTS):
+                raise ValueError(f"{backend}: incomplete {field}")
+        if any(
+            not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or digest == hashlib.sha256(b"").hexdigest()
+            for digest in report["digests"]
+        ):
+            raise ValueError(f"{backend}: missing or empty generated text")
+        if any(item.get("completion_tokens", 0) <= 0 for item in report["usage"]):
+            raise ValueError(f"{backend}: empty completion usage")
+        expected = [
+            dict(
+                prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+                max_tokens=VERIFICATION_MAX_TOKENS,
+                temperature=0,
+            )
+            for prompt in VERIFICATION_PROMPTS
+        ]
+        if report["request_specs"] != expected:
+            raise ValueError(f"{backend}: request plan differs from the fixed suite")
+    left, right = reports["callback"], reports["mte"]
+    text_match = [a == b for a, b in zip(left["digests"], right["digests"])]
+    usage_match = [a == b for a, b in zip(left["usage"], right["usage"])]
+    result = dict(
+        status="passed" if all(text_match + usage_match) else "mismatch",
+        text_match=text_match,
+        usage_match=usage_match,
+        scope="three fixed prompts; exact text/usage only; no logits or performance claim",
+    )
+    print("PAIR_RESULT " + json.dumps(result), flush=True)
+    if result["status"] != "passed":
+        raise RuntimeError("Callback/MTE generated text or request usage differs")
+    return result
+
+
 def prepare_runtime_artifacts(source, target):
     """Copy missing build artifacts only; never replace source code or existing files."""
     source, target = source.resolve(), target.resolve()
@@ -236,6 +280,11 @@ def main():
         help="Diagnostic: keep early publication, defer strict prefetch wait to consumer join",
     )
     parser.add_argument("--skip-profile", action="store_true", help="Run finite requests without starting profiler")
+    parser.add_argument(
+        "--verification-suite",
+        action="store_true",
+        help="Compare three fixed prompts with up to 32 output tokens, callback then MTE",
+    )
     parser.add_argument(
         "--no-load-diagnostics",
         action="store_true",
@@ -294,11 +343,11 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
-    if args.trace_startup and (args.backend != "mte" or not args.diagnose_prefetch_wait_at_join):
-        parser.error("--trace-startup requires --backend mte --diagnose-prefetch-wait-at-join")
+    if args.trace_startup and (args.backend not in ("mte", "both") or not args.diagnose_prefetch_wait_at_join):
+        parser.error("--trace-startup requires MTE and --diagnose-prefetch-wait-at-join")
     if args.no_load_diagnostics:
-        if args.backend != "mte" or not args.diagnose_prefetch_wait_at_join:
-            parser.error("--no-load-diagnostics requires --backend mte --diagnose-prefetch-wait-at-join")
+        if args.backend not in ("mte", "both") or not args.diagnose_prefetch_wait_at_join:
+            parser.error("--no-load-diagnostics requires MTE and --diagnose-prefetch-wait-at-join")
         if any(
             (
                 args.diagnose_load_stages,
@@ -309,6 +358,19 @@ def main():
             )
         ):
             parser.error("--no-load-diagnostics conflicts with per-load diagnosis")
+    if args.verification_suite and not (
+        args.backend == "both"
+        and args.skip_profile
+        and args.no_load_diagnostics
+        and args.diagnose_prefetch_wait_at_join
+        and args.diagnose_graph_dump
+        and args.requests == len(VERIFICATION_PROMPTS)
+        and args.warmup_requests == 1
+    ):
+        parser.error(
+            "verification suite requires both backends, join wait, graph dump, no load diagnostics, "
+            "skip profile, 1 warmup and 3 requests"
+        )
     if args.diagnose_load_vector_cores:
         args.diagnose_native_wait = True
     if not 0 <= args.diagnose_prefetch_poll_budget <= 10_000_000:
@@ -432,14 +494,15 @@ def run(args, root):
             timing_port=args.timing_port,
             requests=args.requests,
             warmup_requests=args.warmup_requests,
-            max_tokens=5,
+            max_tokens=VERIFICATION_MAX_TOKENS if getattr(args, "verification_suite", False) else 5,
             startup_timeout=args.startup_timeout,
             request_timeout=args.request_timeout,
             profile_timeout=args.profile_timeout,
             strict_profile=False,
             mstx=True,
             skip_profile=args.skip_profile,
-            trace_startup=getattr(args, "trace_startup", False),
+            trace_startup=getattr(args, "trace_startup", False) and backend == "mte",
+            verification_suite=getattr(args, "verification_suite", False),
         )
         print(f"\n=== REAL MOE HOST BACKEND: {backend} ===", flush=True)
         print(
@@ -511,11 +574,14 @@ def run(args, root):
                     "callbacks": reports[backend]["count"],
                     "callback_errors": reports[backend]["errors"],
                     "callback_dropped": reports[backend]["dropped"],
+                    "request_specs": reports[backend]["request_specs"],
                 }
             ),
             flush=True,
         )
-    if len(reports) == 2:
+    if getattr(args, "verification_suite", False):
+        compare_verification_reports(reports)
+    elif len(reports) == 2:
         match = reports["callback"]["digests"] == reports["mte"]["digests"]
         usage_match = reports["callback"]["usage"] == reports["mte"]["usage"]
         print(f"GENERATED TEXT MATCH: {match}; USAGE MATCH: {usage_match}", flush=True)

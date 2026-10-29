@@ -2,8 +2,13 @@
 """CPU checks for optional MoE dispatch without NPU imports."""
 
 import ast
+import contextlib
+import copy
+import hashlib
 import importlib.util
+import io
 import json
+import shlex
 import sys
 import tempfile
 import unittest
@@ -29,6 +34,145 @@ class MoeHostSyncTests(unittest.TestCase):
     def test_default_needs_no_extension(self):
         self.module.validate_host_sync_config({})
         self.module.validate_host_sync_config({"host_sync_backend": "callback"})
+
+    def suite_report(self):
+        return dict(
+            count=10,
+            errors=0,
+            dropped=0,
+            request_specs=[
+                dict(prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(), max_tokens=32, temperature=0)
+                for prompt in self.runner.VERIFICATION_PROMPTS
+            ],
+            digests=[hashlib.sha256(str(index).encode()).hexdigest() for index in range(3)],
+            usage=[dict(completion_tokens=32)] * 3,
+        )
+
+    def test_verification_requires_complete_nonempty_matching_results(self):
+        reports = dict(callback=self.suite_report(), mte=self.suite_report())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = self.runner.compare_verification_reports(reports)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(result["text_match"], [True] * 3)
+        for field, value in (
+            ("count", 0),
+            ("errors", 1),
+            ("dropped", 1),
+            ("request_specs", []),
+            ("digests", [hashlib.sha256(b"").hexdigest()] * 3),
+            ("usage", [dict(completion_tokens=0)] * 3),
+        ):
+            broken = copy.deepcopy(reports)
+            broken["mte"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.runner.compare_verification_reports(broken)
+        broken = copy.deepcopy(reports)
+        broken["mte"]["request_specs"][0]["temperature"] = 1
+        with self.assertRaisesRegex(ValueError, "plan differs"):
+            self.runner.compare_verification_reports(broken)
+        for field, value in (
+            ("digests", hashlib.sha256(b"different").hexdigest()),
+            ("usage", dict(completion_tokens=31)),
+        ):
+            broken = copy.deepcopy(reports)
+            broken["mte"][field][1] = value
+            output = io.StringIO()
+            with self.subTest(field=field), contextlib.redirect_stdout(output), self.assertRaises(RuntimeError):
+                self.runner.compare_verification_reports(broken)
+            self.assertIn('"status": "mismatch"', output.getvalue())
+
+    def test_suite_orchestration_keeps_callback_original_and_stops_on_baseline_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.sh"
+            source.write_text(
+                "vllm serve /model --port 8155 --additional-config "
+                + shlex.quote(
+                    json.dumps(
+                        dict(
+                            expert_offload_config=dict(
+                                expert_offload=True,
+                                cache_policy_enabled=True,
+                                expert_prefetch_enabled=True,
+                                num_device_experts=24,
+                            )
+                        )
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "runner",
+                        "--npu",
+                        "7",
+                        "--backend",
+                        "both",
+                        "--verification-suite",
+                        "--no-load-diagnostics",
+                        "--diagnose-prefetch-wait-at-join",
+                        "--diagnose-graph-dump",
+                        "--skip-profile",
+                        "--trace-startup",
+                        "--test-script",
+                        str(source),
+                        "--output-dir",
+                        str(root / "parsed"),
+                    ],
+                ),
+                patch.object(sys, "platform", "linux"),
+                patch.object(self.runner, "run", return_value=0) as parsed,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(self.runner.main(), 0)
+            args = parsed.call_args.args[0]
+            for fail_callback in (False, True):
+                output = root / str(fail_callback)
+                output.mkdir()
+                seen = []
+
+                def infer(run_args, configured, backend, env, *, seen=seen, fail_callback=fail_callback):
+                    words = shlex.split(configured)
+                    config = json.loads(words[words.index("--additional-config") + 1])["expert_offload_config"]
+                    host = config["host_sync_backend"]
+                    seen.append(host)
+                    self.assertEqual(backend, "python")
+                    self.assertEqual(config["num_device_experts"], 24)
+                    self.assertFalse(config["host_sync_diagnose_load"])
+                    self.assertFalse(config["host_sync_diagnose_native_wait"])
+                    self.assertEqual(config["host_sync_diagnose_prefetch_wait_at_join"], host == "mte")
+                    self.assertEqual(config["host_sync_diagnose_graph_dump"], host == "mte")
+                    self.assertEqual(run_args.trace_startup, host == "mte")
+                    self.assertTrue(run_args.verification_suite)
+                    self.assertTrue(run_args.skip_profile)
+                    self.assertEqual((run_args.requests, run_args.warmup_requests, run_args.max_tokens), (3, 1, 32))
+                    if fail_callback and host == "callback":
+                        raise RuntimeError("baseline failed")
+                    (run_args.output_dir / "inference_python.log").write_text(
+                        "[MOE-MTE WORKER] scan=all probe=locked idle=yield\n"
+                        "[MOE-MTE] first real offload callback completed"
+                        if host == "mte"
+                        else "callback service",
+                        encoding="utf-8",
+                    )
+                    return dict(self.suite_report(), request_us=1, profile_status="skipped")
+
+                with (
+                    patch.object(self.runner, "inference", side_effect=infer),
+                    patch.object(self.runner, "run_step", return_value=True),
+                    patch.object(self.runner, "select_build_directory", return_value=root / "build"),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    if fail_callback:
+                        with self.assertRaisesRegex(RuntimeError, "baseline failed"):
+                            self.runner.run(args, output)
+                    else:
+                        self.assertEqual(self.runner.run(args, output), 0)
+                self.assertEqual(seen, ["callback"] if fail_callback else ["callback", "mte"])
 
     def test_compute_limits_restore_both_resources_after_capture_error(self):
         calls = []

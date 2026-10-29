@@ -4,10 +4,10 @@
 默认关闭诊断。参考仓库 `D:\华为\nano2\vllm-ascend\vLLM-ascend-DSA` 仅只读审阅，
 HEAD 为 `ce6900977e6a25377cd11205e3613ec2ec0208a4`。没有收到辅助流单组补跑的新结果。
 
-**最新：消费者汇合处等待已取得一次有效有限通过；下一步关闭前8批额外加载诊断，见第10节。**
+**最新：关闭前8批加载诊断后仍有限通过；下一步比较callback/MTE在三种不同输入上的输出，见第11节。**
 根因仍未证实，停止继续枚举核数。等待位置实验检验“等待与消费者之前的真实模型计算重叠”
 是否参与触发，不能直接区分资源调度、模型算子内部停滞和轮询访存影响。
-第1–9节保留实验设计、首次运行命令与启动取证记录；后续操作以第10节为准。
+第1–10节保留实验设计、首次运行命令与启动取证记录；后续操作以第11节为准。
 
 ## 1. 原项目与当前改造的完整顺序
 
@@ -417,3 +417,72 @@ python -B script/diagnose_mte_wait_placement.py --npu 7 --trace-startup --no-loa
 覆盖选项逐层传递、继承true值显式覆盖、冲突拒绝、原负载保留及错误日志位置边界。
 修改的5个Python文件Ruff检查与格式检查通过，`git diff --check`通过。
 `format.sh ci`仍因缺少pre-commit无法启动完整检查；新增无逐项诊断模式的NPU结果待上述命令返回。
+
+## 11. 普通加载通过：转入有限输出对照与更长执行覆盖
+
+用户返回 `mte_wait_placement_e5189f82/summary.txt`，对应提交 `e4236847`。
+`LOAD_DIAGNOSTICS_REQUESTED=False`，有效配置的load/native_wait诊断均为false，
+`LOAD_DIAGNOSTIC_RECORDS=0`。因此本轮确实从第一批开始走普通批量加载，没有借助前8批逐项同步。
+
+结果与边界：
+
+- wrapper与runner退出码均为0，1次预热+3次请求完成。三个文本摘要仍与上一轮相同，
+  每个请求completion为5 tokens；这是两次MTE诊断配置间的短输入一致性，尚无callback对照。
+- 计时窗口记录510次业务回调，errors=0、dropped=0。计数不能直接等同于MTE generation数，
+  也不能证明全部捕获尺寸均被重放或全部数据依赖均已覆盖。
+- 捕获开始/结束各一次，发布与汇合各42槽、pending=0；`capture_6ki985ja/graph_dump`的42对结构成立。
+  主流与辅助流计算核数未改，仍保留严格generation等待和原始拷贝。
+- `EngineDeadError`只出现1行，在唯一cleanup标记之后，之前为0行；EngineCore PID95109的
+  SIGTERM退出观测也在runner `reason=completed`及父进程terminate请求之后。
+  本轮结束符合主动清理顺序，没有证据把这一行计作请求失败。日志顺序本身仍不是完整因果证明。
+- request_mean_us约3481752，不与上一轮约3201599比较性能。输入短且诊断日志、图转储、MSTX等仍开启。
+
+这次证据排除了“该次通过必须依赖最初8批额外同步”的解释。等待位置方案已有两次有限通过，
+其中一次是普通加载；这增强了等待/映射写回时序方向的可实施性，但没有区分底层调度、轮询访存、
+算子内部依赖等机制。旧启动失败原因也没有因这两次成功而得到解释。
+
+### 11.1 为什么下一步做输出对照
+
+当前更紧迫的缺口是：延后等待与映射写回后，完成的请求是否仍与原callback路径输出一致，
+以及更长生成和不同输入是否还能推进。因此不重复前8批诊断开关、不补跑限核组；下一组是功能验证，
+不是继续证明资源死锁的实验。若失败，按启动、请求停滞、输出差异分别继续。
+
+同一次命令顺序启动两个新服务：callback完成并清理后才启动MTE。两者使用同一次读取的
+`test_graph2.sh`、相同模型/MTP/缓存配置、Python策略和Torch数据拷贝。callback保留原报告回调及加载流，
+MTE保留当前SyncLaunchStream、早发布和join处严格等待；只有MTE启用启动观察与图转储。
+两者均关闭逐项加载诊断、跳过profiler，并沿用既有Runtime debug设置；不作性能比较。
+
+固定三种输入为英文解释蓝天、中文计算17×23、Python平方和函数。每个服务先用首个输入预热一次，
+然后依次执行三种输入，temperature=0，每个请求最多生成32 tokens。默认旧实验仍是原提示词/5 tokens。
+更长请求有机会暴露重复代数与缓存变化的问题，但不预先声称一定覆盖冷热专家、特定miss数或所有图尺寸。
+
+运行器记录实际prompt的SHA256、max_tokens与temperature，逐请求比较返回text的SHA256及完整usage。
+空输出、缺失结果、计时错误或请求计划不符都不能报告通过；不要求业务回调计数相等。
+原始请求及响应保留在各服务目录的 `completion_records.jsonl`，含warmup/measured标记，方便出现差异后
+继续读同一轮数据。summary仅展示摘要，不打印原始生成文本。完全一致也只构成这三种输入上的有限证据，
+不是logits精度验证，更不是阻塞根因或性能结论。
+
+### 11.2 绿区命令与判读
+
+```bash
+cd /home/l00992607/vllm-ascend-worker-poll
+git pull --ff-only origin dev/moeoffload-worker-poll
+python -B script/diagnose_mte_wait_placement.py --npu 7 --trace-startup --no-load-diagnostics --verify-callback
+```
+
+总计两次服务启动，每个服务1次预热+3次请求。保持各服务超时设置；外层总上限6000秒，
+只清理本命令拥有的进程组。callback失败则不会继续启动MTE。
+
+仍返回新建 `bench_results/mte_wait_placement_*/summary.txt` 的检查脱敏文本。检查：
+
+1. 两份 `MOE_RESULT`、两份有效配置，`PAIR_RESULT.status=passed`，三个text_match和usage_match均为true。
+   wrapper必须同时退出0，才标记 `RESULT=finite_output_match`。
+2. MTE的逐项诊断仍关闭、捕获pending=0、图结构配对成立；请求输出与捕获结构分开判断，
+   没有图证据时不得把输出一致升级为交接结构已验证。
+3. 若只有callback结果、服务未就绪或请求中断，先按对应服务日志处理；若输出不一致，使用本轮原始响应
+   判断具体差异。更长请求再次停滞时使用本轮generation/worker证据，不套用旧Transpose任务号。
+
+本轮相关145项CPU测试中143项通过、2项因Windows平台能力限制跳过。覆盖不同输入的真实请求顺序、
+原始响应落盘、异常清理、callback配置保持与失败后停止、结果缺失/空输出/不匹配拒绝、摘要失败路径。
+7个修改的Python文件通过Ruff检查和格式检查，`git diff --check`通过；`format.sh ci`因缺少pre-commit
+无法启动完整检查。新对照尚待绿区NPU结果。

@@ -500,8 +500,11 @@ class TestVerifiedRunner(unittest.TestCase):
 
     def test_skip_profile_preserves_requests_and_cleanup_without_reading_traces(self):
         fn = self.module["_inference"]
-        for fail_measured in (False, True):
-            with self.subTest(fail_measured=fail_measured):
+        for verification_suite, fail_measured in ((False, False), (False, True), (True, False), (True, True)):
+            with (
+                self.subTest(verification_suite=verification_suite, fail_measured=fail_measured),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 args = types.SimpleNamespace(
                     npu=4,
                     port=8155,
@@ -510,7 +513,9 @@ class TestVerifiedRunner(unittest.TestCase):
                     request_timeout=10,
                     warmup_requests=1,
                     requests=3,
-                    max_tokens=5,
+                    max_tokens=32 if verification_suite else 5,
+                    verification_suite=verification_suite,
+                    output_dir=Path(directory) if verification_suite else None,
                     profile_run_dir=Path("profiles/test"),
                     profile_timeout=10,
                     skip_profile=True,
@@ -577,8 +582,22 @@ class TestVerifiedRunner(unittest.TestCase):
                     + ["/v1/completions"] * measured_count
                     + ["/stop"],
                 )
-                self.assertTrue(all(payload == payloads[0] for payload in payloads))
-                self.assertEqual(payloads[0]["max_tokens"], 5)
+                if verification_suite:
+                    self.assertEqual(payloads[0], payloads[1])  # First scenario is the warmup.
+                    if not fail_measured:
+                        self.assertEqual(tuple(p["prompt"] for p in payloads[1:]), self.module["VERIFICATION_PROMPTS"])
+                    records = [
+                        json.loads(line)
+                        for line in (Path(directory) / "completion_records.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()
+                    ]
+                    self.assertEqual(len(records), 1 if fail_measured else 4)
+                    self.assertEqual(records[0]["phase"], "warmup")
+                    self.assertTrue(all(record["phase"] == "measured" for record in records[1:]))
+                else:
+                    self.assertTrue(all(payload == payloads[0] for payload in payloads))
+                self.assertEqual(payloads[0]["max_tokens"], args.max_tokens)
                 if not fail_measured:
                     self.assertEqual(result["profile_status"], "skipped")
                     self.assertEqual(len(result["usage"]), 3)
