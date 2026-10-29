@@ -30,6 +30,8 @@ def failure_context(path):
         return f"LOG MISSING: {path}"
     engine_blocks, other_blocks = deque(maxlen=2), deque(maxlen=1)
     tail, errors = deque(maxlen=12), deque(maxlen=8)
+    preceding = deque(maxlen=60)
+    before_api = []
     active = None
     with path.open(encoding="utf-8", errors="replace") as source:
         for number, line in enumerate(source, 1):
@@ -37,15 +39,21 @@ def failure_context(path):
             record = f"{number}: {line}"
             tail.append(record)
             if "Traceback (most recent call last)" in line:
+                if "APIServer" in line and not before_api:
+                    before_api = list(preceding)
                 active = []
                 (engine_blocks if "EngineCore" in line else other_blocks).append(active)
             if active is not None and len(active) < TRACE_CONTEXT_LINES:
                 active.append(record)
             if re.search(r"\b\w*(?:Error|Exception):|Killed|SIGKILL|SIGSEGV|out of memory", line, re.I):
                 errors.append(record)
+            preceding.append(record)
     blocks = engine_blocks or other_blocks
     sections = [f"READ ONLY LOG: {path}"]
-    if blocks:
+    if not engine_blocks and before_api:
+        sections.append("未发现 EngineCore Python 调用栈；首个 API 异常前最多60行（保留退出前阶段）：")
+        sections.extend(before_api)
+    elif blocks:
         sections.append("异常调用栈片段（优先 EngineCore；不自动判定根因）：")
         sections.extend(record for block in blocks for record in block)
     if errors:
@@ -54,6 +62,32 @@ def failure_context(path):
     sections.append("日志尾部：")
     sections.extend(tail)
     return "\n".join(sections)
+
+
+def kernel_failure_context():
+    """Read kernel records only; unavailable records do not exclude external termination."""
+    if sys.platform != "linux":
+        return "KERNEL LOG: 非 Linux，跳过"
+    try:
+        result = subprocess.run(
+            ["dmesg", "--ctime", "--color=never"],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"KERNEL LOG UNAVAILABLE: {exc}"
+    if result.returncode:
+        return f"KERNEL LOG UNAVAILABLE: {result.stderr.strip()[:500]}"
+    matches = deque(maxlen=16)
+    for line in result.stdout.splitlines():
+        if re.search(r"oom-kill|out of memory|killed process|segfault|NVRM|aicore.*error|device.*reset", line, re.I):
+            matches.append(line[:LOG_LINE_CHARACTERS])
+    return "KERNEL LOG 候选：需核对时间和 PID；容器 PID 可能不同，不能自动关联本次失败。\n" + (
+        "\n".join(matches) if matches else "无匹配记录；不排除日志不可见、已轮转或外部终止。"
+    )
 
 
 def inspect_failure(output):
@@ -216,6 +250,7 @@ def main():
             output = max(candidates, key=lambda path: path.stat().st_mtime_ns)
         print("只读已有日志；不导入 Torch、不初始化 NPU、不启动模型、不写文件。")
         print(inspect_failure(output.resolve()))
+        print(kernel_failure_context())
         return
     if args.npu is None:
         parser.error("运行实验必须指定 --npu；只读已有结果使用 --inspect-latest")
