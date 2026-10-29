@@ -4,9 +4,10 @@
 默认关闭诊断。参考仓库 `D:\华为\nano2\vllm-ascend\vLLM-ascend-DSA` 仅只读审阅，
 HEAD 为 `ce6900977e6a25377cd11205e3613ec2ec0208a4`。没有收到辅助流单组补跑的新结果。
 
-**根因仍未证实。下一次模型实验优先改变严格预取等待的位置，停止继续枚举核数。**
-它检验“等待与消费者之前的真实模型计算重叠”是否参与触发，不能直接区分资源调度、
-模型算子内部停滞和轮询访存影响。下面把原流程、证据与实验边界分开记录。
+**最新：首次等待位置实验在MTP加载收尾时退出，尚未到捕获；下一步先读取已有退出日志，见第7节。**
+根因仍未证实，停止继续枚举核数。等待位置实验检验“等待与消费者之前的真实模型计算重叠”
+是否参与触发，不能直接区分资源调度、模型算子内部停滞和轮询访存影响。
+第1–6节保留实验设计与首次运行命令；后续操作以第7节为准。
 
 ## 1. 原项目与当前改造的完整顺序
 
@@ -169,3 +170,59 @@ python -B script/diagnose_mte_wait_placement.py --npu 7
 修改的独立脚本、host_sync、acl_graph及新增测试通过Ruff；manager与ascend_config的14条
 既有Ruff问题已逐条对照HEAD，未扩展本轮范围修复。`git diff --check`通过。
 要求的 `E:/Git/bin/bash.exe format.sh ci` 已执行，但因缺少pre-commit未能启动全套检查。
+
+## 7. 首次等待位置实验：捕获前退出，尚未形成机制对照
+
+绿区返回 `mte_wait_placement_50028589`。上次交付版本为 `9370a1e7`；本次summary未独立记录Git HEAD。
+API PID91361，EngineCore PID91939；服务在178秒时退出，早于1800秒启动上限。
+这是新实验的启动失败，不是旧scale超时再次复现，也不是等待位置方案已被反证。
+
+本轮实际进度：
+
+- 20:35:40目标模型offload finalize结束，MTE worker策略打印与dispatcher启用均出现。
+  这也说明初始化握手已完成；没有真实offload callback完成记录。
+- MTP/draft checkpoint为46/46，20:35:44打印 `Loading weights took 3.75 seconds`。
+- 最后一条EngineCore日志为同秒的topk_indices_buffer共享。
+- `WAIT_PLACEMENT_RECORDS=0`、`CAPTURE_END_RECORDS=0`、`GRAPH_DUMP begin=0 end=0`，没有图文件。
+- API随后报告引擎初始化失败，没有对应EngineCore异常栈或真实退出信号。
+
+本轮与此前辅助流组的checkpoint 2/46退出处于不同阶段，不能合并成同一个加载故障。
+`Service exited during startup: 1` 是运行器启动的服务/API退出码，不能当作EngineCore退出码。
+现有dmesg候选仍是11:16的另一进程segfault，与20:35:44不匹配，不用于本次归因。
+主机可用内存约616GiB既不能证明峰值/cgroup足够，也不是本次OOM证据。
+
+源码复核提供下一层定位范围，但没有证明某条语句出错：
+
+1. 最后日志位于 `llm_base_proposer._maybe_share_topk_indices` 内部，之后仍会遍历draft模块重绑buffer。
+2. 调用者随后执行 `_maybe_share_lm_head`；MTP且DeepSeek MLA的分支会做 `torch.equal` 再共享head。
+3. 返回父runner、退出设备内存统计范围后才打印 `Loading model weights took ... GB`；摘要未见该记录。
+   该范围是按最后可见日志与源码顺序推断，日志缺失并非完整执行轨迹。
+
+本轮 `enforce_eager=true`，draft的 `use_cuda_graph` 为False；其wrapper分支通常不会执行。
+主模型wrapper以FULL构造，配置FULL_DECODE_ONLY也满足新校验。因此目前不能把退出归为新增的
+wrapper模式检查。MTE worker初始化到退出约4秒，未见新槽发布或FATAL，也不支持120秒watchdog解释。
+format-29转换警告之后，finalize和MTE握手继续完成；该历史回退警告不能单独作为退出根因。
+
+下一步读取已有运行的服务日志、EngineCore/API分别对应的Runtime日志与本轮时间窗口内的内核记录。
+新增入口不导入Torch、不初始化NPU、不启动模型，仅读输入并写一份新的取证summary：
+
+```bash
+cd /home/l00992607/vllm-ascend-worker-poll
+git pull --ff-only origin dev/moeoffload-worker-poll
+python -B script/inspect_mte_startup_exit.py bench_results/mte_wait_placement_50028589
+```
+
+仍只返回新建 `bench_results/mte_startup_inspect_*/summary.txt` 的检查脱敏文本。
+脚本末尾打印 `SUMMARY=` 路径；输入日志保留在绿区。默认只扫描当前用户的 `ascend/log`、
+`/var/log/npu/slog` 和 `/usr/slog` 中本轮PID命名的文本日志，并报告无法读取或未覆盖的范围。
+
+优先找真实退出状态、原生fatal/异常及最后设备提交/同步线索；普通Runtime尾部仅表示最后可见操作，
+不自动等于失败点。没有命中、读取范围外或日志轮转时保持 `NOT_ESTABLISHED`，不把API退出码、
+旧OOM/segfault或缺少错误记录补成原因。本次不重跑等待位置、主流限核或辅助流组。
+如果既有记录仍不能解释退出，下一次才在上述收尾范围加入阶段begin/end、原生崩溃栈和真实
+EngineCore退出状态采集，维持模型、加载策略和等待实验变量不变。
+
+本次仅增加离线取证脚本与测试，更新诊断文档；模型和MTE运行逻辑未修改。
+14项CPU测试中13项通过，1项因本地Windows缺少符号链接创建权限跳过。
+新增Python文件的Ruff检查与格式检查通过，`git diff --check`通过。
+再次执行 `format.sh ci`，仍因缺少pre-commit而未能启动全套检查。
