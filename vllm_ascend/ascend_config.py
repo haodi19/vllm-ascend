@@ -1028,6 +1028,7 @@ class ExpertOffloadConfig:
         "host_sync_diagnose_split_scale": False,  # diagnostic H2D/D2D split; not a copy optimization
         "host_sync_diagnose_scale_context": False,  # diagnostic independent D2D targets in real callback
         "host_sync_diagnose_prefetch_report_wait": False,  # diagnostic wait-only control; native worker retained
+        "host_sync_diagnose_prefetch_wait_at_join": False,  # delay strict prefetch wait until full-graph consumer join
         "host_sync_diagnose_prefetch_poll_budget": 0,  # 0=disabled; bounded AIV requires report guard
         "host_sync_library": "",
         "cache_recent_window": 32,

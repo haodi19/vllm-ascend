@@ -40,6 +40,7 @@ def configured_source(
     diagnose_compute_cube_cores=0,
     diagnose_dsa_cube_cores=0,
     diagnose_native_stream_limits=False,
+    diagnose_prefetch_wait_at_join=False,
 ):
     diagnose_split_scale = diagnose_split_scale or diagnose_scale_context
     diagnose_prefetch_report_wait = diagnose_prefetch_report_wait or bool(diagnose_prefetch_poll_budget)
@@ -51,6 +52,8 @@ def configured_source(
     config = json.loads(words[index])
     offload = config["expert_offload_config"]
     offload["host_sync_backend"] = backend
+    if diagnose_prefetch_wait_at_join or "host_sync_diagnose_prefetch_wait_at_join" in offload:
+        offload["host_sync_diagnose_prefetch_wait_at_join"] = diagnose_prefetch_wait_at_join and backend == "mte"
     if diagnose_native_stream_limits:
         offload["host_sync_diagnose_native_stream_limits"] = backend == "mte"
     if diagnose_dsa_cube_cores:
@@ -103,6 +106,7 @@ def failure_excerpt(text):
         ("[MOE-MTE FATAL]", 1),
         ("[MOE-MTE STREAM_MAP]", 1),
         ("[MOE-MTE WAIT_CONTROL]", 1),
+        ("[MOE-MTE WAIT_PLACEMENT]", 8),
         ("[MOE-MTE AIV_EXIT]", 8),
         ("[MOE-MTE AFTER_AIV_EXIT]", 8),
         ("[MOE-MTE EXIT_COUNTS]", 4),
@@ -173,6 +177,12 @@ def main():
     parser.add_argument("--worker-scan", choices=("all", "allocated"), default="all")
     parser.add_argument("--worker-probe", choices=("locked", "atomic"), default="locked")
     parser.add_argument("--worker-idle", choices=("yield", "spin"), default="yield")
+    parser.add_argument(
+        "--diagnose-prefetch-wait-at-join",
+        action="store_true",
+        help="Diagnostic: keep early publication, defer strict prefetch wait to consumer join",
+    )
+    parser.add_argument("--skip-profile", action="store_true", help="Run finite requests without starting profiler")
     parser.add_argument(
         "--diagnose-prefetch-poll-budget",
         type=int,
@@ -301,6 +311,13 @@ def run(args, root):
             ("CPU worker regression", [sys.executable, "-B", "tests/ut/expert_offload/test_worker_polling.py"]),
             ("MoE dispatch regression", [sys.executable, "-B", "tests/ut/expert_offload/test_moe_host_sync.py"]),
         ]
+        if args.diagnose_prefetch_wait_at_join:
+            commands.append(
+                (
+                    "MoE deferred prefetch regression",
+                    [sys.executable, "-B", "tests/ut/expert_offload/test_mte_prefetch_join.py"],
+                )
+            )
         for label, command in commands:
             if not run_step(label, command, 600):
                 return 1
@@ -318,7 +335,7 @@ def run(args, root):
     )
     print(
         "MTE uses graph polling dispatch and SyncLaunchStream H2D; callback keeps its original load stream. "
-        "Eager callback invocation is unchanged. Timers + profiler enabled.",
+        f"Eager callback invocation is unchanged. Timers enabled; profiler={not args.skip_profile}.",
         flush=True,
     )
     for backend in backends:
@@ -338,6 +355,7 @@ def run(args, root):
             profile_timeout=args.profile_timeout,
             strict_profile=False,
             mstx=True,
+            skip_profile=args.skip_profile,
         )
         print(f"\n=== REAL MOE HOST BACKEND: {backend} ===", flush=True)
         print(
@@ -369,6 +387,7 @@ def run(args, root):
                 args.diagnose_compute_cube_cores,
                 args.diagnose_dsa_cube_cores,
                 args.diagnose_native_stream_limits,
+                args.diagnose_prefetch_wait_at_join,
             ),
             "python",
             env,
@@ -415,8 +434,11 @@ def run(args, root):
         )
         if not match or not usage_match:
             raise RuntimeError("Generated output differs; inspect before claiming correctness or speedup")
-    print("REAL MOE RUN COMPLETE. Limited prompt coverage; diagnostic timings include profiler overhead.", flush=True)
-    print(f"Profiles: {root / 'profile'}; return summary.txt text only.", flush=True)
+    print("REAL MOE RUN COMPLETE. Limited prompt coverage; diagnostic timings are not performance results.", flush=True)
+    print(
+        f"Profiler requested={not args.skip_profile}; artifacts: {root / 'profile'}; return summary.txt text only.",
+        flush=True,
+    )
     return 0
 
 

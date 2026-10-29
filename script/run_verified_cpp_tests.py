@@ -309,7 +309,7 @@ def finish_profile(opener, args, profile_dir):
     return "complete"
 
 
-def print_inference_report(backend, report, requests):
+def print_inference_report(backend, report, requests, *, profile_enabled=True):
     if report.get("mstx_enabled"):
         print(f"MSTX {backend}: enabled=True; marker_errors={report.get('mstx_errors', 0)}", flush=True)
     if report["errors"] or report["dropped"] or not report["count"]:
@@ -347,7 +347,8 @@ def print_inference_report(backend, report, requests):
                     flush=True,
                 )
     stats = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))["summarize"]
-    print(f"Request wall time (ms, TIMERS + PROFILER): {stats([r[0] / 1000 for r in requests])}", flush=True)
+    instrumentation = "TIMERS + PROFILER" if profile_enabled else "TIMERS; NO PROFILER"
+    print(f"Request wall time (ms, {instrumentation}): {stats([r[0] / 1000 for r in requests])}", flush=True)
     print(f"Request usage: {[r[1] for r in requests]}", flush=True)
     report["request_us"] = statistics.mean(r[0] for r in requests)
     report["usage"] = [r[1] for r in requests]
@@ -365,6 +366,7 @@ def inference(args, source, backend, env):
 
 
 def _inference(args, source, backend, env, log):
+    profile_enabled = not getattr(args, "skip_profile", False)
     profile_dir = args.profile_run_dir / backend
     prefix, command, model, _ = launch_spec(
         source, backend, args.npu, args.port, args.timing_port, profile_dir, mstx=getattr(args, "mstx", False)
@@ -414,7 +416,8 @@ def _inference(args, source, backend, env, log):
         with progress(f"{backend} warmup: {args.warmup_requests} requests"):
             for _ in range(args.warmup_requests):
                 completion()
-        request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
+        if profile_enabled:
+            request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
         requests = []
         try:
             request(opener, args.timing_port, "/start", {})
@@ -424,14 +427,14 @@ def _inference(args, source, backend, env, log):
             try:
                 report = request(opener, args.timing_port, "/stop", {}, timeout=40)
                 if len(requests) == args.requests:
-                    print_inference_report(backend, report, requests)
+                    print_inference_report(backend, report, requests, profile_enabled=profile_enabled)
                     baseline = getattr(args, "python_baseline_report", None)
                     if backend == "cpp" and baseline is not None:
                         compare_inference_reports({"python": baseline, "cpp": report})
             finally:
-                profile_status = finish_profile(opener, args, profile_dir)
+                profile_status = finish_profile(opener, args, profile_dir) if profile_enabled else "skipped"
         report["profile_status"] = profile_status
-        if getattr(args, "mstx", False):
+        if getattr(args, "mstx", False) and profile_enabled:
             report["mstx_trace_occurrences"] = inspect_mstx_trace(profile_dir)
             if profile_status == "complete":
                 analyze = runpy.run_path(str(REPO / "script/analyze_callback_gaps.py"))["analyze"]

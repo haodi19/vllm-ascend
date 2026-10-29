@@ -102,6 +102,12 @@ class ACLGraphWrapper:
         self._moe_compute_cores = offload_config.get("host_sync_diagnose_compute_cube_cores", 0)
         self._moe_dsa_cores = offload_config.get("host_sync_diagnose_dsa_cube_cores", 0)
         self._moe_native_limits = bool(offload_config.get("host_sync_diagnose_native_stream_limits", False))
+        self._moe_join_wait = bool(offload_config.get("host_sync_diagnose_prefetch_wait_at_join", False))
+        if self._moe_join_wait and (
+            runtime_mode != CUDAGraphMode.FULL
+            or vllm_config.compilation_config.cudagraph_mode not in (CUDAGraphMode.FULL, CUDAGraphMode.FULL_DECODE_ONLY)
+        ):
+            raise ValueError("prefetch wait-at-join diagnosis requires FULL or FULL_DECODE_ONLY capture")
         if self._moe_dsa_cores and not self._moe_compute_cores:
             raise ValueError("DSA core diagnosis requires compute core diagnosis")
         if self._moe_compute_cores and (offload_config.get("host_sync_backend") != "mte" or not self._moe_graph_dump):
@@ -199,6 +205,13 @@ class ACLGraphWrapper:
                 from vllm.model_executor.offloader.base import get_offloader
 
                 get_offloader().sync_prev_onload()
+                join_dispatcher = None
+                if self._moe_join_wait:
+                    # Lazy to avoid model-manager import cycles during wrapper construction.
+                    from vllm_ascend.expert_offload.expert_offload_manager import get_expert_offload_manager
+
+                    join_dispatcher = get_expert_offload_manager()._host_dispatcher
+                    stack.enter_context(join_dispatcher.prefetch_join_capture())
                 forward_context.capturing = True
                 try:
                     with torch.npu.graph(aclgraph, pool=self.graph_pool):
@@ -214,12 +227,18 @@ class ACLGraphWrapper:
                             # restores limits after capture ends, including failures.
                             stack.enter_context(
                                 diagnostic_compute_limits(
-                                    torch_npu.npu, self._moe_compute_cores, additional_limits,
+                                    torch_npu.npu,
+                                    self._moe_compute_cores,
+                                    additional_limits,
                                     native_limits=self._moe_native_limits,
                                 )
                             )
                         # `output` is managed by pytorch's aclgraph pool
                         output = self.runnable(*args, **kwargs)
+                        if join_dispatcher is not None:
+                            # Check inside capture, before capture_end can accept an
+                            # orphaned producer or report an unrelated unjoined stream.
+                            join_dispatcher.assert_prefetch_join_complete()
                         # Join offloader's copy stream after forward to avoid
                         # unjoined stream error. The last layer's start_prefetch
                         # forks copy_stream, but wait_prefetch only happens in
@@ -258,7 +277,9 @@ class ACLGraphWrapper:
                 dump_path = str(Path(tempfile.mkdtemp(prefix="capture_", dir=dump_root)) / "graph_dump")
                 logger.warning(
                     "[MOE-MTE GRAPH_DUMP_BEGIN] mode=%s batch=%s path=%s",
-                    self.runtime_mode, batch_descriptor, dump_path,
+                    self.runtime_mode,
+                    batch_descriptor,
+                    dump_path,
                 )
                 aclgraph.debug_dump(dump_path)
                 logger.warning("[MOE-MTE GRAPH_DUMP_END] mode=%s batch=%s", self.runtime_mode, batch_descriptor)

@@ -34,18 +34,50 @@ class ResourceScopeTests(unittest.TestCase):
         )
 
     def test_matching_failure_allows_auxiliary_control(self):
-        self.assertEqual(self.module.classify_report(self.known_failure(), 1), "scale_wait_reproduced")
+        text = self.known_failure()
+        self.assertEqual(self.module.classify_report(text, 1), "scale_wait_reproduced")
+        self.assertEqual(self.module.classify_resource_evidence(text, 0)["main_targets"], "VERIFIED")
 
-    def test_wrong_or_missing_actual_limits_stop_experiment(self):
+    def test_outcome_does_not_claim_resource_controls_were_verified(self):
         text = self.known_failure()
         for changed in (text.replace("14, 0", "28, 0"), text.replace("5, 1", "56, 1"), text.replace("1, 0", "2, 0")):
             with self.subTest(changed=changed):
-                self.assertEqual(self.module.classify_report(changed, 1), "inconclusive")
+                self.assertEqual(self.module.classify_report(changed, 1), "scale_wait_reproduced")
+                self.assertEqual(self.module.classify_resource_evidence(changed, 0)["main_targets"], "UNVERIFIED")
         self.assertEqual(self.module.classify_report("RuntimeError: startup failed", 1), "inconclusive")
+
+    def test_scale_name_and_timeout_must_belong_to_same_record(self):
+        text = self.known_failure().replace(
+            "w13_weight_scale ACL_WAIT_RETURN code=507046",
+            "w13_weight_scale ACL_WAIT_RETURN code=0\nscale_refresh ACL_WAIT_RETURN code=507046",
+        )
+        self.assertEqual(self.module.classify_report(text, 1), "inconclusive")
+
+    def test_arbitrary_matmul_count_never_proves_auxiliary_stream_identity(self):
+        text = self.known_failure() + (
+            '\nGRAPH_KERNEL [22, "MatMulV3_bf16_100", 14, 1]\n'
+            "[MOE-MTE COMPUTE_LIMIT] api=torch stream=dsa_aux pointer=1234 cube=14 vector=28\n"
+        )
+        evidence = self.module.classify_resource_evidence(text, 14)
+        self.assertEqual(evidence["main_targets"], "VERIFIED")
+        self.assertEqual(evidence["dsa_aux"], "UNVERIFIED")
+        self.assertEqual(evidence["matmul_candidates"][0]["stream"], 22)
+        self.assertEqual(evidence["matmul_candidates"][0]["blocks"], 14)
+        self.assertIn("明确关联", evidence["dsa_aux_reason"])
+
+    def test_malformed_and_missing_graph_records_are_not_resource_evidence(self):
+        malformed = 'RESOURCE_API=torch\nGRAPH_KERNEL [23, "HcPre", true, 0]\nGRAPH_KERNEL null\nGRAPH_KERNEL {bad}'
+        evidence = self.module.classify_resource_evidence(malformed, 0)
+        self.assertEqual(evidence["main_targets"], "UNVERIFIED")
+        self.assertEqual(evidence["target_status"]["hcpre"], "UNVERIFIED")
+        self.assertEqual(evidence["dsa_aux"], "NOT_REQUESTED")
+        text = self.known_failure().replace("RESOURCE_API=torch", "RESOURCE_API=raw_acl")
+        self.assertEqual(self.module.classify_resource_evidence(text, 0)["main_targets"], "UNVERIFIED")
 
     def test_request_success_requires_report_and_exit_code(self):
         text = 'RUNNER_EXIT=0\nMOE_RESULT {"profile_status": "invalid"}'
         self.assertEqual(self.module.classify_report(text, 0), "request_passed")
+        self.assertEqual(self.module.classify_resource_evidence(text, 14)["dsa_aux"], "UNVERIFIED")
         self.assertEqual(self.module.classify_report(text, 1), "inconclusive")
         self.assertEqual(self.module.classify_report("RUNNER_EXIT=0", 0), "inconclusive")
 
@@ -147,6 +179,25 @@ class ResourceScopeTests(unittest.TestCase):
             summary = (case_path.parent / "summary.txt").read_text(encoding="utf-8")
             self.assertIn("单独补跑 native_main_aux", summary)
             self.assertIn("request_passed", summary)
+            self.assertIn('"dsa_aux": "UNVERIFIED"', summary)
+
+    def test_two_case_run_stops_on_scale_failure_with_unverified_main_control(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake_script = Path(directory) / "script/diagnose_mte_resource_scope.py"
+            changed = self.known_failure().replace("14, 0", "28, 0")
+            with (
+                patch.object(self.module, "__file__", str(fake_script)),
+                patch.object(sys, "argv", ["diagnose", "--npu", "7"]),
+                patch.object(self.module, "run_case", return_value=(1, changed)) as run,
+                patch.object(self.module, "host_memory_snapshot", return_value="HOST_MEMORY test"),
+                patch("builtins.print"),
+            ):
+                self.module.main()
+            run.assert_called_once()
+            case_path = run.call_args.args[1]
+            summary = (case_path.parent / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("RESULT=scale_wait_reproduced", summary)
+            self.assertIn("主流目标配置未验证", summary)
 
 
 if __name__ == "__main__":

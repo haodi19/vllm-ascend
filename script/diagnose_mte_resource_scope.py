@@ -117,40 +117,71 @@ def inspect_failure(output):
 
 
 def classify_report(text, exit_code):
-    """Proceed only after the established scale wait, not arbitrary startup errors."""
+    """Classify request outcome separately from whether resource controls took effect."""
     if exit_code == 0 and "RUNNER_EXIT=0" in text and "MOE_RESULT " in text:
         return "request_passed"
-    actual_hcpre = []
-    actual_routing = []
-    actual_wait = []
+    if "[MOE-MTE ACL_DETAIL]" in text and re.search(
+        r"\bw13_weight_scale\b[^\r\n]*\bACL_WAIT_RETURN code=507046\b", text
+    ):
+        return "scale_wait_reproduced"
+    return "inconclusive"
+
+
+def classify_resource_evidence(text, aux_cores):
+    """Do not equate a MatMul block count with a proven DSA auxiliary-stream mapping."""
+    observations = {"hcpre": [], "routing": [], "wait": []}
+    matmul_candidates = []
     for line in text.splitlines():
         if line.startswith("GRAPH_KERNEL "):
             try:
                 fields = json.loads(line[len("GRAPH_KERNEL ") :])
-                name, blocks, _ = fields[-3:]
+                stream, name, blocks, mode = fields
             except (ValueError, TypeError):
                 continue
-            if not isinstance(name, str):
+            if not isinstance(name, str) or not isinstance(blocks, int) or isinstance(blocks, bool):
                 continue
             if "HcPre" in name:
-                actual_hcpre.append(blocks)
+                observations["hcpre"].append(blocks)
             elif "MoeInitRouting" in name:
-                actual_routing.append(blocks)
+                observations["routing"].append(blocks)
             elif "host_sync_wait" in name:
-                actual_wait.append(blocks)
-    if (
-        "[MOE-MTE ACL_DETAIL]" in text
-        and "ACL_WAIT_RETURN code=507046" in text
-        and "w13_weight_scale" in text
-        and actual_hcpre
-        and all(blocks == REQUESTED_CUBE_CORES for blocks in actual_hcpre)
-        and actual_routing
-        and all(blocks == REQUESTED_ROUTING_CORES for blocks in actual_routing)
-        and actual_wait
-        and all(blocks == 1 for blocks in actual_wait)
-    ):
-        return "scale_wait_reproduced"
-    return "inconclusive"
+                observations["wait"].append(blocks)
+            elif "MatMulV3" in name:
+                candidate = {"stream": stream, "name": name, "blocks": blocks, "mode": mode}
+                if candidate not in matmul_candidates:
+                    matmul_candidates.append(candidate)
+    expected = {"hcpre": REQUESTED_CUBE_CORES, "routing": REQUESTED_ROUTING_CORES, "wait": 1}
+    target_status = {
+        name: (
+            "UNVERIFIED"
+            if not blocks
+            else "VERIFIED"
+            if all(value == expected[name] for value in blocks)
+            else "MISMATCH"
+        )
+        for name, blocks in observations.items()
+    }
+    api_verified = "RESOURCE_API=torch" in text.splitlines()
+    main_verified = api_verified and all(value == "VERIFIED" for value in target_status.values())
+    # COMPUTE_LIMIT reports a capture-stream pointer, whereas GRAPH_KERNEL uses
+    # replay stream IDs. No explicit pointer-to-replay mapping is emitted today.
+    # Even a unique MatMul with the requested count does not establish that edge.
+    aux_status = "UNVERIFIED" if aux_cores else "NOT_REQUESTED"
+    return {
+        "main_targets": "VERIFIED" if main_verified else "UNVERIFIED",
+        "torch_api_recorded": api_verified,
+        "target_status": target_status,
+        "observed_blocks": {name: sorted(set(blocks)) for name, blocks in observations.items()},
+        "dsa_aux": aux_status,
+        "dsa_aux_requested_cube": aux_cores,
+        "dsa_aux_reason": (
+            "缺少捕获流指针到重放图流的明确关联；任意 MatMul 核数符合不能验证 DSA 辅助流干预"
+            if aux_cores
+            else "本组未请求修改 DSA 辅助流"
+        ),
+        "matmul_candidates": matmul_candidates,
+        "source": "GRAPH_KERNEL 捕获结构；不代表实际核占用或执行开始",
+    }
 
 
 def concise_report(text):
@@ -294,18 +325,25 @@ def main():
             print(f"START {name}; 总时限={CASE_TIMEOUT_SECONDS}s", flush=True)
             code, text = run_case(root, output / name, args.npu, aux_cores)
             state = classify_report(text, code)
+            resources = classify_resource_evidence(text, aux_cores)
             dest.write(f"WRAPPER_EXIT={code}; RESULT={state}\n")
+            dest.write("RESOURCE_EVIDENCE " + json.dumps(resources, ensure_ascii=False) + "\n")
             dest.write((concise_report(text) or text) + "\n")
             dest.flush()
             print(f"DONE {name}: {state}", flush=True)
             if state == "request_passed":
-                dest.write("本组请求通过，停止扩大改动；仍须检查输出正确性，不视为已证明根因。\n")
+                dest.write("本组请求通过，停止扩大改动；资源验证单独见 RESOURCE_EVIDENCE，不视为已证明根因或精度。\n")
                 break
             if state != "scale_wait_reproduced":
                 dest.write(inspect_failure(output / name) + "\n")
                 dest.write(kernel_failure_context() + "\n")
                 dest.write("未形成有效的同类阻塞对照，停止后续组，避免重复加载模型。\n")
                 break
+            if resources["main_targets"] != "VERIFIED":
+                dest.write("同类 scale 等待已复现，但主流目标配置未验证，停止后续组。\n")
+                break
+            if aux_cores and resources["dsa_aux"] != "VERIFIED":
+                dest.write("辅助流干预尚未独立验证；本次失败不能写成辅助流限核无效，不自动补跑。\n")
     print(f"仅返回此文件内容：{summary}", flush=True)
 
 

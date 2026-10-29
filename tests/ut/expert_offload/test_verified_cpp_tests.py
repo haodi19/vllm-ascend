@@ -440,6 +440,109 @@ class TestVerifiedRunner(unittest.TestCase):
         self.assertTrue(popen.call_args.kwargs["start_new_session"])
         self.assertEqual(len(result["digests"]), 3)
         self.assertIn("INFERENCE cpp: callbacks=5", captured.getvalue())
+        self.assertEqual(result["profile_status"], "complete")
+        self.assertIn("TIMERS + PROFILER", captured.getvalue())
+        self.assertNotIn("NO PROFILER", captured.getvalue())
+
+    def test_skip_profile_preserves_requests_and_cleanup_without_reading_traces(self):
+        fn = self.module["_inference"]
+        for fail_measured in (False, True):
+            with self.subTest(fail_measured=fail_measured):
+                args = types.SimpleNamespace(
+                    npu=4,
+                    port=8155,
+                    timing_port=18155,
+                    startup_timeout=20,
+                    request_timeout=10,
+                    warmup_requests=1,
+                    requests=3,
+                    max_tokens=5,
+                    profile_run_dir=Path("profiles/test"),
+                    profile_timeout=10,
+                    skip_profile=True,
+                    mstx=True,
+                )
+                sequence, payloads = [], []
+
+                def request(
+                    opener,
+                    port,
+                    path,
+                    payload=None,
+                    timeout=None,
+                    *,
+                    observed=sequence,
+                    received=payloads,
+                    fail=fail_measured,
+                ):
+                    observed.append(path)
+                    if path == "/status":
+                        return dict(backend="cpp", load_backend="python", mstx_enabled=True)
+                    if path == "/v1/completions":
+                        received.append(payload)
+                        if fail and len(received) == 2:
+                            raise RuntimeError("measured request failed")
+                        return dict(choices=[{"text": "synthetic"}], usage={"completion_tokens": 5})
+                    if path == "/stop":
+                        return dict(count=5, errors=0, dropped=0, groups=[])
+                    if path in ("/start_profile", "/stop_profile"):
+                        self.fail(f"Skipped profiling sent {path}")
+                    return {}
+
+                process = Mock()
+                process.poll.return_value = None
+                cleanup, export, trace = Mock(), Mock(), Mock()
+                captured = io.StringIO()
+                with (
+                    patch.dict(
+                        fn.__globals__,
+                        {
+                            "request": request,
+                            "assert_port_free": Mock(),
+                            "stop_owned_service": cleanup,
+                            "wait_profile": export,
+                            "inspect_mstx_trace": trace,
+                        },
+                    ),
+                    patch("subprocess.Popen", return_value=process),
+                    patch.object(Path, "rglob", side_effect=AssertionError("Skipped profiling scanned trace files")),
+                    contextlib.redirect_stdout(captured),
+                ):
+                    if fail_measured:
+                        with self.assertRaisesRegex(RuntimeError, "measured request failed"):
+                            fn(args, self.source, "cpp", {}, None)
+                    else:
+                        result = fn(args, self.source, "cpp", {}, None)
+                cleanup.assert_called_once_with(process)
+                export.assert_not_called()
+                trace.assert_not_called()
+                measured_count = 1 if fail_measured else args.requests
+                self.assertEqual(
+                    sequence,
+                    ["/health", "/status", "/v1/completions", "/start"]
+                    + ["/v1/completions"] * measured_count
+                    + ["/stop"],
+                )
+                self.assertTrue(all(payload == payloads[0] for payload in payloads))
+                self.assertEqual(payloads[0]["max_tokens"], 5)
+                if not fail_measured:
+                    self.assertEqual(result["profile_status"], "skipped")
+                    self.assertEqual(len(result["usage"]), 3)
+                    self.assertEqual(len(result["digests"]), 3)
+                    self.assertNotIn("mstx_trace_occurrences", result)
+                    self.assertIn("TIMERS; NO PROFILER", captured.getvalue())
+
+    def test_report_profiler_label_defaults_on_and_can_be_disabled(self):
+        fn = self.module["print_inference_report"]
+        request = [(1000, {"completion_tokens": 5}, "digest")]
+        for options, label in (({}, "TIMERS + PROFILER"), ({"profile_enabled": False}, "TIMERS; NO PROFILER")):
+            with self.subTest(options=options):
+                report = dict(count=1, errors=0, dropped=0, groups=[])
+                captured = io.StringIO()
+                with contextlib.redirect_stdout(captured):
+                    result = fn("cpp", report, request, **options)
+                self.assertIn(label, captured.getvalue())
+                self.assertEqual(result["digests"], ["digest"])
 
     def test_request_failure_still_cleans_up_owned_service(self):
         fn = self.module["inference"]

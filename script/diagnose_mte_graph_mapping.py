@@ -26,12 +26,17 @@ def main():
     parser.add_argument("--compute-cube-cores", type=int, default=0, choices=range(29))
     parser.add_argument("--dsa-cube-cores", type=int, default=0, choices=range(29))
     parser.add_argument("--native-stream-limits", action="store_true")
+    parser.add_argument("--prefetch-wait-at-join", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
     if args.dsa_cube_cores and not args.compute_cube_cores:
         parser.error("--dsa-cube-cores requires --compute-cube-cores")
     if args.native_stream_limits and not args.compute_cube_cores:
         parser.error("--native-stream-limits requires --compute-cube-cores")
+    if args.prefetch_wait_at_join and any(
+        (args.routing_cores, args.compute_cube_cores, args.dsa_cube_cores, args.native_stream_limits)
+    ):
+        parser.error("wait placement diagnosis must not change core limits")
     # Fail before loading the model if this build has no Python entry point.
     import torch_npu
 
@@ -83,6 +88,9 @@ def main():
         command += ["--diagnose-dsa-cube-cores", str(args.dsa_cube_cores)]
     if args.native_stream_limits:
         command += ["--diagnose-native-stream-limits"]
+    if args.prefetch_wait_at_join:
+        command += ["--diagnose-prefetch-wait-at-join", "--skip-profile"]
+        command[command.index("--requests") + 1] = "3"
     print(f"纯 MTE 图诊断；routing_cores={args.routing_cores}（0不改）；原始拷贝、严格预取等待。", flush=True)
     print(f"完整构建/服务日志保留在 {output}", flush=True)
     with subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT) as proc:
@@ -105,6 +113,7 @@ def main():
         dest.write(f"COMPUTE_CUBE_REQUESTED={args.compute_cube_cores}; Vector=2*Cube；0表示不改\n")
         dest.write(f"ROUTING_CORES_REQUESTED={args.routing_cores}; 以 GRAPH_KERNEL 实际值判断是否生效\n")
         dest.write(f"RUNNER_EXIT={code}\n" + failure_excerpt(text) + "\n")
+        dest.write(f"PREFETCH_WAIT_AT_JOIN={args.prefetch_wait_at_join}\n")
         for line in text.splitlines():
             if "[MOE-MTE COMPUTE_LIMIT]" in line:
                 dest.write(line + "\n")

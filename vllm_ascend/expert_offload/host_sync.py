@@ -28,6 +28,33 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    join_wait = config.get("host_sync_diagnose_prefetch_wait_at_join", False)
+    if not isinstance(join_wait, bool):
+        raise ValueError("host_sync_diagnose_prefetch_wait_at_join must be boolean")
+    if join_wait:
+        if not (
+            config.get("host_sync_backend") == "mte"
+            and config.get("expert_prefetch_enabled")
+            and config.get("host_sync_diagnose_graph_dump")
+            and config.get("expert_predictor", "fate") == "fate"
+        ):
+            raise ValueError("prefetch wait-at-join diagnosis requires MTE, fate prefetch and graph dump")
+        incompatible = (
+            "host_sync_diagnose_prefetch_report_wait",
+            "host_sync_diagnose_prefetch_poll_budget",
+            "host_sync_diagnose_load_vector_cores",
+            "host_sync_diagnose_routing_vector_cores",
+            "host_sync_diagnose_compute_cube_cores",
+            "host_sync_diagnose_dsa_cube_cores",
+            "host_sync_diagnose_native_stream_limits",
+            "host_sync_diagnose_split_scale",
+            "host_sync_diagnose_scale_context",
+            "enable_multi_card",
+        )
+        if any(config.get(key) for key in incompatible):
+            raise ValueError(
+                "prefetch wait-at-join diagnosis cannot combine report waits, core limits or altered copies"
+            )
     aux_cores = config.get("host_sync_diagnose_dsa_cube_cores", 0)
     if type(aux_cores) is not int or not 0 <= aux_cores <= 28:
         raise ValueError("diagnostic DSA cube cores must be an integer in 0..28")
@@ -250,7 +277,8 @@ def diagnostic_native_stream_limits(npu, cube_cores, additional_stream_limits):
             npu.set_stream_limit(stream, cube_num=cores, vector_num=2 * cores)
             print(
                 f"[MOE-MTE COMPUTE_LIMIT] api=torch stream={label} pointer={int(stream.npu_stream)} "
-                f"cube={cores} vector={2 * cores} previous={previous}", flush=True,
+                f"cube={cores} vector={2 * cores} previous={previous}",
+                flush=True,
             )
         yield
     finally:
@@ -365,6 +393,14 @@ class MteHostDispatcher:
         self.completed = 0
         self.load_diagnostic_batches = 0
         self.active_callback = None
+        self.join_capture = None
+        self.join_capture_failed = False
+        self.deferred_waits = {}
+        self.deferred_prefetch = {}
+        self.join_events = []
+        self.join_capture_index = 0
+        self.join_published_slots = []
+        self.joined_slots = []
         self.closed = False
         self.stopping = threading.Event()
         self.states = torch.zeros((self.SLOT_CAPACITY, 4), dtype=torch.int64, device="npu")
@@ -637,7 +673,9 @@ class MteHostDispatcher:
         lines.append("[MOE-MTE DIAGNOSTIC END]")
         print("\n".join(lines), file=sys.stderr, flush=True)
 
-    def launch(self, stream, callback, args):
+    def _publish_task(self, stream, callback, args):
+        if getattr(self, "join_capture_failed", False):
+            raise RuntimeError("cannot publish after failed MTE join capture")
         if self.closed or self.next_slot >= self.SLOT_CAPACITY:
             raise RuntimeError("MTE dispatcher closed or graph callback slot capacity exceeded")
         slot = self.next_slot
@@ -655,6 +693,10 @@ class MteHostDispatcher:
         request = self.alias + slot * self.stride
         state = self.state_base + slot * self.STATE_BYTES
         self.publish(pointer, request, state)
+        return slot, pointer, request, state
+
+    def launch(self, stream, callback, args):
+        slot, pointer, request, state = self._publish_task(stream, callback, args)
         if (
             getattr(self.manager.offload_config, "host_sync_diagnose_prefetch_report_wait", False)
             and stream == self.manager._prefetch_stream
@@ -681,6 +723,117 @@ class MteHostDispatcher:
             torch_npu.npu._launch_host_func(stream, self._report_wait_completion, slot)
         else:
             self.wait(pointer, request + self.done_offset, state)
+
+    @contextmanager
+    def prefetch_join_capture(self):
+        """Keep diagnostic split handoffs within one successful full capture."""
+        if self.join_capture_failed or self.join_capture is not None:
+            raise RuntimeError("prefetch join capture is failed or already active")
+        self.assert_prefetch_join_complete()
+        self.join_capture = object()
+        self.join_capture_index += 1
+        self.join_published_slots = []
+        self.joined_slots = []
+        self._log_wait_placement("capture_begin")
+        try:
+            yield
+            self.assert_prefetch_join_complete()
+            self._log_wait_placement("capture_end")
+        except BaseException:
+            # Retain references; never reuse a partially captured handoff.
+            self.join_capture_failed = True
+            raise
+        finally:
+            self.join_capture = None
+
+    def assert_prefetch_join_complete(self):
+        if self.deferred_waits or self.deferred_prefetch:
+            raise RuntimeError("unjoined MTE prefetch at capture boundary; refusing cross-graph handoff")
+
+    def _log_wait_placement(self, phase, **details):
+        print(
+            "[MOE-MTE WAIT_PLACEMENT] "
+            + json.dumps(
+                {
+                    "phase": phase,
+                    "capture": self.join_capture_index,
+                    "published_slots": self.join_published_slots,
+                    "joined_slots": self.joined_slots,
+                    "pending_waits": len(self.deferred_waits),
+                    "pending_layers": sorted(self.deferred_prefetch),
+                    **details,
+                }
+            ),
+            flush=True,
+        )
+
+    def publish_for_join(self, stream, callback, args):
+        if self.join_capture_failed or self.join_capture is None:
+            raise RuntimeError("split MTE publish requires an active full capture")
+        if stream != self.manager._prefetch_stream:
+            raise RuntimeError("split MTE publish requires the prefetch stream")
+        slot, pointer, request, state = self._publish_task(stream, callback, args)
+        token = object()
+        self.deferred_waits[token] = (self.join_capture, slot, pointer, request, state)
+        self.join_published_slots.append(slot)
+        return token
+
+    def wait_for_join(self, stream, token):
+        record = self.deferred_waits.get(token)
+        if (
+            self.join_capture_failed
+            or self.join_capture is None
+            or record is None
+            or record[0] is not self.join_capture
+        ):
+            raise RuntimeError("stale, duplicate or foreign MTE join token")
+        _, slot, pointer, request, state = record
+        if stream != self.manager._prefetch_stream or int(stream.npu_stream) != pointer:
+            raise RuntimeError("MTE join wait must use its original prefetch stream")
+        self.wait(pointer, request + self.done_offset, state)
+        del self.deferred_waits[token]
+        self.joined_slots.append(slot)
+        return slot
+
+    def defer_prefetch(self, stream, callback, args, layer_idx, destination, source):
+        # The manager shares prefetch staging buffers. Never allow a second
+        # producer to overwrite them before the first target's join.
+        if self.deferred_prefetch or self.deferred_waits:
+            raise RuntimeError("MTE prefetch staging buffers still have an unjoined producer")
+        token = self.publish_for_join(stream, callback, args)
+        self.deferred_prefetch[layer_idx] = (token, destination, source)
+        self._log_wait_placement("publish", layer=layer_idx, slot=self.deferred_waits[token][1])
+
+    def finish_prefetch_at_join(self, main_stream, layer_idx):
+        if self.join_capture_failed:
+            raise RuntimeError("cannot continue after failed MTE join capture")
+        if not self.deferred_prefetch:
+            return None
+        if self.join_capture is None or layer_idx not in self.deferred_prefetch:
+            raise RuntimeError("MTE prefetch reached the wrong consumer or escaped its capture")
+        prefetch_stream = self.manager._prefetch_stream
+        if main_stream == prefetch_stream:
+            raise RuntimeError("MTE prefetch consumer must use a distinct compute stream")
+        token, destination, source = self.deferred_prefetch[layer_idx]
+        # Record before waiting: waiting on a never-recorded Event can be a
+        # no-op. The compute stream joins the returned done event only AFTER
+        # this gate, so no device dependency points backwards through the join.
+        gate = main_stream.record_event()
+        self.join_events.append(gate)
+        with self.torch.npu.stream(prefetch_stream):
+            prefetch_stream.wait_event(gate)
+            slot = self.wait_for_join(prefetch_stream, token)
+            destination.copy_(source, non_blocking=True)
+            done = prefetch_stream.record_event()
+            self.join_events.append(done)
+        del self.deferred_prefetch[layer_idx]
+        self._log_wait_placement(
+            "join",
+            layer=layer_idx,
+            slot=slot,
+            order="publish,compute_gate,prefetch_gate_wait,strict_wait,mapping,done,consumer_join",
+        )
+        return done
 
     def _report_wait_completion(self, slot):
         # Control experiment: report thread only waits; the native worker still

@@ -1847,6 +1847,16 @@ class ExpertOffloadManager:
         except ValueError:
             return 0
         self._finish_pending_predict(layer_idx)
+        dispatcher = getattr(self, '_host_dispatcher', None)
+        if (dispatcher is not None
+                and self.offload_config.host_sync_diagnose_prefetch_wait_at_join):
+            deferred_event = dispatcher.finish_prefetch_at_join(
+                torch_npu.npu.current_stream(), layer_idx)
+            if deferred_event is not None:
+                with self._prefetch_state_lock:
+                    if layer_idx in self._prefetch_layer_npu_event:
+                        raise RuntimeError("duplicate prefetch completion for wait-at-join diagnosis")
+                    self._prefetch_layer_npu_event[layer_idx] = deferred_event
         # Wait for prefetch NPU copies to complete before using the weights.
         # Use stream wait (graphable) instead of host synchronize.
         with self._prefetch_state_lock:
@@ -3617,6 +3627,10 @@ class ExpertOffloadManager:
                 and self.expert_predictor.covers(layer_idx + 1)):
             return
 
+        dispatcher = getattr(self, '_host_dispatcher', None)
+        if (_EXTRA_CTX.capturing and dispatcher is not None
+                and self.offload_config.host_sync_diagnose_prefetch_wait_at_join):
+            dispatcher.assert_prefetch_join_complete()
         staged = self._stage_predicted_topk(layer_idx, hidden_states)
         if staged is None:
             return
@@ -3677,6 +3691,13 @@ class ExpertOffloadManager:
                 if self.enable_multi_card:
                     self._log_mc_debug_schedule(
                         next_idx, is_prefetch=True)
+                dispatcher = getattr(self, '_host_dispatcher', None)
+                if (dispatcher is not None
+                        and self.offload_config.host_sync_diagnose_prefetch_wait_at_join):
+                    dispatcher.defer_prefetch(
+                        current_compute_stream, _prefetch_host_cb, prefetch_args,
+                        next_idx, next_layer.log2phy, log2phy_h)
+                    return
                 self._launch_offload_callback(
                     current_compute_stream, _prefetch_host_cb, prefetch_args)
             else:
