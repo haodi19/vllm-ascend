@@ -27,6 +27,11 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    routing_cores = config.get("host_sync_diagnose_routing_vector_cores", 0)
+    if type(routing_cores) is not int or not 0 <= routing_cores <= 56:
+        raise ValueError("diagnostic routing vector cores must be an integer in 0..56")
+    if routing_cores and config.get("host_sync_backend") != "mte":
+        raise ValueError("routing core diagnosis requires MTE")
     cores = config.get("host_sync_diagnose_load_vector_cores", 0)
     if type(cores) is not int or not 0 <= cores <= 56:
         raise ValueError("diagnostic load vector cores must be an integer in 0..56")
@@ -128,6 +133,30 @@ def apply_load_vector_limit(library, pointer, cores):
     code = bind(pointer)
     if code:
         raise RuntimeError(f"load vector limit thread binding failed: {code}")
+
+
+def call_routing_with_vector_limit(operation, npu, cores, *args, **kwargs):
+    """Diagnostic only: restrict routing tiling, flush submission, restore stream cap."""
+    library = ctypes.CDLL("libascendcl.so")
+    stream = npu.current_stream()
+    pointer = int(stream.npu_stream)
+    getter = library.aclrtGetStreamResLimit
+    getter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint32)]
+    getter.restype = ctypes.c_int
+    previous = ctypes.c_uint32()
+    code = getter(pointer, 1, ctypes.byref(previous))
+    if code:
+        raise RuntimeError(f"routing diagnostic get vector limit failed: {code}")
+    try:
+        apply_load_vector_limit(library, pointer, cores)
+        return operation(*args, **kwargs)
+    finally:
+        # npu_stream flushes Host submission; this is NOT device synchronization.
+        # Keep the override until the operator has been submitted by Torch.
+        try:
+            int(stream.npu_stream)
+        finally:
+            apply_load_vector_limit(library, pointer, previous.value)
 
 
 def runtime_last_task(library):

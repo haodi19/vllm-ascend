@@ -24,6 +24,8 @@ def describe(event):
     result = {"id": identity(event), "name": event.get("name"), "type": args.get("Task Type")}
     for key in ("Numblocks", "Schem Mode", "Kernel Args", "Kernel Args Size"):
         if key in args:
+            if key == "Kernel Args" and not event.get("name", "").startswith("host_sync_"):
+                continue
             result[key] = args[key]
     return json.dumps(result, ensure_ascii=False)
 

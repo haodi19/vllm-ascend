@@ -30,6 +30,42 @@ class MoeHostSyncTests(unittest.TestCase):
         self.module.validate_host_sync_config({})
         self.module.validate_host_sync_config({"host_sync_backend": "callback"})
 
+    def test_routing_limit_restores_previous_on_success_and_failure(self):
+        for failure in (False, True):
+            calls = []
+
+            def get_limit(pointer, kind, output):
+                self.assertEqual((pointer, kind), (123, 1))
+                output._obj.value = 56
+                return 0
+
+            def operation(value, *, scale, calls=calls, failure=failure):
+                calls.append((value, scale))
+                if failure:
+                    raise RuntimeError("operator failed")
+                return 42
+
+            library = SimpleNamespace(aclrtGetStreamResLimit=Mock(side_effect=get_limit))
+            npu = SimpleNamespace(current_stream=lambda: SimpleNamespace(npu_stream=123))
+            with patch.object(self.module.ctypes, "CDLL", return_value=library), patch.object(
+                self.module,
+                "apply_load_vector_limit",
+                side_effect=lambda lib, ptr, cores, calls=calls: calls.append(cores),
+            ):
+                if failure:
+                    with self.assertRaisesRegex(RuntimeError, "operator failed"):
+                        self.module.call_routing_with_vector_limit(operation, npu, 28, "input", scale="scale")
+                else:
+                    self.assertEqual(
+                        self.module.call_routing_with_vector_limit(operation, npu, 28, "input", scale="scale"), 42
+                    )
+            self.assertEqual(calls, [28, ("input", "scale"), 56])
+
+    def test_routing_limit_rejects_invalid_or_callback_configuration(self):
+        for value in (True, -1, 57, 28):
+            with self.assertRaises(ValueError):
+                self.module.validate_host_sync_config({"host_sync_diagnose_routing_vector_cores": value})
+
     def test_vector_limit_is_diagnostic_only_and_binds_after_set(self):
         for value in (True, -1, 57):
             with self.assertRaises(ValueError):

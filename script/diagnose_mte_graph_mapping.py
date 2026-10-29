@@ -3,6 +3,7 @@
 
 import argparse
 import inspect
+import json
 import os
 import re
 import subprocess
@@ -21,6 +22,7 @@ def graph_record(line):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=int, required=True)
+    parser.add_argument("--routing-cores", type=int, default=0, choices=range(57))
     args = parser.parse_args()
     # Fail before loading the model if this build has no Python entry point.
     import torch_npu
@@ -58,7 +60,9 @@ def main():
         "--output-dir",
         str(output),
     ]
-    print("启动纯 MTE 图映射诊断；不分核、不更换拷贝、不替换预取等待。", flush=True)
+    if args.routing_cores:
+        command += ["--diagnose-routing-vector-cores", str(args.routing_cores)]
+    print(f"纯 MTE 图诊断；routing_cores={args.routing_cores}（0不改）；原始拷贝、严格预取等待。", flush=True)
     print(f"完整构建/服务日志保留在 {output}", flush=True)
     with subprocess.Popen(command, cwd=root, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT) as proc:
         elapsed = 0
@@ -75,7 +79,13 @@ def main():
     if not output.is_dir():
         raise RuntimeError(f"运行器退出 {code}，没有生成实验目录")
     with report.open("w", encoding="utf-8") as dest:
+        dest.write(f"ROUTING_CORES_REQUESTED={args.routing_cores}; 以 GRAPH_KERNEL 实际值判断是否生效\n")
         dest.write(f"RUNNER_EXIT={code}\n" + failure_excerpt(text) + "\n")
+        summary = output / "summary.txt"
+        if summary.is_file():
+            for line in summary.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line.startswith("MOE_RESULT ") or line.startswith("FAILED:"):
+                    dest.write(line + "\n")
         starts = sum("[MOE-MTE GRAPH_DUMP_BEGIN]" in line for line in text.splitlines())
         ends = sum("[MOE-MTE GRAPH_DUMP_END]" in line for line in text.splitlines())
         dest.write(f"GRAPH_DUMP begin={starts} end={ends}; 接口返回不保证所需映射已包含\n")
@@ -83,6 +93,19 @@ def main():
         for path in sorted(graph_root.rglob("*")):
             if path.is_file():
                 dest.write(f"GRAPH_FILE {path.relative_to(output)} bytes={path.stat().st_size}\n")
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    events = data.get("traceEvents", []) if isinstance(data, dict) else data
+                    signatures = set()
+                    for event in events:
+                        name = event.get("name", "")
+                        if "MoeInitRouting" in name or "host_sync_wait" in name:
+                            info = event.get("args", {})
+                            signatures.add((name, info.get("Numblocks"), info.get("Schem Mode")))
+                    for signature in sorted(signatures, key=str):
+                        dest.write("GRAPH_KERNEL " + json.dumps(signature) + "\n")
+                except (ValueError, UnicodeError, TypeError, AttributeError) as exc:
+                    dest.write(f"GRAPH_SCHEMA_UNAVAILABLE {exc}\n")
                 # Text preview only; binary artifacts stay in the green environment.
                 with path.open("rb") as source:
                     head = source.read(4096)

@@ -21,6 +21,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
+from functools import partial
 from typing import Generic
 
 import torch
@@ -32,6 +33,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.distributed.parallel_state import get_mc2_group
+from vllm_ascend.expert_offload.host_sync import call_routing_with_vector_limit
 from vllm_ascend.lora.fused_moe import (
     all2all_lora_indices,
     postprocess_lora_indices,
@@ -356,6 +358,14 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
 class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadata]):
     def __init__(self, **kwargs):
+        offload = (get_current_vllm_config().additional_config or {}).get("expert_offload_config", {})
+        cores = offload.get("host_sync_diagnose_routing_vector_cores", 0)
+        if type(cores) is not int or not 0 <= cores <= 56:
+            raise ValueError("diagnostic routing vector cores must be an integer in 0..56")
+        self._routing_vector_cores = cores
+        if cores:
+            if offload.get("host_sync_backend") != "mte":
+                raise ValueError("routing core diagnosis requires MTE")
         super().__init__(**kwargs)
         self.max_num_tokens = kwargs.get("max_num_tokens")
         num_experts_local = kwargs.get("num_local_experts", 0)
@@ -423,7 +433,12 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             first_expert_idx = 0
             last_expert_idx = num_local_experts
             global_num_experts = num_local_experts
-        sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
+        routing_operation = DeviceOperator.npu_moe_init_routing
+        if self._routing_vector_cores:
+            routing_operation = partial(
+                call_routing_with_vector_limit, routing_operation, torch_npu.npu, self._routing_vector_cores
+            )
+        sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = routing_operation(
             hidden_states,
             topk_ids,
             scale=dynamic_scale,

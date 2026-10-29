@@ -161,3 +161,43 @@ python -B script/inspect_mte_graph_dump.py bench_results/mte_graph_mapping_44f5e
 
 该步骤不重新启动模型，只读取已有图文件和日志。尚未获得其他待查图任务的身份，
 仍不能声称已建立闭合等待链或已定位根因。
+
+### 图内路由初始化与驻留等待的定点对照
+
+对 PID=74275 同轮图文件的解析确认了第二个图内任务身份：
+
+| 位置 | 任务 | Numblocks | Schem Mode |
+| --- | --- | --- | --- |
+| stream21/task2 | host_sync_wait_2 | 1 | 0 |
+| stream23/task64 | MoeInitRoutingV3 | 56 | 1 |
+| stream27/task711 | 动态加载流的 Transpose（Runtime 日志确认，不在捕获图中） | 56 | 0 |
+
+图中预取分支从主计算流 EVENT_RECORD_8 分出，经 publish、wait、映射回传后，
+通过 EVENT_RECORD_9 对应主计算流 task118 的 EVENT_WAIT_9。路由初始化位于
+主计算流 task64，在这个汇合位置之前。图文件表示依赖结构，不是实测时间线。
+
+[Runtime 调度模式说明](https://www.hiascend.com/doc_center/source/zh/CANNCommunityEdition/910/API/runtimeapi/aclcppdevg_03_1814.html)
+中模式1为 batch 调度，需要所需的核全部空闲后启动。新增待验证假设是：
+预取等待算子持续驻留，与请求56个 block 的路由初始化任务发生资源调度相互影响。
+目前没有直接证据说明它如何进一步阻止其他流的 Transpose；不能据此宣布已证明死锁。
+Numblocks 也不能直接当作已经独占的物理核数量。
+
+之前把加载流 Transpose 从56减到28仍阻塞，改的是加载流，不是这次确认的路由任务。
+本次诊断只在调用路由初始化时设置当前流 Vector Core 上限28，提交后恢复原上限。
+纯 MTE 的 publish/wait、原始 Tensor 拷贝、加载流和严格 completion 等待均保留。
+不修改路由算子的调度模式，不绕过数据完成条件。默认上限配置0表示不启用此诊断。
+
+```bash
+python -B script/diagnose_mte_graph_mapping.py --npu 7 --routing-cores 28
+```
+
+脚本合并运行和图文件检查，在 graph_diagnosis.txt 中输出实际路由和等待算子的
+Numblocks、Schem Mode，以及请求结果或失败位置。判断规则为：
+
+- 路由仍为56：干预没有生效，不能当作假设的反证。
+- 路由变为28、严格等待仍在且请求通过：支持路由资源配置参与阻塞；仍需区分
+  资源需求与 tiling 变化，不能直接断言底层调度算法或宣称这是最终修复。
+- 路由变为28仍阻塞：该限制不足以消除阻塞；检查同轮快照身份是否变化，
+  不重复宣称原 scale 拷贝的位置是新发现。
+
+此诊断包含额外 ACL 调用、Host 提交队列排空和 Runtime DEBUG，不用于性能收益比较。
