@@ -382,6 +382,7 @@ def print_inference_report(backend, report, requests, *, profile_enabled=True):
     print(f"Request wall time (ms, {instrumentation}): {stats([r[0] / 1000 for r in requests])}", flush=True)
     print(f"Request usage: {[r[1] for r in requests]}", flush=True)
     report["request_us"] = statistics.mean(r[0] for r in requests)
+    report["request_stats_us"] = stats([r[0] for r in requests])
     report["usage"] = [r[1] for r in requests]
     report["digests"] = [r[2] for r in requests]
     return report
@@ -472,6 +473,25 @@ def _inference(args, source, backend, env, log):
         with progress(f"{backend} warmup: {args.warmup_requests} requests"):
             for index in range(args.warmup_requests):
                 completion(payloads[index % len(payloads)], phase="warmup")
+        untimed = None
+        if getattr(args, "compare_join_cost", False):
+            if profile_enabled or getattr(args, "mstx", False):
+                raise ValueError("Join cost comparison must disable profiler and MSTX")
+            # The collector is inactive after construction. No start/stop of
+            # profiler or per-callback timers occurs in this first window.
+            # Wrappers remain installed, so this is not an uninstrumented binary.
+            if status.get("active") is not False or status.get("mstx_enabled") is not False:
+                raise RuntimeError("Cost baseline requires inactive timers and disabled MSTX")
+            with progress(f"{backend} timer-inactive requests: {args.requests}"):
+                baseline_requests = [completion(payload, phase="timer_inactive") for payload in payloads]
+            stats = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))["summarize"]
+            untimed = dict(
+                count=len(baseline_requests),
+                request_us=statistics.mean(item[0] for item in baseline_requests),
+                stats_us=stats([item[0] for item in baseline_requests]),
+                digests=[item[2] for item in baseline_requests],
+                usage=[item[1] for item in baseline_requests],
+            )
         if profile_enabled:
             request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
         requests = []
@@ -491,6 +511,8 @@ def _inference(args, source, backend, env, log):
                 profile_status = finish_profile(opener, args, profile_dir) if profile_enabled else "skipped"
         report["profile_status"] = profile_status
         report["request_specs"] = request_specs
+        if untimed is not None:
+            report["untimed"] = untimed
         if getattr(args, "mstx", False) and profile_enabled:
             report["mstx_trace_occurrences"] = inspect_mstx_trace(profile_dir)
             if profile_status == "complete":
@@ -502,7 +524,7 @@ def _inference(args, source, backend, env, log):
                         print(f"GAP ANALYSIS NOT VERIFIED: {exc}", flush=True)
         return report
     finally:
-        if getattr(args, "trace_startup", False):
+        if getattr(args, "trace_startup", False) or getattr(args, "compare_join_cost", False):
             error_type = sys.exc_info()[0]
             startup_cleanup_marker(child, log, error_type.__name__ if error_type else "completed")
         with progress(f"{backend} service cleanup and port release; up to 50s"):

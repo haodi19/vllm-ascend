@@ -10,17 +10,66 @@ import re
 import shlex
 import shutil
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
 from inspect_mte_runtime_task import inspect_run
+from mte_join_cost import prepare_cost_source, print_cost_comparison
 from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, run_step
 from run_host_sync_stage2 import target_cmake_args
 from run_host_sync_stage3 import select_build_directory
 from run_verified_cpp_tests import VERIFICATION_MAX_TOKENS, VERIFICATION_PROMPTS, SummaryTee, inference, launch_spec
 
 MAX_ENGINE_ERROR_LINE_CHARS = 800
+
+
+class CostProgressFile:
+    """Keep full details locally; show only phase progress on the console."""
+
+    def __init__(self, console, details):
+        self.console, self.details = console, details
+        self.pending = ""
+        self.lock = threading.Lock()
+
+    def write(self, text):
+        with self.lock:
+            self.details.write(text)
+            self.details.flush()
+            self.pending += text
+            while "\n" in self.pending:
+                line, self.pending = self.pending.split("\n", 1)
+                if line.startswith(("START:", "PASS:", "WAIT:", "DONE:", "FAILED:", "=== REAL MOE")):
+                    self.console.write(line + "\n")
+                    self.console.flush()
+        return len(text)
+
+    def flush(self):
+        with self.lock:
+            self.details.flush()
+            self.console.flush()
+
+
+def run_cost_comparison(args, root, console):
+    print("成本对照：原回调 vs 消费者处严格等待的 MTE；原始权重拷贝，不限核。", flush=True)
+    print("关闭 Runtime DEBUG、图 dump、逐项加载诊断、启动观测、MSTX 与 profiler。", flush=True)
+    print(
+        f"每组 {args.warmup_requests} 次预热 → {args.requests} 次内部计时关闭请求 → "
+        f"{args.requests} 次分项计时请求；max_tokens=5。仅两个服务依次运行。",
+        flush=True,
+    )
+    print(f"详细日志：{root / 'cost_details.log'}；本轮不采集 profile。", flush=True)
+    with (
+        (root / "cost_details.log").open("w", encoding="utf-8") as details,
+        contextlib.redirect_stdout(CostProgressFile(console, details)),
+    ):
+        reports = run(args, root)
+    if not isinstance(reports, dict):
+        print("FAILED: 构建或前置检查未通过，未形成成本对照；查看 cost_details.log。", flush=True)
+        return 1
+    print_cost_comparison(reports)
+    return 0
 
 
 def configured_source(
@@ -279,6 +328,11 @@ def prepare_runtime_artifacts(source, target):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--compare-join-cost",
+        action="store_true",
+        help="Compare callback with late strict MTE wait; no profiler/debug; concise summary",
+    )
     parser.add_argument("--npu", type=npu_number, required=True)
     parser.add_argument("--backend", choices=("both", "callback", "mte"), default="both")
     parser.add_argument("--worker-scan", choices=("all", "allocated"), default="all")
@@ -340,7 +394,7 @@ def main():
         help="Serialize the first eight MTE load batches for diagnosis, not performance",
     )
     parser.add_argument("--test-script", type=Path, default=REPOSITORY_ROOT / "script/test_graph2.sh")
-    parser.add_argument("--requests", type=int, default=3)
+    parser.add_argument("--requests", type=int)
     parser.add_argument("--diagnose-graph-dump", action="store_true")
     parser.add_argument(
         "--no-graph-dump",
@@ -352,7 +406,7 @@ def main():
     parser.add_argument("--diagnose-dsa-cube-cores", type=int, default=0, choices=range(29))
     parser.add_argument("--diagnose-native-stream-limits", action="store_true")
     parser.add_argument("--diagnose-load-vector-cores", type=int, default=0, choices=range(57))
-    parser.add_argument("--warmup-requests", type=int, default=1)
+    parser.add_argument("--warmup-requests", type=int)
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=300)
     parser.add_argument("--profile-timeout", type=int, default=120)
@@ -363,6 +417,24 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
+    if args.requests is None:
+        args.requests = 10 if args.compare_join_cost else 3
+    if args.warmup_requests is None:
+        args.warmup_requests = 3 if args.compare_join_cost else 1
+    if args.compare_join_cost:
+        conflicts = [name for name, value in vars(args).items() if name.startswith("diagnose_") and value]
+        if (
+            conflicts
+            or args.verification_suite
+            or args.trace_startup
+            or args.backend != "both"
+            or (args.worker_scan, args.worker_probe, args.worker_idle) != ("all", "locked", "yield")
+        ):
+            parser.error("join cost preset requires both backends and original worker policy; no diagnosis switches")
+        args.diagnose_prefetch_wait_at_join = True
+        args.no_load_diagnostics = True
+        args.no_graph_dump = True
+        args.skip_profile = True
     if args.diagnose_prefetch_wait_before_gate and not (
         args.backend == "mte"
         and args.diagnose_prefetch_wait_at_join
@@ -371,8 +443,8 @@ def main():
         and not args.verification_suite
     ):
         parser.error("early-wait diagnosis requires MTE, join capture, graph dump and no load diagnostics")
-    if args.no_graph_dump and (args.diagnose_graph_dump or not args.verification_suite):
-        parser.error("--no-graph-dump requires --verification-suite and conflicts with --diagnose-graph-dump")
+    if args.no_graph_dump and (args.diagnose_graph_dump or not (args.verification_suite or args.compare_join_cost)):
+        parser.error("--no-graph-dump requires --verification-suite or cost mode; conflicts with graph dump")
     if args.trace_startup and (args.backend not in ("mte", "both") or not args.diagnose_prefetch_wait_at_join):
         parser.error("--trace-startup requires MTE and --diagnose-prefetch-wait-at-join")
     if args.no_load_diagnostics:
@@ -426,6 +498,8 @@ def main():
     ):
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
         try:
+            if args.compare_join_cost:
+                return run_cost_comparison(args, root, sys.stdout.console)
             return run(args, root)
         except Exception as exc:
             print(f"FAILED: {type(exc).__name__}: {exc}", flush=True)
@@ -498,6 +572,9 @@ def run(args, root):
             if not run_step(label, command, 600):
                 return 1
     source = args.test_script.read_text(encoding="utf-8")
+    cost_mode = getattr(args, "compare_join_cost", False)
+    if cost_mode:
+        source = prepare_cost_source(source)
     _, command, _, _ = launch_spec(source, "python", args.npu, args.port, args.timing_port)
     port = int(command[command.index("--port") + 1])
     if not 1024 <= port <= 65535 or not 1024 <= args.timing_port <= 65535 or port == args.timing_port:
@@ -530,8 +607,9 @@ def run(args, root):
             request_timeout=args.request_timeout,
             profile_timeout=args.profile_timeout,
             strict_profile=False,
-            mstx=True,
+            mstx=not cost_mode,
             skip_profile=args.skip_profile,
+            compare_join_cost=cost_mode,
             trace_startup=getattr(args, "trace_startup", False) and backend == "mte",
             verification_suite=getattr(args, "verification_suite", False),
         )
@@ -575,6 +653,15 @@ def run(args, root):
         )
         log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
         assess_profile_report(reports[backend], log)
+        if cost_mode:
+            # Preserve each completed group before comparing results or starting
+            # the next service, so a later failure does not lose measurements.
+            (directory / "cost_report.json").write_text(json.dumps(reports[backend]), encoding="utf-8")
+            positions = reports[backend]["engine_error_log_positions"]
+            if not positions["cleanup_marker_unique"] or positions["before_cleanup"] != 0:
+                raise RuntimeError(f"{backend}: missing cleanup boundary or request-phase EngineDeadError")
+            if any(tag in log for tag in ("[MOE-MTE COMPUTE_LIMIT]", "[MOE-MTE WAIT_CONTROL]", "[MOE-MTE FATAL]")):
+                raise RuntimeError(f"{backend}: unexpected diagnostic intervention or MTE failure")
         if backend == "mte":
             if getattr(args, "no_graph_dump", False) and (
                 "[MOE-MTE GRAPH_DUMP_" in log or (directory / "graph_debug").exists()
@@ -616,6 +703,8 @@ def run(args, root):
             ),
             flush=True,
         )
+    if cost_mode:
+        return reports
     if getattr(args, "verification_suite", False):
         compare_verification_reports(reports)
     elif len(reports) == 2:

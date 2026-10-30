@@ -5,11 +5,11 @@
 HEAD 为 `ce6900977e6a25377cd11205e3613ec2ec0208a4`。最初编写时未收到辅助流单组补跑结果；
 另一对话中该组已通过短请求，现已合并到第14节，不能继续把它当作未执行实验。
 
-**最新：两边对话的证据与代码已合并复核，见第14节。继续使用第13节现成的早/晚wait对照，
-不新增限核枚举；将消费者汇合处严格等待作为候选绕行方案，后续必须量化额外开销。**
+**最新：第15节已收到早/晚wait对照。映射同样延后时，晚wait完成请求，早wait在预取加载同步处
+超时，支持提前等待窗口参与阻塞。停止重复定位这一点，转向晚wait与原callback的成本对比。**
 根因仍未证实，停止继续枚举核数。等待位置实验检验“等待与消费者之前的真实模型计算重叠”
 是否参与触发，不能直接区分资源调度、模型算子内部停滞和轮询访存影响。
-第1–13节保留实验设计、运行命令与取证记录；当前判断以第14节为准。
+第1–14节保留实验设计、运行命令与取证记录；当前判断以第15节为准。
 
 ## 1. 原项目与当前改造的完整顺序
 
@@ -720,3 +720,79 @@ python -B script/diagnose_mte_wait_order.py --npu 7
 
 本轮重新运行test_moe_host_sync（55项）、test_mte_prefetch_join（14项）、
 test_mte_wait_placement_runner（23项），共92项CPU测试通过。本轮没有新增NPU结果。
+
+## 15. 固定晚映射的早/晚wait结果：开始评估候选方案的成本（2026-10-30）
+
+### 15.1 本轮阻塞结论
+
+实验目录为 `bench_results/mte_wait_order_17c1f323`，两个服务依次运行。
+两组保持原始Tensor权重拷贝、全核模型计算、all/locked/yield工作线程策略，
+映射写回均在消费者gate之后；关闭逐项加载诊断，开启图debug核对捕获结构。
+
+| 对照 | 捕获结构 | 运行结果 |
+| --- | --- | --- |
+| late_wait，PID103916 | publish → gate_wait → strict_wait → mapping → done | 1次预热和3次5-token请求完成；510条回调计时，错误/丢弃均为0 |
+| early_wait，PID105466 | publish → strict_wait → gate_wait → mapping → done | 首次预热中，预取slot2、layer1、generation1超过120秒仍未完成 |
+
+两组都核对出42组结构，捕获结束published/joined槽位一致、pending=0。
+第一组映射任务都为stream21/task4，早/晚对照只是task2/3的严格wait和gate wait交换。
+这是捕获顺序证据，不将dump中的时间字段解释成设备实测时延。
+
+早wait失败时request_generation=1、done_generation=0；工作线程已接到预取任务，栈位于
+`_prefetch_host_cb → _update_weights → _synchronize_h2d → SyncLaunchStream.synchronize()`。
+因此本轮支持：**在映射位置固定后，提前执行严格AIV等待仍会触发预取加载同步停滞；
+延后等待能绕过当前有限请求下的阻塞。** 不能再仅归因为提前映射写回，也不是Host工作线程
+没有发现任务。通用单组标签`RESULT=inconclusive`没有识别无逐项诊断的加载卡点；
+本轮联合结构与watchdog的最终判据是`EARLY_WAIT_LATE_MAPPING_PENDING_AT_LOAD_SYNC`。
+
+晚wait的3个输出摘要均为`21e9f347...`，请求均值约3219.330ms。这轮开启Runtime DEBUG、
+MSTX与内部计时，而且没有callback组，不能拿这个均值宣称性能收益。
+晚组唯一EngineDeadError出现在cleanup标记之后，并有SIGTERM清理记录；本轮不把它当作请求阶段阻塞。
+
+仍未确定的部分是设备底层机制：本轮没有取得超时的具体设备任务/PC，不能直接声称再次
+映射到旧Transpose；也未证明物理核资源死锁或轮询访存拥塞。此前辅助流限核通过与本轮
+结果共同提高“提前等待与模型并行执行相互影响”的可信度，但不替代上述缺失证据。
+
+### 15.2 下一轮：同一入口完成原callback与晚wait MTE的成本对照
+
+新增可选入口，现有诊断模式与默认运行方式保留：
+
+```bash
+python -B script/run_moe_host_sync.py --npu 7 --compare-join-cost \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh
+```
+
+脚本仍只启动两个服务：先原callback，再晚wait MTE。每个服务按以下顺序完成：
+
+1. 3次相同短请求预热；与test_graph2.sh对齐模型、MTP、预取与缓存设置。
+2. 10次内部计时关闭的请求，记录客户端请求时延、输出摘要与token用量。
+3. 同一服务开启分项计时，再运行10次相同请求，记录预取/按需的Host分项时延。
+4. 完成后清理服务，再启动另一组；任一组请求失败立即停止，保留已完成组的数据。
+
+两个请求窗口均为`The future of AI is`、max_tokens=5、temperature=0；可以通过
+`--requests`、`--warmup-requests`修改次数。计时关闭窗口仍安装了包装器，只是收集器未激活，
+不是完全移除计时代码的进程。先后窗口的差值也可能含缓存、温度与负载变化，不能全部归于打点成本。
+
+此预设会清除继承的host_sync诊断设置，仅为MTE重新开启晚wait；强制关闭
+moe_offload_debug、Runtime DEBUG、图dump、启动观测、MSTX、profiler和逐项加载诊断，
+不限制核数、不更换权重布局、不改变all/locked/yield策略。原callback加载流与MTE的
+SyncLaunchStream差异继续保留，属于当前方案成本；不会为了好看而偷偷换回回调交接。
+
+`summary.txt`只保存关键结果，详细服务和构建输出在实验目录内的独立日志。
+每组完成后先保存`callback/cost_report.json`、`mte/cost_report.json`，防止后续失败丢数据；
+用户只需复制summary文本，不传文件。本轮不调用start/stop_profile，避免采集扰动和停止解析等待。
+
+首要指标按prefetch/reactive及token_rows分别比较：`load_prepare`、`copy_submit`、
+`scale_refresh`、`load_submit`、`synchronize`，以及`load_and_wait`的均值。
+同时保留`total`、`observe`、`choose_victims`，每个实测项展示均值和p95；
+load_and_wait仅相加均值，不把两个p95相加。先核对输出、token用量、样本数、层与加载数量摘要；
+工作量不同则标为描述性比较，不写成同工作量收益。
+
+成本验收尚待本轮绿区结果。通过不等于设备MEMCPY间隔或两个host_callback间距已经降低；
+这些还需之后单独短profile核对。若搬权重成本接近原callback，优先保留晚wait候选并评估
+汇合处剩余等待；若仍有明显回退，就针对本次实测项分析，不回到无约束的核数枚举。
+
+蓝区验证：成本配置/统计校验17项、成本运行器9项、原MoE dispatch 55项、原推理运行器20项、
+预取join 14项、等待位置运行器23项，共138项CPU测试通过。这里只验证脚本控制、计时窗口、
+数据判据与已有依赖保护；新的成本对比尚未在NPU上执行。本次没有更改设备算子或MoE运行逻辑。
