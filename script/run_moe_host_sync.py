@@ -371,7 +371,9 @@ def prepare_runtime_artifacts(source, target):
     print(f"Runtime artifacts: copied missing files={copied}; existing files preserved; source={source}", flush=True)
 
 
-def parse_args(argv=None, *, profile_compare=False, stream_compare=False):
+def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_way=False):
+    if three_way and not stream_compare:
+        raise ValueError("three-way comparison requires stream comparison preset")
     if stream_compare and not profile_compare:
         raise ValueError("stream comparison requires profile comparison preset")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -471,6 +473,7 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False):
     args = parser.parse_args(argv)
     args.profile_compare = profile_compare
     args.stream_compare = stream_compare
+    args.three_way = three_way
     if args.requests is None:
         args.requests = 1 if profile_compare else (10 if args.compare_join_cost else 3)
     if args.warmup_requests is None:
@@ -684,6 +687,8 @@ def run(args, root):
         if stream_compare
         else tuple((backend, backend, "sync_launch") for backend in backends)
     )
+    if getattr(args, "three_way", False):
+        cases = (("callback", "callback", "ordinary"), *cases)
     for label, backend, load_stream_mode in cases:
         directory = root / label
         directory.mkdir()
@@ -762,7 +767,7 @@ def run(args, root):
             h2d_backend="torch",
             load_stream_mode=load_stream_mode if backend == "mte" else "ordinary",
         )
-        if stream_compare:
+        if stream_compare and backend == "mte":
             expected_type = "SyncLaunchStream" if load_stream_mode == "sync_launch" else "Stream"
             expected = f"[MOE-MTE] weight load stream={expected_type}; mode={load_stream_mode}; H2D wait retained"
             if expected not in log:

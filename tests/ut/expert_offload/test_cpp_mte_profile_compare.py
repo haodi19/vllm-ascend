@@ -151,14 +151,16 @@ class CppMteProfileTests(unittest.TestCase):
                 self.assertEqual(len(reports[backend]["profile_trace_data"]), 1)
 
     def test_stream_comparison_only_changes_load_stream_and_preserves_baseline_on_timeout(self):
-        for fail_ordinary in (False, True):
+        for fail_ordinary, three_way in ((False, False), (True, False), (False, True), (True, True)):
             with tempfile.TemporaryDirectory() as directory:
                 root, settings, calls = Path(directory), [], []
+                labels = ("callback", "sync_launch", "ordinary") if three_way else ("sync_launch", "ordinary")
                 with patch.object(sys, "platform", "linux"):
                     args = self.runner.parse_args(
                         ["--npu", "7", "--cache-policy-backend", "cpp"],
                         profile_compare=True,
                         stream_compare=True,
+                        three_way=three_way,
                     )
 
                 def fake_inference(
@@ -176,9 +178,9 @@ class CppMteProfileTests(unittest.TestCase):
                     calls.append(mode)
                     _, command, _, _ = self.runner.launch_spec(source, policy, 7, None, 18155)
                     config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
-                    self.assertEqual(config.pop("host_sync_load_stream"), mode)
-                    self.assertEqual(config["host_sync_backend"], "mte")
-                    self.assertTrue(config["host_sync_diagnose_prefetch_wait_at_join"])
+                    self.assertEqual(config.pop("host_sync_load_stream"), "ordinary" if mode == "callback" else mode)
+                    self.assertEqual(config["host_sync_backend"], "callback" if mode == "callback" else "mte")
+                    self.assertEqual(config["host_sync_diagnose_prefetch_wait_at_join"], mode != "callback")
                     self.assertFalse(config["host_sync_diagnose_load"])
                     self.assertEqual(policy, "cpp")
                     settings.append(config)
@@ -206,14 +208,68 @@ class CppMteProfileTests(unittest.TestCase):
                             self.runner.run(args, root)
                     else:
                         reports = self.runner.run(args, root)
-                        self.assertEqual(set(reports), {"sync_launch", "ordinary"})
-                        result = self.compare.print_comparison(reports, root, ("sync_launch", "ordinary"))
+                        self.assertEqual(set(reports), set(labels))
+                        result = self.compare.print_comparison(reports, root, labels)
                         self.assertTrue(result["outputs_match"])
-                self.assertEqual(calls, ["sync_launch", "ordinary"])
-                self.assertEqual(settings[0], settings[1])
+                self.assertEqual(calls, list(labels))
+                self.assertEqual(settings[-2], settings[-1])
+                if three_way:
+                    callback, mte = copy.deepcopy(settings[0]), copy.deepcopy(settings[1])
+                    for key in ("host_sync_backend", "host_sync_library", "host_sync_diagnose_prefetch_wait_at_join"):
+                        callback.pop(key)
+                        mte.pop(key)
+                    self.assertEqual(callback, mte)
+                    self.assertTrue((root / "callback/profile_report.json").is_file())
                 self.assertTrue((root / "sync_launch/profile_report.json").is_file())
                 installs = [call.args[1] for call in steps.call_args_list if "install" in call.args[1]]
                 self.assertEqual(len(installs), 2)  # one build per extension, not per service
+
+    def test_three_way_summary_compares_all_outputs_and_workloads(self):
+        labels = ("callback", "sync_launch", "ordinary")
+        reports = {name: self.report("incomplete") for name in labels}
+        for name, report in reports.items():
+            report.update(
+                host_backend="callback" if name == "callback" else "mte",
+                load_stream_mode="ordinary" if name == "callback" else name,
+                cache_policy_backend="cpp",
+            )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = self.compare.print_comparison(reports, Path("run"), labels)
+        self.assertTrue(result["outputs_match"] and result["workload_summaries_match"])
+        self.assertIn("ordinary-callback=", output.getvalue())
+        self.assertIn("ordinary-sync_launch=", output.getvalue())
+        self.assertEqual(output.getvalue().count("PROFILE ordinary:"), 1)
+        reports["ordinary"]["groups"][0]["count"] = 3
+        reports["ordinary"]["count"] = 3
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = self.compare.print_comparison(reports, Path("run"), labels)
+        self.assertFalse(result["workload_summaries_match"])
+        reports["ordinary"]["digests"] = [hashlib.sha256(b"different").hexdigest()]
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "输出不一致"):
+            self.compare.print_comparison(reports, Path("run"), labels)
+
+    def test_three_way_entry_uses_three_labels_and_keeps_completed_reports_on_failure(self):
+        def fake_run(args, root):
+            self.assertTrue(args.three_way and args.stream_compare and args.profile_compare)
+            for name in ("callback", "sync_launch"):
+                directory = root / name
+                directory.mkdir()
+                (directory / "profile_report.json").write_text(json.dumps(self.report()), encoding="utf-8")
+            raise TimeoutError("ordinary timed out")
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(sys, "platform", "linux"),
+            patch.object(self.compare, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            root = Path(directory) / "run"
+            self.assertEqual(self.compare.main(["--npu", "7", "--output-dir", str(root)], three_way=True), 1)
+            summary = (root / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("PARTIAL_METRICS callback", summary)
+            self.assertIn("PARTIAL_METRICS sync_launch", summary)
+            self.assertIn("PARTIAL ordinary: 未取得完成报告", summary)
 
     def test_stream_comparison_rejects_wrong_runtime_identity(self):
         reports = {name: self.report() for name in ("sync_launch", "ordinary")}

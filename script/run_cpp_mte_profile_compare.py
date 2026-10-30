@@ -115,19 +115,19 @@ def print_profile(backend, report, root):
 
 def print_comparison(reports, root, labels=("callback", "mte")):
     """Keep descriptive timings even when profile export fails; reject unequal outputs."""
-    print("\n两组 LRC=cpp（observe/choose_victims 及配套状态管理）；权重准备/提交仍用 Python/Torch。")
+    print(f"\n本轮{len(labels)}组 LRC=cpp（observe/choose_victims 及配套状态管理）；权重准备/提交仍用 Python/Torch。")
     print("未开启融合规划、ACL 搬运或 CPU 重排。")
     print("计时含 profiler、MSTX 和内部计时开销；请求时延为辅助数据，不是无采集性能验收。")
     print("间隔覆盖整个采集窗口：Host 仅同进程相邻回调；MEMCPY 仅同设备同流，包含批次内/批次间。")
     print("大间隔阈值只按长度筛选，不自动识别同层预取→按需；MEMCPY 间隔不等于整卡空闲。")
     if set(reports) != set(labels):
-        raise ValueError("两组未全部完成；已完成组的 profile_report.json 和原始 profile 保留")
-    if labels == ("sync_launch", "ordinary"):
+        raise ValueError("对照组未全部完成；已完成组的 profile_report.json 和原始 profile 保留")
+    if "ordinary" in labels:
         for label in labels:
             report = reports[label]
             if (report.get("host_backend"), report.get("load_stream_mode"), report.get("cache_policy_backend")) != (
-                "mte",
-                label,
+                "callback" if label == "callback" else "mte",
+                "ordinary" if label == "callback" else label,
                 "cpp",
             ):
                 raise ValueError(f"{label}: wrong MTE stream/policy identity")
@@ -151,11 +151,12 @@ def print_comparison(reports, root, labels=("callback", "mte")):
         print(f"ENGINE_ERRORS {backend}: {json.dumps(positions)}；只按日志顺序区分清理边界。")
         profiles_ok = print_profile(backend, report, root) and profiles_ok
     matching = {
-        field: reports[labels[0]][field] == reports[labels[1]][field] for field in ("request_specs", "digests", "usage")
+        field: all(reports[labels[0]][field] == reports[label][field] for label in labels[1:])
+        for field in ("request_specs", "digests", "usage")
     }
     print("OUTPUT_MATCH", json.dumps(matching))
     if not all(matching.values()):
-        raise ValueError("两组请求/输出不一致，比较失败；不据此给出性能收益")
+        raise ValueError("对照组请求/输出不一致，比较失败；不据此给出性能收益")
     print("输出摘要与 token 用量一致，仅验证本轮有限请求一致性，不代表完整模型精度验收。")
     clean = all(
         report.get("engine_error_log_positions", {}).get("cleanup_marker_unique") is True
@@ -164,24 +165,31 @@ def print_comparison(reports, root, labels=("callback", "mte")):
     )
     if not clean:
         print("清理前存在引擎错误或清理边界不明，以下仅列已取得的描述性数据，不作性能收益验收。")
-    comparable = indexed[labels[0]].keys() == indexed[labels[1]].keys()
-    for key in sorted(indexed[labels[0]].keys() | indexed[labels[1]].keys()):
-        a, b = (indexed[backend].get(key) for backend in labels)
-        if a is None or b is None:
+    comparable = all(indexed[labels[0]].keys() == indexed[label].keys() for label in labels[1:])
+    for key in sorted(set().union(*(groups.keys() for groups in indexed.values()))):
+        groups = [indexed[backend].get(key) for backend in labels]
+        if any(group is None for group in groups):
             comparable = False
             print(f"GROUP kind={key[0]} rows={key[1]}: 一组缺失，不能作同工作量比较")
             continue
-        matched = (
+        a = groups[0]
+        matched = all(
             a["count"] == b["count"]
             and sorted(a["layers"]) == sorted(b["layers"])
             and all(math.isclose(a["loads"][stat], b["loads"][stat], rel_tol=1e-9, abs_tol=1e-9) for stat in LOAD_STATS)
+            for b in groups[1:]
         )
         comparable = comparable and matched
         print(
-            f"GROUP kind={key[0]} rows={key[1]} callbacks={a['count']}/{b['count']} "
-            f"experts={a['loads']['mean'] * a['count']:.1f}/{b['loads']['mean'] * b['count']:.1f} "
+            f"GROUP kind={key[0]} rows={key[1]} order={','.join(labels)} "
+            f"callbacks={'/'.join(str(group['count']) for group in groups)} "
+            f"experts={'/'.join(format(group['loads']['mean'] * group['count'], '.1f') for group in groups)} "
             f"workload_summary_match={matched}"
         )
+        if len(labels) == 3:
+            print_three_group_metrics(groups, labels)
+            continue
+        a, b = groups
         print(
             f"metric               {labels[0]}_mean_us  {labels[1]}_mean_us  delta_us  "
             f"{labels[0]}_p95_us  {labels[1]}_p95_us"
@@ -198,7 +206,7 @@ def print_comparison(reports, root, labels=("callback", "mte")):
         print(f"{'load_and_wait':20} {first:16.3f} {second:13.3f} {second - first:+9.3f}  p95不能分项相加")
     print(
         f"COMPARISON workload_summaries_match={comparable}; no_precleanup_engine_error={clean}; "
-        f"both_profiles_usable={profiles_ok}"
+        f"all_profiles_usable={profiles_ok}"
     )
     print("分项时延与间隔是不同测量；上述统计不证明跨 CPU/NPU 时间线的因果关系。")
     return {
@@ -207,6 +215,25 @@ def print_comparison(reports, root, labels=("callback", "mte")):
         "no_precleanup_engine_error": clean,
         "both_profiles_usable": profiles_ok,
     }
+
+
+def print_three_group_metrics(groups, labels):
+    print("metric               " + "  ".join(f"{label}(mean/p95_us)" for label in labels))
+    for metric in METRICS:
+        print(
+            f"{metric:20} "
+            + "  ".join(
+                f"{group['metrics'][metric]['mean']:.3f}/{group['metrics'][metric]['p95']:.3f}" for group in groups
+            )
+        )
+    totals = [sum(group["metrics"][metric]["mean"] for metric in ("load_submit", "synchronize")) for group in groups]
+    print(f"{'load_and_wait':20} " + "  ".join(f"{value:.3f}" for value in totals) + "  仅均值，不累加p95")
+    for metric in ("copy_submit", "load_submit", "synchronize", "load_and_wait", "total"):
+        values = totals if metric == "load_and_wait" else [group["metrics"][metric]["mean"] for group in groups]
+        print(
+            f"DELTA {metric}: sync_launch-callback={values[1] - values[0]:+.3f} us; "
+            f"ordinary-callback={values[2] - values[0]:+.3f} us; ordinary-sync_launch={values[2] - values[1]:+.3f} us"
+        )
 
 
 def print_partial_reports(root, labels=("callback", "mte")):
@@ -247,31 +274,39 @@ def print_failure_logs(root, labels):
             print(failure_excerpt(tail))
 
 
-def main(argv=None, *, stream_compare=False):
+def main(argv=None, *, stream_compare=False, three_way=False):
+    stream_compare = stream_compare or three_way
     args = parse_args(
         ["--cache-policy-backend", "cpp", *(sys.argv[1:] if argv is None else argv)],
         profile_compare=True,
         stream_compare=stream_compare,
+        three_way=three_way,
     )
     labels = ("sync_launch", "ordinary") if stream_compare else ("callback", "mte")
     prefix = "mte_load_stream" if stream_compare else "cpp_mte_profile"
+    if three_way:
+        labels = ("callback", "sync_launch", "ordinary")
+        prefix = "moe_three_way"
     root = (args.output_dir or REPO / "bench_results" / f"{prefix}_{uuid4().hex[:8]}").resolve()
     root.mkdir(parents=True, exist_ok=False)
     with (
         (root / "summary.txt").open("w", encoding="utf-8") as summary,
         contextlib.redirect_stdout(SummaryTee(sys.stdout, summary)),
     ):
-        if stream_compare:
+        if three_way:
+            print("三组顺序运行：callback普通流 → MTE SyncLaunchStream → MTE普通流；全部cpp LRC。")
+            print("两组MTE均使用消费者处严格等待；普通流只对齐提交方式，不替换交接机制或工作线程。")
+        elif stream_compare:
             print("两组均为MTE晚等待＋cpp LRC；只改变加载流：sync_launch → ordinary。")
             print("普通流若请求超时则终止本轮，不跳过设备完成检查，不继续推理。")
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
         print(
-            f"配置：两组 cpp；MTE 严格 wait 延后到消费门控后；预热={args.warmup_requests}，"
+            f"配置：各组 cpp；MTE 严格 wait 延后到消费门控后；预热={args.warmup_requests}，"
             f"采集请求={args.requests}，max_tokens=5，大间隔阈值={args.large_gap_us:g} us。",
             flush=True,
         )
         print(
-            f"详细日志：{root / 'run_details.log'}；停止采集最多等 {args.profile_timeout:g}s，失败继续另一组。",
+            f"详细日志：{root / 'run_details.log'}；停止采集最多等 {args.profile_timeout:g}s，导出失败继续后续组。",
             flush=True,
         )
         try:
