@@ -34,6 +34,11 @@ class WaitPlacementRunnerTests(unittest.TestCase):
             )
             cls.mapping = importlib.util.module_from_spec(mapping_spec)
             mapping_spec.loader.exec_module(cls.mapping)
+            order_spec = importlib.util.spec_from_file_location(
+                "wait_order_test", cls.root / "script/diagnose_mte_wait_order.py"
+            )
+            cls.order = importlib.util.module_from_spec(order_spec)
+            order_spec.loader.exec_module(cls.order)
 
     @staticmethod
     def node(stream, task, name, kind="KERNEL_AIVEC"):
@@ -56,6 +61,93 @@ class WaitPlacementRunnerTests(unittest.TestCase):
         self.assertEqual(len(pairs), 1)
         self.assertEqual(pairs[0]["strict_wait"], (63, 21, 7))
         self.assertEqual(pairs[0]["mapping_tasks"], [(63, 21, 8)])
+
+    def test_early_wait_graph_requires_mapping_to_stay_after_gate(self):
+        graph = self.graph()
+        graph[1]["args"]["Task Id"], graph[2]["args"]["Task Id"] = 7, 6
+        self.assertEqual(self.module.gated_wait_pairs(graph), [])
+        pairs = self.module.gated_wait_pairs(graph, wait_before_gate=True)
+        self.assertEqual(len(pairs), 1)
+        self.assertEqual(pairs[0]["strict_wait"], (63, 21, 6))
+        self.assertEqual(pairs[0]["gate_wait"], (63, 21, 7))
+        graph[1]["args"]["Task Id"], graph[3]["args"]["Task Id"] = 8, 7
+        self.assertEqual(self.module.gated_wait_pairs(graph, wait_before_gate=True), [])
+
+    def test_wait_order_facts_use_matching_capture_and_only_active_worker_stack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "mte/graph_debug/capture/graph_dump"
+            path.parent.mkdir(parents=True)
+            graph = self.graph()
+            graph[1]["args"]["Task Id"], graph[2]["args"]["Task Id"] = 7, 6
+            path.write_text(json.dumps({"traceEvents": graph}), encoding="utf-8")
+            ledger = dict(
+                phase="capture_end", published_slots=[2], joined_slots=[2], pending_waits=0, pending_layers=[]
+            )
+            pending = [dict(slot=2, state=dict(request_generation=1, done_generation=0))]
+            prefix = "[MOE-MTE WAIT_PLACEMENT] " + json.dumps(ledger) + "\n[MOE-MTE DIAGNOSTIC BEGIN]\n"
+            prefix += "active_callback=(2, 123); completed=1\n[MOE-MTE PENDING] " + json.dumps(pending) + "\n"
+            service = root / "mte/inference_python.log"
+            for worker_sync in (False, True):
+                service.write_text(
+                    prefix
+                    + "(EngineCore pid=7) Python thread=123; active_worker=True\n"
+                    + ("_synchronize_h2d\n" if worker_sync else "cache_plan\n")
+                    + "(EngineCore pid=7) Python thread=456; active_worker=False\n_synchronize_h2d\n"
+                    + "[MOE-MTE DIAGNOSTIC END]\n",
+                    encoding="utf-8",
+                )
+                facts = self.order.case_facts(root, 1, True)
+                self.assertTrue(facts["expected_structure"])
+                self.assertTrue(facts["active_prefetch_pending"])
+                self.assertEqual(facts["worker_in_load_sync"], worker_sync)
+                self.assertTrue(facts["pending_snapshot_valid"])
+                self.assertEqual(facts["active_prefetch_snapshot"]["slot"], 2)
+                self.assertFalse(facts["watchdog_timeout_for_active_prefetch"])
+                self.assertFalse(self.order.case_facts(root, 1, False)["expected_structure"])
+            with service.open("a", encoding="utf-8") as log:
+                log.write("[MOE-MTE FATAL] slot=2 generation=1 exceeded 120s\n")
+            self.assertTrue(self.order.case_facts(root, 1, True)["watchdog_timeout_for_active_prefetch"])
+            ledger["pending_layers"] = [2]
+            service.write_text("[MOE-MTE WAIT_PLACEMENT] " + json.dumps(ledger), encoding="utf-8")
+            self.assertFalse(self.order.case_facts(root, 0, True)["expected_structure"])
+            self.assertIsNone(self.order.case_facts(root, 0, True)["pending_prefetch_count"])
+
+    def test_wait_order_does_not_run_early_case_without_valid_control(self):
+        for control_ok, passed, timed_out in (
+            (False, False, True),
+            (True, False, True),
+            (True, False, False),
+            (True, True, False),
+        ):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                control = dict(request_outcome="finite_requests_passed", expected_structure=control_ok)
+                target = dict(
+                    request_outcome="finite_requests_passed" if passed else "inconclusive",
+                    expected_structure=True,
+                    active_prefetch_pending=True,
+                    worker_in_load_sync=True,
+                    watchdog_timeout_for_active_prefetch=timed_out,
+                )
+                output = io.StringIO()
+                with (
+                    patch.object(self.order, "run_once", return_value=0) as run,
+                    patch.object(self.order, "append_evidence"),
+                    patch.object(self.order, "case_facts", side_effect=[control, target]),
+                ):
+                    self.order.run_comparison(root, root, 7, output)
+                self.assertEqual(run.call_count, 2 if control_ok else 1)
+                expected = (
+                    "CONTROL_NOT_ESTABLISHED"
+                    if not control_ok
+                    else "EARLY_WAIT_LATE_MAPPING_PASSED"
+                    if passed
+                    else "EARLY_WAIT_LATE_MAPPING_PENDING_AT_LOAD_SYNC"
+                    if timed_out
+                    else "INCONCLUSIVE"
+                )
+                self.assertIn("BLOCKING_PROGRESS=" + expected, output.getvalue())
 
     def test_early_wait_or_ambiguous_event_is_not_accepted(self):
         graph = self.graph()
@@ -215,6 +307,7 @@ class WaitPlacementRunnerTests(unittest.TestCase):
                         "--npu",
                         "7",
                         "--prefetch-wait-at-join",
+                        "--prefetch-wait-before-gate",
                         "--trace-startup",
                         "--no-load-diagnostics",
                         "--output-dir",
@@ -231,6 +324,7 @@ class WaitPlacementRunnerTests(unittest.TestCase):
             for flag in (
                 "--no-load-diagnostics",
                 "--diagnose-prefetch-wait-at-join",
+                "--diagnose-prefetch-wait-before-gate",
                 "--diagnose-graph-dump",
                 "--skip-profile",
                 "--trace-startup",
@@ -263,6 +357,31 @@ class WaitPlacementRunnerTests(unittest.TestCase):
         self.assertEqual(configs[0], configs[1])
         with self.assertRaisesRegex(ValueError, "conflicts"):
             self.runner.configured_source(source, "mte", "/lib.so", no_load_diagnostics=True, diagnose_native_wait=True)
+
+    def test_wait_order_control_resets_inherited_early_wait_and_only_changes_wait_flag(self):
+        config = dict(
+            expert_offload_config=dict(
+                expert_offload=True, expert_prefetch_enabled=True, host_sync_diagnose_prefetch_wait_before_gate=True
+            )
+        )
+        source = "vllm serve /model --additional-config " + shlex.quote(json.dumps(config))
+        configs = []
+        for early in (False, True):
+            words = shlex.split(
+                self.runner.configured_source(
+                    source,
+                    "mte",
+                    "/lib.so",
+                    diagnose_prefetch_wait_at_join=True,
+                    diagnose_graph_dump=True,
+                    no_load_diagnostics=True,
+                    diagnose_prefetch_wait_before_gate=early,
+                )
+            )
+            result = json.loads(words[words.index("--additional-config") + 1])["expert_offload_config"]
+            self.assertEqual(result.pop("host_sync_diagnose_prefetch_wait_before_gate"), early)
+            configs.append(result)
+        self.assertEqual(configs[0], configs[1])
 
     def test_no_load_option_rejects_conflicting_diagnostics_before_launch(self):
         with (

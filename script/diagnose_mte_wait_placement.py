@@ -29,7 +29,7 @@ from summarize_mte_startup import startup_evidence
 MAX_GRAPH_EXAMPLES = 2
 
 
-def gated_wait_pairs(events):
+def gated_wait_pairs(events, wait_before_gate=False):
     """Check unique event-name pairs in capture order; never infer execution times."""
     nodes = [node for node in events if isinstance(node, dict) and identity(node) is not None]
     keys = [identity(node) for node in nodes]
@@ -39,9 +39,18 @@ def gated_wait_pairs(events):
     for model, stream in sorted({key[:2] for key in keys}):
         track = sorted((n for n in nodes if identity(n)[:2] == (model, stream)), key=identity)
         for index, wait in enumerate(track):
-            if not wait.get("name", "").startswith("host_sync_wait") or index < 2:
+            if not wait.get("name", "").startswith("host_sync_wait"):
                 continue
-            publish, gate_wait = track[index - 2 : index]
+            if wait_before_gate:
+                if index < 1 or index + 1 >= len(track):
+                    continue
+                publish, gate_wait = track[index - 1], track[index + 1]
+                following = track[index + 2 :]
+            else:
+                if index < 2:
+                    continue
+                publish, gate_wait = track[index - 2 : index]
+                following = track[index + 1 :]
             if not publish.get("name", "").startswith("host_sync_publish"):
                 continue
             if not re.fullmatch(r"EVENT_WAIT_\d+", gate_wait.get("name", "")):
@@ -51,7 +60,6 @@ def gated_wait_pairs(events):
                 continue
             if event_candidates(nodes, gate_records[0]) != [gate_wait]:
                 continue
-            following = track[index + 1 :]
             done_record = next((n for n in following if n.get("name", "").startswith("EVENT_RECORD_")), None)
             if done_record is None:
                 continue
@@ -88,7 +96,7 @@ def gated_wait_pairs(events):
     return pairs
 
 
-def graph_evidence(run_dir):
+def graph_evidence(run_dir, wait_before_gate=False):
     lines = []
     for path in sorted((run_dir / "mte/graph_debug").rglob("graph_dump*")):
         if not path.is_file():
@@ -98,8 +106,11 @@ def graph_evidence(run_dir):
             events = data.get("traceEvents", []) if isinstance(data, dict) else data
             if not isinstance(events, list):
                 raise ValueError("not a trace event list")
-            pairs = gated_wait_pairs(events)
-            lines.append(f"GATE_GRAPH file={path.relative_to(run_dir)}; structural_pairs={len(pairs)}")
+            pairs = gated_wait_pairs(events, wait_before_gate)
+            lines.append(
+                f"GATE_GRAPH file={path.relative_to(run_dir)}; structural_pairs={len(pairs)}; "
+                f"wait_before_gate={wait_before_gate}"
+            )
             for pair in pairs[:MAX_GRAPH_EXAMPLES]:
                 lines.append("GATE_PAIR " + json.dumps(pair))
         except (OSError, ValueError, UnicodeError, TypeError, AttributeError) as exc:
@@ -164,7 +175,14 @@ def wrapper_cleanup_marker(process, log, reason):
 
 
 def run_once(
-    root, run_dir, npu, trace_startup=False, no_load_diagnostics=False, verify_callback=False, no_graph_dump=False
+    root,
+    run_dir,
+    npu,
+    trace_startup=False,
+    no_load_diagnostics=False,
+    verify_callback=False,
+    no_graph_dump=False,
+    wait_before_gate=False,
 ):
     command = [
         sys.executable,
@@ -204,6 +222,10 @@ def run_once(
         ]
     if trace_startup:
         command.append("--trace-startup")
+    if wait_before_gate:
+        if verify_callback or no_graph_dump or not no_load_diagnostics:
+            raise ValueError("wait-order diagnosis requires one MTE case, graph dump and ordinary loads")
+        command.append("--prefetch-wait-before-gate")
     if no_graph_dump:
         command.remove("--diagnose-graph-dump")
         command.append("--no-graph-dump")
@@ -236,7 +258,9 @@ def run_once(
             raise
 
 
-def append_evidence(dest, run_dir, code, trace_startup=False, verify_callback=False, no_graph_dump=False):
+def append_evidence(
+    dest, run_dir, code, trace_startup=False, verify_callback=False, no_graph_dump=False, wait_before_gate=False
+):
     report_path = run_dir / "graph_diagnosis.txt"
     report = report_path.read_text(encoding="utf-8", errors="replace") if report_path.is_file() else ""
     runner_summary = run_dir / "summary.txt"
@@ -294,7 +318,7 @@ def append_evidence(dest, run_dir, code, trace_startup=False, verify_callback=Fa
         dest.write(f"GRAPH_DUMP_REQUESTED=False; GRAPH_DUMP_RECORDS={dump_records}\n")
         dest.write("GATE_GRAPH=NOT_REQUESTED；仅有CPU捕获登记与汇合检查，不能独立证明本轮设备图依赖结构。\n")
     else:
-        dest.write("\n".join(graph_evidence(run_dir)) + "\n")
+        dest.write("\n".join(graph_evidence(run_dir, wait_before_gate)) + "\n")
     if verify_callback:
         dest.write("输出对照与MTE捕获结构分开判读；仅覆盖三种固定输入，不证明logits精度、全部捕获尺寸或性能。\n")
     if state in ("inconclusive", "inconclusive_or_mismatch"):
@@ -308,7 +332,7 @@ def append_evidence(dest, run_dir, code, trace_startup=False, verify_callback=Fa
     if not no_graph_dump:
         dest.write("没有结构证据不等于没有干预；若结构不符，先检查本轮图，不重跑限核组。\n")
     if not verify_callback:
-        dest.write("通过仅支持等待位置/重叠窗口参与触发，不证明资源死锁、输出精度或性能收益。\n")
+        dest.write("单组请求结果不能独立证明等待窗口因果或资源死锁；需结合对照，不作精度或性能结论。\n")
     dest.write("仍失败时使用本轮快照，不套旧PID任务号；不自动追加其他实验。\n")
 
 

@@ -33,10 +33,13 @@ def main():
     parser.add_argument("--dsa-cube-cores", type=int, default=0, choices=range(29))
     parser.add_argument("--native-stream-limits", action="store_true")
     parser.add_argument("--prefetch-wait-at-join", action="store_true")
+    parser.add_argument("--prefetch-wait-before-gate", action="store_true")
     parser.add_argument("--trace-startup", action="store_true")
     parser.add_argument("--no-load-diagnostics", action="store_true")
     parser.add_argument("--output-dir", type=Path)
     args = parser.parse_args()
+    if args.prefetch_wait_before_gate and not (args.prefetch_wait_at_join and args.no_load_diagnostics):
+        parser.error("--prefetch-wait-before-gate requires --prefetch-wait-at-join --no-load-diagnostics")
     if args.trace_startup and not args.prefetch_wait_at_join:
         parser.error("--trace-startup requires --prefetch-wait-at-join")
     if args.no_load_diagnostics and not args.prefetch_wait_at_join:
@@ -104,6 +107,8 @@ def main():
         command[command.index("--requests") + 1] = "3"
     if args.trace_startup:
         command += ["--trace-startup"]
+    if args.prefetch_wait_before_gate:
+        command += ["--diagnose-prefetch-wait-before-gate"]
     if args.no_load_diagnostics:
         command.remove("--diagnose-native-wait")
         command += ["--no-load-diagnostics"]

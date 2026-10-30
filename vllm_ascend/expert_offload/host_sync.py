@@ -29,6 +29,11 @@ def create_offload_load_stream(npu, backend):
 
 def validate_host_sync_config(config):
     join_wait = config.get("host_sync_diagnose_prefetch_wait_at_join", False)
+    early_wait = config.get("host_sync_diagnose_prefetch_wait_before_gate", False)
+    if not isinstance(early_wait, bool):
+        raise ValueError("host_sync_diagnose_prefetch_wait_before_gate must be boolean")
+    if early_wait and not (join_wait is True and config.get("host_sync_diagnose_graph_dump")):
+        raise ValueError("early wait with late mapping requires join capture and graph dump")
     if not isinstance(join_wait, bool):
         raise ValueError("host_sync_diagnose_prefetch_wait_at_join must be boolean")
     if join_wait:
@@ -802,8 +807,14 @@ class MteHostDispatcher:
         if self.deferred_prefetch or self.deferred_waits:
             raise RuntimeError("MTE prefetch staging buffers still have an unjoined producer")
         token = self.publish_for_join(stream, callback, args)
-        self.deferred_prefetch[layer_idx] = (token, destination, source)
+        self.deferred_prefetch[layer_idx] = (token, destination, source, None, stream)
         self._log_wait_placement("publish", layer=layer_idx, slot=self.deferred_waits[token][1])
+        if getattr(self.manager.offload_config, "host_sync_diagnose_prefetch_wait_before_gate", False):
+            # Enqueue immediately after publish, at the original prefetch site.
+            # Mapping/staging ownership remains deferred until the consumer gate.
+            slot = self.wait_for_join(stream, token)
+            self.deferred_prefetch[layer_idx] = (token, destination, source, slot, stream)
+            self._log_wait_placement("early_wait_enqueued", layer=layer_idx, slot=slot)
 
     def finish_prefetch_at_join(self, main_stream, layer_idx):
         if self.join_capture_failed:
@@ -815,7 +826,9 @@ class MteHostDispatcher:
         prefetch_stream = self.manager._prefetch_stream
         if main_stream == prefetch_stream:
             raise RuntimeError("MTE prefetch consumer must use a distinct compute stream")
-        token, destination, source = self.deferred_prefetch[layer_idx]
+        token, destination, source, early_slot, original_stream = self.deferred_prefetch[layer_idx]
+        if prefetch_stream != original_stream:
+            raise RuntimeError("MTE deferred mapping must use its original prefetch stream")
         # Record before waiting: waiting on a never-recorded Event can be a
         # no-op. The compute stream joins the returned done event only AFTER
         # this gate, so no device dependency points backwards through the join.
@@ -823,7 +836,7 @@ class MteHostDispatcher:
         self.join_events.append(gate)
         with self.torch.npu.stream(prefetch_stream):
             prefetch_stream.wait_event(gate)
-            slot = self.wait_for_join(prefetch_stream, token)
+            slot = self.wait_for_join(prefetch_stream, token) if early_slot is None else early_slot
             destination.copy_(source, non_blocking=True)
             done = prefetch_stream.record_event()
             self.join_events.append(done)
@@ -832,7 +845,11 @@ class MteHostDispatcher:
             "join",
             layer=layer_idx,
             slot=slot,
-            order="publish,compute_gate,prefetch_gate_wait,strict_wait,mapping,done,consumer_join",
+            order=(
+                "publish,strict_wait,compute_gate,prefetch_gate_wait,mapping,done,consumer_join"
+                if early_slot is not None
+                else "publish,compute_gate,prefetch_gate_wait,strict_wait,mapping,done,consumer_join"
+            ),
         )
         return done
 

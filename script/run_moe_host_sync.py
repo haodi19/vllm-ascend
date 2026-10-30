@@ -46,6 +46,7 @@ def configured_source(
     diagnose_prefetch_wait_at_join=False,
     no_load_diagnostics=False,
     no_graph_dump=False,
+    diagnose_prefetch_wait_before_gate=False,
 ):
     if no_graph_dump and diagnose_graph_dump:
         raise ValueError("no-graph-dump conflicts with diagnose-graph-dump")
@@ -65,6 +66,10 @@ def configured_source(
     offload["host_sync_backend"] = backend
     if diagnose_prefetch_wait_at_join or "host_sync_diagnose_prefetch_wait_at_join" in offload:
         offload["host_sync_diagnose_prefetch_wait_at_join"] = diagnose_prefetch_wait_at_join and backend == "mte"
+    if diagnose_prefetch_wait_before_gate or "host_sync_diagnose_prefetch_wait_before_gate" in offload:
+        offload["host_sync_diagnose_prefetch_wait_before_gate"] = (
+            diagnose_prefetch_wait_before_gate and backend == "mte"
+        )
     if diagnose_native_stream_limits:
         offload["host_sync_diagnose_native_stream_limits"] = backend == "mte"
     if diagnose_dsa_cube_cores:
@@ -286,6 +291,11 @@ def main():
     )
     parser.add_argument("--skip-profile", action="store_true", help="Run finite requests without starting profiler")
     parser.add_argument(
+        "--diagnose-prefetch-wait-before-gate",
+        action="store_true",
+        help="Restore early strict wait while keeping mapping after the consumer gate",
+    )
+    parser.add_argument(
         "--verification-suite",
         action="store_true",
         help="Compare three fixed prompts with up to 32 output tokens, callback then MTE",
@@ -353,6 +363,14 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
+    if args.diagnose_prefetch_wait_before_gate and not (
+        args.backend == "mte"
+        and args.diagnose_prefetch_wait_at_join
+        and args.diagnose_graph_dump
+        and args.no_load_diagnostics
+        and not args.verification_suite
+    ):
+        parser.error("early-wait diagnosis requires MTE, join capture, graph dump and no load diagnostics")
     if args.no_graph_dump and (args.diagnose_graph_dump or not args.verification_suite):
         parser.error("--no-graph-dump requires --verification-suite and conflicts with --diagnose-graph-dump")
     if args.trace_startup and (args.backend not in ("mte", "both") or not args.diagnose_prefetch_wait_at_join):
@@ -550,6 +568,7 @@ def run(args, root):
                 args.diagnose_prefetch_wait_at_join,
                 getattr(args, "no_load_diagnostics", False),
                 getattr(args, "no_graph_dump", False),
+                getattr(args, "diagnose_prefetch_wait_before_gate", False),
             ),
             "python",
             env,

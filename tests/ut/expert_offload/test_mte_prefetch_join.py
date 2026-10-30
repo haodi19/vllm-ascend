@@ -135,6 +135,35 @@ class PrefetchJoinTests(unittest.TestCase):
                 self.obj.wait_for_join(self.prefetch, token)
             self.obj.wait.assert_called_once()
 
+    def test_early_strict_wait_keeps_mapping_and_staging_behind_consumer_gate(self):
+        self.obj.manager.offload_config.host_sync_diagnose_prefetch_wait_before_gate = True
+        with self.obj.prefetch_join_capture():
+            self.obj.defer_prefetch(self.prefetch, Mock(), (), 1, self.destination, self.source)
+            self.obj.wait.assert_called_once()
+            self.destination.copy_.assert_not_called()
+            self.assertEqual(self.obj.deferred_waits, {})
+            with self.assertRaisesRegex(RuntimeError, "staging"):
+                self.obj.defer_prefetch(self.prefetch, Mock(), (), 2, self.destination, self.source)
+            self.calls.append(("main", "independent_compute"))
+            done = self.obj.finish_prefetch_at_join(self.main, 1)
+            self.main.wait_event(done)
+        publish, wait, compute, gate, gate_wait, mapping, record_done, consumer_wait = self.calls
+        self.assertEqual(wait[1:], (22, publish[2] + 512, publish[3]))
+        self.assertEqual(compute, ("main", "independent_compute"))
+        self.assertEqual(gate[:2], ("main", "record"))
+        self.assertEqual(gate_wait, ("prefetch", "wait", gate[2]))
+        self.assertEqual(mapping, ("mapping", self.source))
+        self.assertEqual(record_done, ("prefetch", "record", done))
+        self.assertEqual(consumer_wait, ("main", "wait", done))
+        self.obj.wait.assert_called_once()
+
+    def test_early_wait_does_not_make_orphan_mapping_a_complete_capture(self):
+        self.obj.manager.offload_config.host_sync_diagnose_prefetch_wait_before_gate = True
+        with self.assertRaisesRegex(RuntimeError, "unjoined"), self.obj.prefetch_join_capture():
+            self.obj.defer_prefetch(self.prefetch, Mock(), (), 1, self.destination, self.source)
+        self.assertTrue(self.obj.join_capture_failed)
+        self.destination.copy_.assert_not_called()
+
     def test_orphan_poison_prevents_reuse_in_next_capture(self):
         with self.assertRaisesRegex(RuntimeError, "unjoined"), self.obj.prefetch_join_capture():
             token = self.obj.publish_for_join(self.prefetch, Mock(), ())
@@ -270,6 +299,14 @@ class PrefetchJoinTests(unittest.TestCase):
             "host_sync_library": str(Path(__file__).resolve()),
         }
         self.module.validate_host_sync_config(valid)
+        self.module.validate_host_sync_config({**valid, "host_sync_diagnose_prefetch_wait_before_gate": True})
+        for changes in (
+            {"host_sync_diagnose_prefetch_wait_before_gate": 1},
+            {"host_sync_diagnose_prefetch_wait_before_gate": True, "host_sync_diagnose_prefetch_wait_at_join": False},
+            {"host_sync_diagnose_prefetch_wait_before_gate": True, "host_sync_diagnose_graph_dump": False},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.module.validate_host_sync_config({**valid, **changes})
         self.module.validate_host_sync_config({**valid, "host_sync_diagnose_graph_dump": False})
         self.module.validate_host_sync_config(
             {key: value for key, value in valid.items() if key != "host_sync_diagnose_graph_dump"}

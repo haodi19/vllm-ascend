@@ -4,10 +4,10 @@
 默认关闭诊断。参考仓库 `D:\华为\nano2\vllm-ascend\vLLM-ascend-DSA` 仅只读审阅，
 HEAD 为 `ce6900977e6a25377cd11205e3613ec2ec0208a4`。没有收到辅助流单组补跑的新结果。
 
-**最新：三种输入各32 tokens的callback/MTE对照通过；下一步关闭图debug/转储验证，见第12节。**
+**最新：关闭图debug后输出仍一致；回到阻塞主线，固定晚映射，比较早/晚严格wait，见第13节。**
 根因仍未证实，停止继续枚举核数。等待位置实验检验“等待与消费者之前的真实模型计算重叠”
 是否参与触发，不能直接区分资源调度、模型算子内部停滞和轮询访存影响。
-第1–11节保留实验设计、首次运行命令与启动取证记录；后续操作以第12节为准。
+第1–12节保留实验设计、运行命令与取证记录；后续操作以第13节为准。
 
 ## 1. 原项目与当前改造的完整顺序
 
@@ -553,3 +553,82 @@ python -B script/diagnose_mte_wait_placement.py --npu 7 --trace-startup --no-loa
 完整套件参数传递、意外转储拒绝成功，以及摘要不推断设备图结构。6个修改的Python文件Ruff检查和
 格式检查通过，`git diff --check`通过。`format.sh ci`仍因缺少pre-commit未能运行完整检查，
 本轮新增配置的NPU结果待上述命令返回。
+
+## 13. 回到阻塞主线：固定晚映射，只改变严格wait位置（2026-10-30）
+
+用户返回关闭图debug的结果（EngineCore PID102344、API PID101766，10月30日10:23:49清理）。
+两个服务均完成三种输入各32 tokens，三项text_match及usage_match全部为true。
+有效配置graph dump=false、转储记录0、CPU capture登记/汇合各42槽、pending=0。
+本轮没有设备图转储，不能复用旧运行的42对结构当作本轮设备证据。业务计时记录3825/3827、错误与丢失为0。
+MTE清理后仍观测到SIGKILL（距terminate约129毫秒），发送来源未明；不将其作为请求阶段阻塞证据。
+
+### 13.1 本轮阻塞排查进展
+
+- **已知主线继续有效**：历史报告等待、有界等待以及延后严格等待的对照，共同支持预取AIV等待
+  与真实模型执行的组合参与触发。不是重新从零怀疑“AIV等待有没有关系”。
+- **本次新增证据**：本轮汇合处等待方案的推进和有限输出一致不依赖显式图debug接口。
+  这是对已通过方案的条件核验；没有新增原始未完成设备任务、PC或资源依赖证据。
+- **仍未解释**：提前严格wait与真实主辅流计算中的哪一段组合，如何阻碍加载；驻留资源、轮询访存、
+  内部依赖等机制仍未区分。前面几轮正确性/可用性验证不能累计成底层根因已定位。
+- **环境边界**：本轮启动前MemAvailable为1455545552 kB，上轮约931153268 kB，变化明显。
+  这是主机快照，不是NPU资源或容器限额；既不能据此判为内存原因，也不能用历史失败充作严格同轮对照。
+
+后续每轮按“新增阻塞证据—排除/削弱了什么—仍未知什么—下一实验区分什么”汇报。
+功能验证另列，若没有新增根因证据就明确说没有。
+
+### 13.2 下一实验具体定位什么
+
+当前成功方案同时延后了严格wait和预取映射写回。为取得当前代码/环境下可判读的阻塞样本，
+本轮固定映射在消费者gate之后，比较严格wait是否也必须等待gate。并不是重新检验AIV是否相关，
+而是分离等待与映射写回的干预作用，给后续具体任务定位建立可复现对照。
+
+| 本轮组别 | 预取流顺序 | 用途 |
+| --- | --- | --- |
+| late_wait | publish → wait gate → strict wait → mapping → done | 同轮推进对照 |
+| early_wait | publish → strict wait → wait gate → mapping → done | 恢复提前等待，映射仍延后 |
+
+主流两组都是原计算 → record gate → wait done。early_wait在原预取publish位置立即提交严格wait，
+不是等到消费者Python代码执行时才提交一个无gate的wait。映射仍经过主流gate，不能越过它提前写回。
+提前提交wait后仍保留共享staging所有权，下一次stage会检查未完成的映射汇合；孤立映射会使捕获失败。
+同generation、原始拷贝、加载同步、worker策略、核数保持不变，不用假done或有界放行。
+
+新增默认关闭的配置 `host_sync_diagnose_prefetch_wait_before_gate`，要求已有join捕获和graph dump。
+不改变默认路径。CPU测试检查early组只提交一次strict wait、映射和done位于gate之后，并保持孤立捕获拒绝。
+
+新入口顺序跑两个MTE服务，不再跑callback精度组。两组统一采用原阻塞排查的短负载：
+1次预热+3次请求、原提示词、max_tokens=5；统一打开图debug以核验交换后的顺序，关闭逐项加载诊断。
+相对上轮功能验证改变了负载和观测，因此结论只在新两组内部比较，不直接拿上轮结果归因。
+只有late_wait完成请求且图结构与CPU捕获登记对应，才启动early_wait；对照不成立就停止。
+
+### 13.3 判据及证据边界
+
+- `CONTROL_NOT_ESTABLISHED`：late_wait未完成或结构缺失，不启动early组，不根据失效对照推理。
+- `EARLY_WAIT_LATE_MAPPING_PENDING_AT_LOAD_SYNC`：early组顺序成立；同一watchdog快照中，活动worker
+  对应已登记预取槽、request未完成且栈位于 `_synchronize_h2d`，同槽同generation随后达到watchdog时限。
+  结合late组通过，支持在预取映射仍延后的条件下，恢复提前严格等待仍可触发加载推进问题。
+  这可削弱“必须提前写回预取映射才会卡住”的解释，不能直接证明资源死锁。
+- `EARLY_WAIT_LATE_MAPPING_PASSED`：本轮允许提前wait的图也通过，未得到新的阻塞样本。
+  不能由允许重叠推断实际发生了与旧故障相同的重叠；映射时序、加载量和环境变化仍需区分。
+- `INCONCLUSIVE`：提前组启动退出、结构缺失、或失败证据达不到上述门槛。保持未知，不自动归类为旧scale卡点。
+
+图dump只证明捕获依赖，不证明kernel实际启动或核占用。单次Host快照也不是完整执行轨迹。
+未得到具体设备任务/PC时，不能称为已再次定位到旧Transpose任务711，更不能照抄历史PID/stream/task。
+已有业务计时分组会随摘要保留，供查看实际负载；没有对应快照时pending计数为null而非“观测到0”。
+
+### 13.4 绿区命令
+
+```bash
+cd /home/l00992607/vllm-ascend-worker-poll
+git pull --ff-only origin dev/moeoffload-worker-poll
+python -B script/diagnose_mte_wait_order.py --npu 7
+```
+
+返回新建 `bench_results/mte_wait_order_*/summary.txt` 的检查脱敏文本。
+重点是两个CASE的有效配置、设备图顺序、`WAIT_ORDER_FACTS`及末尾 `BLOCKING_PROGRESS`。
+每组独立3000秒外层上限、只清理本组进程；记录各组启动前主机内存，不自动追加第三组或限核组。
+
+本轮相关152项CPU测试中150项通过、2项因Windows能力限制跳过。覆盖早wait下的原槽/单次严格等待、
+gate后的映射与done顺序、staging与孤立捕获保护、两种设备图顺序识别、活动worker与主线程栈区分、
+同代watchdog关联，以及对照不成立时停止。7个新增/修改的独立Python文件通过Ruff检查与格式检查；
+`ascend_config.py`两条既有Ruff问题已与HEAD按规则/消息核对，没有新增。`git diff --check`通过。
+`format.sh ci`因本地缺少pre-commit未能启动全套检查。新干预尚无NPU结果，以上均不是硬件机制证明。
