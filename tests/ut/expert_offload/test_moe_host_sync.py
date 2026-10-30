@@ -696,6 +696,21 @@ class MoeHostSyncTests(unittest.TestCase):
             self.module.create_offload_load_stream(npu, "mte")
         npu.Stream.assert_not_called()
 
+    def test_mte_ordinary_stream_is_explicit_and_does_not_require_sync_class(self):
+        npu = SimpleNamespace(Stream=Mock(return_value="ordinary"))
+        self.assertEqual(self.module.create_offload_load_stream(npu, "mte", "ordinary"), "ordinary")
+        npu.Stream.assert_called_once_with()
+
+    def test_invalid_load_stream_is_rejected_before_creation(self):
+        for mode in ("typo", None, True):
+            npu = SimpleNamespace(Stream=Mock(), SyncLaunchStream=Mock())
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.module.create_offload_load_stream(npu, "mte", mode)
+            npu.Stream.assert_not_called()
+            npu.SyncLaunchStream.assert_not_called()
+            with self.assertRaises(ValueError):
+                self.module.validate_host_sync_config({"host_sync_load_stream": mode})
+
     def test_manager_initializes_selected_load_stream(self):
         tree = ast.parse(
             (self.root / "vllm_ascend/expert_offload/expert_offload_manager.py").read_text(encoding="utf-8")
@@ -1059,6 +1074,7 @@ class MoeHostSyncTests(unittest.TestCase):
         self.assertEqual(new.pop("host_sync_scan_mode"), "all")
         self.assertEqual(new.pop("host_sync_idle_probe"), "locked")
         self.assertEqual(new.pop("host_sync_idle_mode"), "yield")
+        self.assertEqual(new.pop("host_sync_load_stream"), "sync_launch")
         self.assertEqual(new, old)
         self.assertFalse(any(not word.strip() for word in after))
 

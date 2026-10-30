@@ -104,7 +104,10 @@ def configured_source(
     no_load_diagnostics=False,
     no_graph_dump=False,
     diagnose_prefetch_wait_before_gate=False,
+    mte_load_stream="sync_launch",
 ):
+    if mte_load_stream not in ("sync_launch", "ordinary"):
+        raise ValueError("invalid MTE load stream")
     if no_graph_dump and diagnose_graph_dump:
         raise ValueError("no-graph-dump conflicts with diagnose-graph-dump")
     if no_load_diagnostics and any(
@@ -121,6 +124,7 @@ def configured_source(
     config = json.loads(words[index])
     offload = config["expert_offload_config"]
     offload["host_sync_backend"] = backend
+    offload["host_sync_load_stream"] = mte_load_stream
     if diagnose_prefetch_wait_at_join or "host_sync_diagnose_prefetch_wait_at_join" in offload:
         offload["host_sync_diagnose_prefetch_wait_at_join"] = diagnose_prefetch_wait_at_join and backend == "mte"
     if diagnose_prefetch_wait_before_gate or "host_sync_diagnose_prefetch_wait_before_gate" in offload:
@@ -367,7 +371,9 @@ def prepare_runtime_artifacts(source, target):
     print(f"Runtime artifacts: copied missing files={copied}; existing files preserved; source={source}", flush=True)
 
 
-def parse_args(argv=None, *, profile_compare=False):
+def parse_args(argv=None, *, profile_compare=False, stream_compare=False):
+    if stream_compare and not profile_compare:
+        raise ValueError("stream comparison requires profile comparison preset")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--compare-join-cost",
@@ -464,6 +470,7 @@ def parse_args(argv=None, *, profile_compare=False):
     )
     args = parser.parse_args(argv)
     args.profile_compare = profile_compare
+    args.stream_compare = stream_compare
     if args.requests is None:
         args.requests = 1 if profile_compare else (10 if args.compare_join_cost else 3)
     if args.warmup_requests is None:
@@ -572,6 +579,7 @@ def main():
 
 
 def run(args, root):
+    stream_compare = getattr(args, "stream_compare", False)
     cache_policy_backend = getattr(args, "cache_policy_backend", "python")
     profile_compare = getattr(args, "profile_compare", False)
     if cache_policy_backend not in ("python", "cpp"):
@@ -667,16 +675,21 @@ def run(args, root):
         flush=True,
     )
     print(
-        "MTE uses graph polling dispatch and SyncLaunchStream H2D; callback keeps its original load stream. "
+        "MTE uses graph polling dispatch; load stream selection is printed per case. "
         f"Eager callback invocation is unchanged. Timers enabled; profiler={not args.skip_profile}.",
         flush=True,
     )
-    for backend in backends:
-        directory = root / backend
+    cases = (
+        (("sync_launch", "mte", "sync_launch"), ("ordinary", "mte", "ordinary"))
+        if stream_compare
+        else tuple((backend, backend, "sync_launch") for backend in backends)
+    )
+    for label, backend, load_stream_mode in cases:
+        directory = root / label
         directory.mkdir()
         run_args = SimpleNamespace(
             output_dir=directory,
-            profile_run_dir=root / "profile" / backend,
+            profile_run_dir=root / "profile" / label,
             npu=args.npu,
             port=port,
             timing_port=args.timing_port,
@@ -694,7 +707,7 @@ def run(args, root):
             trace_startup=getattr(args, "trace_startup", False) and backend == "mte",
             verification_suite=getattr(args, "verification_suite", False),
         )
-        print(f"\n=== REAL MOE HOST BACKEND: {backend} ===", flush=True)
+        print(f"\n=== REAL MOE HOST BACKEND: {backend}; case={label}; load_stream={load_stream_mode} ===", flush=True)
         print(
             f"Requested worker policy: scan={args.worker_scan}; probe={args.worker_probe}; "
             f"idle={args.worker_idle}; MTE only",
@@ -702,7 +715,7 @@ def run(args, root):
         )
         if args.diagnose_load_stages:
             print("DIAGNOSTIC LOAD BARRIERS ENABLED: timings are not a performance comparison", flush=True)
-        reports[backend] = inference(
+        reports[label] = inference(
             run_args,
             configured_source(
                 source,
@@ -728,29 +741,43 @@ def run(args, root):
                 getattr(args, "no_load_diagnostics", False),
                 getattr(args, "no_graph_dump", False),
                 getattr(args, "diagnose_prefetch_wait_before_gate", False),
+                mte_load_stream=load_stream_mode,
             ),
             cache_policy_backend,
             env,
         )
         log = (directory / f"inference_{cache_policy_backend}.log").read_text(encoding="utf-8", errors="replace")
         assess_profile_report(
-            reports[backend],
+            reports[label],
             log,
-            root / "profile" / backend / cache_policy_backend,
+            root / "profile" / label / cache_policy_backend,
             require_mte=backend == "mte",
             retain_trace_data=profile_compare,
             large_gap_us=getattr(args, "large_gap_us", None) if profile_compare else None,
         )
-        reports[backend].update(
-            host_backend=backend, cache_policy_backend=cache_policy_backend, load_backend="python", h2d_backend="torch"
+        reports[label].update(
+            host_backend=backend,
+            cache_policy_backend=cache_policy_backend,
+            load_backend="python",
+            h2d_backend="torch",
+            load_stream_mode=load_stream_mode if backend == "mte" else "ordinary",
         )
+        if stream_compare:
+            expected_type = "SyncLaunchStream" if load_stream_mode == "sync_launch" else "Stream"
+            expected = f"[MOE-MTE] weight load stream={expected_type}; mode={load_stream_mode}; H2D wait retained"
+            if expected not in log:
+                raise RuntimeError(f"Missing runtime load stream evidence: {expected}")
         if profile_compare:
-            (directory / "profile_report.json").write_text(json.dumps(reports[backend]), encoding="utf-8")
+            (directory / "profile_report.json").write_text(json.dumps(reports[label]), encoding="utf-8")
+        if stream_compare:
+            positions = reports[label]["engine_error_log_positions"]
+            if not positions["cleanup_marker_unique"] or positions["before_cleanup"] != 0:
+                raise RuntimeError(f"{label}: engine error before cleanup or missing cleanup boundary; stop comparison")
         if cost_mode:
             # Preserve each completed group before comparing results or starting
             # the next service, so a later failure does not lose measurements.
-            (directory / "cost_report.json").write_text(json.dumps(reports[backend]), encoding="utf-8")
-            positions = reports[backend]["engine_error_log_positions"]
+            (directory / "cost_report.json").write_text(json.dumps(reports[label]), encoding="utf-8")
+            positions = reports[label]["engine_error_log_positions"]
             if not positions["cleanup_marker_unique"] or positions["before_cleanup"] != 0:
                 raise RuntimeError(f"{backend}: missing cleanup boundary or request-phase EngineDeadError")
             if any(tag in log for tag in ("[MOE-MTE COMPUTE_LIMIT]", "[MOE-MTE WAIT_CONTROL]", "[MOE-MTE FATAL]")):
@@ -784,19 +811,19 @@ def run(args, root):
                 {
                     "host_backend": backend,
                     "cache_policy_backend": cache_policy_backend,
-                    "request_mean_us": reports[backend]["request_us"],
-                    "digests": reports[backend]["digests"],
-                    "usage": reports[backend]["usage"],
-                    "profile_status": reports[backend]["profile_status"],
-                    "profile_errors": reports[backend]["profile_errors"],
-                    "profile_warnings": reports[backend]["profile_warnings"],
-                    "profile_checks": reports[backend]["profile_checks"],
-                    "engine_error_seen": reports[backend]["engine_error_seen"],
-                    "engine_error_log_positions": reports[backend]["engine_error_log_positions"],
-                    "callbacks": reports[backend]["count"],
-                    "callback_errors": reports[backend]["errors"],
-                    "callback_dropped": reports[backend]["dropped"],
-                    "request_specs": reports[backend]["request_specs"],
+                    "request_mean_us": reports[label]["request_us"],
+                    "digests": reports[label]["digests"],
+                    "usage": reports[label]["usage"],
+                    "profile_status": reports[label]["profile_status"],
+                    "profile_errors": reports[label]["profile_errors"],
+                    "profile_warnings": reports[label]["profile_warnings"],
+                    "profile_checks": reports[label]["profile_checks"],
+                    "engine_error_seen": reports[label]["engine_error_seen"],
+                    "engine_error_log_positions": reports[label]["engine_error_log_positions"],
+                    "callbacks": reports[label]["count"],
+                    "callback_errors": reports[label]["errors"],
+                    "callback_dropped": reports[label]["dropped"],
+                    "request_specs": reports[label]["request_specs"],
                 }
             ),
             flush=True,

@@ -244,9 +244,13 @@ class ExpertOffloadManager:
 
         from vllm_ascend.expert_offload.host_sync import create_offload_load_stream
         host_sync_backend = getattr(self.offload_config, "host_sync_backend", "callback")
-        self.load_stream = create_offload_load_stream(torch_npu.npu, host_sync_backend)
+        load_stream_mode = getattr(self.offload_config, "host_sync_load_stream", "sync_launch")
+        self.load_stream = create_offload_load_stream(torch_npu.npu, host_sync_backend, load_stream_mode)
         if host_sync_backend == "mte":
-            logger.info("[MOE-MTE] weight load stream=SyncLaunchStream; direct Host submission; H2D wait retained")
+            logger.info(
+                "[MOE-MTE] weight load stream=%s; mode=%s; H2D wait retained",
+                type(self.load_stream).__name__, load_stream_mode,
+            )
         # MemFabric SHARED initialization is collective and needs the EP group,
         # so defer it until the first layer allocates Host expert buffers.
         self.h2d_transport = None

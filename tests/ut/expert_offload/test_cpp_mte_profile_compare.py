@@ -150,6 +150,104 @@ class CppMteProfileTests(unittest.TestCase):
                 self.assertTrue((root / backend / "profile_report.json").exists())
                 self.assertEqual(len(reports[backend]["profile_trace_data"]), 1)
 
+    def test_stream_comparison_only_changes_load_stream_and_preserves_baseline_on_timeout(self):
+        for fail_ordinary in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                root, settings, calls = Path(directory), [], []
+                with patch.object(sys, "platform", "linux"):
+                    args = self.runner.parse_args(
+                        ["--npu", "7", "--cache-policy-backend", "cpp"],
+                        profile_compare=True,
+                        stream_compare=True,
+                    )
+
+                def fake_inference(
+                    run_args,
+                    source,
+                    policy,
+                    env,
+                    *,
+                    calls=calls,
+                    settings=settings,
+                    root=root,
+                    fail_ordinary=fail_ordinary,
+                ):
+                    mode = run_args.output_dir.name
+                    calls.append(mode)
+                    _, command, _, _ = self.runner.launch_spec(source, policy, 7, None, 18155)
+                    config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
+                    self.assertEqual(config.pop("host_sync_load_stream"), mode)
+                    self.assertEqual(config["host_sync_backend"], "mte")
+                    self.assertTrue(config["host_sync_diagnose_prefetch_wait_at_join"])
+                    self.assertFalse(config["host_sync_diagnose_load"])
+                    self.assertEqual(policy, "cpp")
+                    settings.append(config)
+                    self.assertEqual(run_args.profile_run_dir, root / "profile" / mode)
+                    stream_type = "SyncLaunchStream" if mode == "sync_launch" else "Stream"
+                    (run_args.output_dir / "inference_cpp.log").write_text(
+                        f"[MOE-MTE] weight load stream={stream_type}; mode={mode}; H2D wait retained\n"
+                        "[MOE-MTE WORKER] scan=all probe=locked idle=yield\n"
+                        "[MOE-MTE] first real offload callback completed\n"
+                        '[MOE-MTE RUNNER] {"event": "cleanup_begin"}\n',
+                        encoding="utf-8",
+                    )
+                    if fail_ordinary and mode == "ordinary":
+                        raise TimeoutError("ordinary request timed out")
+                    return self.report("incomplete")
+
+                with (
+                    patch.object(self.runner, "run_step", return_value=True) as steps,
+                    patch.object(self.runner, "select_build_directory", return_value=root / "build"),
+                    patch.object(self.runner, "inference", side_effect=fake_inference),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    if fail_ordinary:
+                        with self.assertRaisesRegex(TimeoutError, "ordinary request"):
+                            self.runner.run(args, root)
+                    else:
+                        reports = self.runner.run(args, root)
+                        self.assertEqual(set(reports), {"sync_launch", "ordinary"})
+                        result = self.compare.print_comparison(reports, root, ("sync_launch", "ordinary"))
+                        self.assertTrue(result["outputs_match"])
+                self.assertEqual(calls, ["sync_launch", "ordinary"])
+                self.assertEqual(settings[0], settings[1])
+                self.assertTrue((root / "sync_launch/profile_report.json").is_file())
+                installs = [call.args[1] for call in steps.call_args_list if "install" in call.args[1]]
+                self.assertEqual(len(installs), 2)  # one build per extension, not per service
+
+    def test_stream_comparison_rejects_wrong_runtime_identity(self):
+        reports = {name: self.report() for name in ("sync_launch", "ordinary")}
+        for name, report in reports.items():
+            report.update(host_backend="mte", load_stream_mode=name, cache_policy_backend="cpp")
+        reports["ordinary"]["load_stream_mode"] = "sync_launch"
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "identity"):
+            self.compare.print_comparison(reports, Path("run"), ("sync_launch", "ordinary"))
+
+    def test_stream_entry_preserves_first_report_and_includes_failure_excerpt(self):
+        def fake_run(args, root):
+            self.assertTrue(args.stream_compare and args.profile_compare)
+            first = root / "sync_launch"
+            first.mkdir()
+            (first / "profile_report.json").write_text(json.dumps(self.report()), encoding="utf-8")
+            second = root / "ordinary"
+            second.mkdir()
+            (second / "inference_cpp.log").write_text("[MOE-MTE FATAL] stalled\n", encoding="utf-8")
+            raise TimeoutError("ordinary timeout")
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(sys, "platform", "linux"),
+            patch.object(self.compare, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            root = Path(directory) / "run"
+            result = self.compare.main(["--npu", "7", "--output-dir", str(root)], stream_compare=True)
+            self.assertEqual(result, 1)
+            summary = (root / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("PARTIAL_METRICS sync_launch", summary)
+            self.assertIn("FAILED_CASE ordinary", summary)
+            self.assertIn("[MOE-MTE FATAL] stalled", summary)
+
     def test_lrc_build_or_parity_failure_prevents_model_start(self):
         for returns in ([False], [True, False]):
             with (

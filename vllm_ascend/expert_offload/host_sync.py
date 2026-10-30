@@ -13,12 +13,16 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-def create_offload_load_stream(npu, backend):
-    """Keep polling-worker H2D off the model's Host submission queue."""
+def create_offload_load_stream(npu, backend, mte_load_stream="sync_launch"):
+    """Default to direct MTE submission; allow an explicit ordinary-stream comparison."""
+    if mte_load_stream not in ("sync_launch", "ordinary"):
+        raise ValueError("host_sync_load_stream must be sync_launch or ordinary")
     if backend == "callback":
         return npu.Stream()
     if backend != "mte":
         raise ValueError("host_sync_backend must be callback or mte")
+    if mte_load_stream == "ordinary":
+        return npu.Stream()
     stream_type = getattr(npu, "SyncLaunchStream", None)
     if stream_type is None:
         raise RuntimeError("MTE host sync requires torch_npu.npu.SyncLaunchStream; no ordinary-stream fallback")
@@ -28,6 +32,8 @@ def create_offload_load_stream(npu, backend):
 
 
 def validate_host_sync_config(config):
+    if config.get("host_sync_load_stream", "sync_launch") not in ("sync_launch", "ordinary"):
+        raise ValueError("host_sync_load_stream must be sync_launch or ordinary")
     join_wait = config.get("host_sync_diagnose_prefetch_wait_at_join", False)
     early_wait = config.get("host_sync_diagnose_prefetch_wait_before_gate", False)
     if not isinstance(early_wait, bool):

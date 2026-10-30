@@ -10,7 +10,7 @@ import sys
 from uuid import uuid4
 
 from mte_join_cost import LOAD_STATS
-from run_moe_host_sync import CostProgressFile, parse_args, run
+from run_moe_host_sync import CostProgressFile, failure_excerpt, parse_args, run
 from run_verified_cpp_tests import REPO, SummaryTee
 
 METRICS = (
@@ -113,20 +113,31 @@ def print_profile(backend, report, root):
     return len(usable) == len(traces)
 
 
-def print_comparison(reports, root):
+def print_comparison(reports, root, labels=("callback", "mte")):
     """Keep descriptive timings even when profile export fails; reject unequal outputs."""
     print("\n两组 LRC=cpp（observe/choose_victims 及配套状态管理）；权重准备/提交仍用 Python/Torch。")
     print("未开启融合规划、ACL 搬运或 CPU 重排。")
     print("计时含 profiler、MSTX 和内部计时开销；请求时延为辅助数据，不是无采集性能验收。")
     print("间隔覆盖整个采集窗口：Host 仅同进程相邻回调；MEMCPY 仅同设备同流，包含批次内/批次间。")
     print("大间隔阈值只按长度筛选，不自动识别同层预取→按需；MEMCPY 间隔不等于整卡空闲。")
-    if set(reports) != {"callback", "mte"}:
+    if set(reports) != set(labels):
         raise ValueError("两组未全部完成；已完成组的 profile_report.json 和原始 profile 保留")
+    if labels == ("sync_launch", "ordinary"):
+        for label in labels:
+            report = reports[label]
+            if (report.get("host_backend"), report.get("load_stream_mode"), report.get("cache_policy_backend")) != (
+                "mte",
+                label,
+                "cpp",
+            ):
+                raise ValueError(f"{label}: wrong MTE stream/policy identity")
     indexed = {backend: checked_groups(report, backend) for backend, report in reports.items()}
     profiles_ok = True
     for backend, report in reports.items():
         print(
-            f"BACKEND {backend}: cache_policy={report.get('cache_policy_backend', 'not_recorded')}; "
+            f"BACKEND {backend}: host={report.get('host_backend', backend)}; "
+            f"load_stream={report.get('load_stream_mode', 'not_recorded')}; "
+            f"cache_policy={report.get('cache_policy_backend', 'not_recorded')}; "
             f"load={report.get('load_backend', 'not_recorded')}; h2d={report.get('h2d_backend', 'not_recorded')}"
         )
         print(
@@ -140,7 +151,7 @@ def print_comparison(reports, root):
         print(f"ENGINE_ERRORS {backend}: {json.dumps(positions)}；只按日志顺序区分清理边界。")
         profiles_ok = print_profile(backend, report, root) and profiles_ok
     matching = {
-        field: reports["callback"][field] == reports["mte"][field] for field in ("request_specs", "digests", "usage")
+        field: reports[labels[0]][field] == reports[labels[1]][field] for field in ("request_specs", "digests", "usage")
     }
     print("OUTPUT_MATCH", json.dumps(matching))
     if not all(matching.values()):
@@ -153,9 +164,9 @@ def print_comparison(reports, root):
     )
     if not clean:
         print("清理前存在引擎错误或清理边界不明，以下仅列已取得的描述性数据，不作性能收益验收。")
-    comparable = indexed["callback"].keys() == indexed["mte"].keys()
-    for key in sorted(indexed["callback"].keys() | indexed["mte"].keys()):
-        a, b = (indexed[backend].get(key) for backend in ("callback", "mte"))
+    comparable = indexed[labels[0]].keys() == indexed[labels[1]].keys()
+    for key in sorted(indexed[labels[0]].keys() | indexed[labels[1]].keys()):
+        a, b = (indexed[backend].get(key) for backend in labels)
         if a is None or b is None:
             comparable = False
             print(f"GROUP kind={key[0]} rows={key[1]}: 一组缺失，不能作同工作量比较")
@@ -171,7 +182,10 @@ def print_comparison(reports, root):
             f"experts={a['loads']['mean'] * a['count']:.1f}/{b['loads']['mean'] * b['count']:.1f} "
             f"workload_summary_match={matched}"
         )
-        print("metric               callback_mean_us   mte_mean_us  delta_us  callback_p95_us  mte_p95_us")
+        print(
+            f"metric               {labels[0]}_mean_us  {labels[1]}_mean_us  delta_us  "
+            f"{labels[0]}_p95_us  {labels[1]}_p95_us"
+        )
         for metric in METRICS:
             first, second = a["metrics"][metric], b["metrics"][metric]
             print(
@@ -195,9 +209,9 @@ def print_comparison(reports, root):
     }
 
 
-def print_partial_reports(root):
+def print_partial_reports(root, labels=("callback", "mte")):
     print("PARTIAL：完整对照未成功，以下仅保留各组已取得的数据，不能据此比较收益。")
-    for backend in ("callback", "mte"):
+    for backend in labels:
         path = root / backend / "profile_report.json"
         if not path.is_file():
             print(f"PARTIAL {backend}: 未取得完成报告；service_log={root / backend / 'inference_cpp.log'}")
@@ -221,16 +235,35 @@ def print_partial_reports(root):
             print(f"PARTIAL {backend}: 报告无法验证（{type(exc).__name__}），保留于 {path}")
 
 
-def main(argv=None):
+def print_failure_logs(root, labels):
+    for label in labels:
+        path = root / label / "inference_cpp.log"
+        if path.is_file() and not (root / label / "profile_report.json").exists():
+            print(f"FAILED_CASE {label}; service_log={path}")
+            with path.open("rb") as log:
+                log.seek(0, 2)
+                log.seek(max(0, log.tell() - 256 * 1024))
+                tail = log.read().decode("utf-8", errors="replace")
+            print(failure_excerpt(tail))
+
+
+def main(argv=None, *, stream_compare=False):
     args = parse_args(
-        ["--cache-policy-backend", "cpp", *(sys.argv[1:] if argv is None else argv)], profile_compare=True
+        ["--cache-policy-backend", "cpp", *(sys.argv[1:] if argv is None else argv)],
+        profile_compare=True,
+        stream_compare=stream_compare,
     )
-    root = (args.output_dir or REPO / "bench_results" / f"cpp_mte_profile_{uuid4().hex[:8]}").resolve()
+    labels = ("sync_launch", "ordinary") if stream_compare else ("callback", "mte")
+    prefix = "mte_load_stream" if stream_compare else "cpp_mte_profile"
+    root = (args.output_dir or REPO / "bench_results" / f"{prefix}_{uuid4().hex[:8]}").resolve()
     root.mkdir(parents=True, exist_ok=False)
     with (
         (root / "summary.txt").open("w", encoding="utf-8") as summary,
         contextlib.redirect_stdout(SummaryTee(sys.stdout, summary)),
     ):
+        if stream_compare:
+            print("两组均为MTE晚等待＋cpp LRC；只改变加载流：sync_launch → ordinary。")
+            print("普通流若请求超时则终止本轮，不跳过设备完成检查，不继续推理。")
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
         print(
             f"配置：两组 cpp；MTE 严格 wait 延后到消费门控后；预热={args.warmup_requests}，"
@@ -251,14 +284,16 @@ def main(argv=None):
                         progress.flush()
             if not isinstance(reports, dict):
                 raise RuntimeError(f"构建、回归或运行失败（exit={reports}），详见 run_details.log")
-            print_comparison(reports, root)
+            print_comparison(reports, root, labels)
             return 0
         except Exception as exc:
             print(
                 f"FAILED: {type(exc).__name__}: {exc}; 已生成的报告/profile 保留，详情见 run_details.log。",
                 flush=True,
             )
-            print_partial_reports(root)
+            print_partial_reports(root, labels)
+            if stream_compare:
+                print_failure_logs(root, labels)
             return 1
 
 

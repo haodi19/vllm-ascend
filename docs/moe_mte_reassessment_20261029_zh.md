@@ -1052,3 +1052,32 @@ SyncLaunchStream则由当前工作线程直接提交。因此原来可能在后�
 并非已经证实的本次设备Transpose阻塞根因。改流后仍曾复现阻塞，当前能够完成请求的修复是延后预取严格等待。
 SyncLaunchStream不是共享内存协议本身的必需条件，其在当前晚等待路径中的必要性尚未单独验证。
 名字中的Sync指Host直接提交，不代表每次copy_都等待设备搬完；实际完成仍由_synchronize_h2d确认。
+
+## 18. MTE加载流单变量对照（待绿区执行）
+
+本轮直接比较同一晚等待MTE路径的两种加载流，不再比较callback与MTE。
+第一组`sync_launch`使用现有`SyncLaunchStream`，第二组`ordinary`使用普通`Stream`。
+新增配置`host_sync_load_stream`默认仍为`sync_launch`；callback后端始终沿用普通流。
+两组都保留提前发布、消费者门控之后的严格等待、原始权重/scale拷贝和`_synchronize_h2d`，
+都使用cpp LRC、all/locked/yield工作线程，不引入重排、限核、布局适配或额外逐项同步。
+
+实验脚本只构建一次所需扩展，然后顺序启动两个独立服务，核验实际流类型日志。
+沿用test_graph2.sh模型参数，每组3次预热、1次5-token采集请求，保存profile、MSTX与分项计时。
+比较输出摘要/usage、实际加载工作量，以及预取/按需的load_prepare、copy_submit、load_submit、
+synchronize、load_and_wait和Host/MEMCPY间隔。先看提交＋等待总时间，再看提交与等待各自的分布，
+不能把计时从一个区间转移到另一个区间当成整体加速。实际结果尚未返回。
+
+```bash
+python -B script/run_mte_load_stream_compare.py --npu 7 \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --request-timeout 120 --profile-timeout 120 \
+  --output-dir bench_results/mte_load_stream_01
+```
+
+输出目录必须未存在。只需返回`bench_results/mte_load_stream_01/summary.txt`的内容。
+profile分别位于该目录的`profile/sync_launch/cpp/`和`profile/ordinary/cpp/`，流编号由本轮分配，
+不能继续硬套上一轮的57/24。普通流请求超时后停止该服务，保留已完成的第一组计时、日志摘录及profile；
+不会让严格等待算子提前放行，也不把失败组记作性能样本。请求超时后仍有计时停止、profile停止及服务清理阶段，
+所以120秒不是整个脚本的总退出预算；启动预算默认1800秒。
+本轮仅用于比较加载流，短请求与profiler扰动限制保持不变。
