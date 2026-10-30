@@ -14,6 +14,7 @@ MAX_TRACE_FILES = 32
 MAX_PRINT_STREAMS = 32
 MAX_LOG_LINE_CHARS = 4096
 MEMCPY_GAP_SCOPE = "本设备进程/流的全部 MEMCPY_ASYNC 间隙，含批次内及批次间；非预取方向标注或设备全空闲"
+LARGE_GAP_SCOPE = "大间隙仅按时长 >= 阈值筛选，仍可能混合批次内、批次间及请求间隔；不代表层级或因果定位"
 
 
 def _interval(event):
@@ -73,8 +74,42 @@ def _stats(values):
     )
 
 
-def scan_trace(path, *, require_mte=False):
+def positive_gap_us(value):
+    """CLI converter shared by callers; do not accept zero, NaN or infinity."""
+    try:
+        if isinstance(value, bool):
+            raise ValueError("boolean threshold")
+        threshold = float(value)
+        if not math.isfinite(threshold) or threshold <= 0:
+            raise ValueError("nonpositive or nonfinite threshold")
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("大间隙阈值必须是正的有限微秒数") from exc
+    return threshold
+
+
+def _gap_stats(values, threshold):
+    result = _stats(values)
+    if threshold is not None:
+        large = [value for value in values if value >= threshold]
+        large_stats = _stats(large)
+        large_stats["total_us"] = sum(large)
+        if not math.isfinite(large_stats["total_us"]):
+            raise ValueError("大间隙累计时长溢出")
+        result.update(
+            large_gap_threshold_us=threshold,
+            large_gaps=large_stats,
+            large_gap_fraction=len(large) / len(values) if values else None,
+        )
+    return result
+
+
+def scan_trace(path, *, require_mte=False, large_gap_us=None):
     """完整消费 JSON；核对基本轨道/嵌套，不证明所有数据或时钟关联正确。"""
+    if large_gap_us is not None:
+        try:
+            large_gap_us = positive_gap_us(large_gap_us)
+        except argparse.ArgumentTypeError as exc:
+            raise ValueError(str(exc)) from exc
     path = Path(path)
     process_names, thread_names, tracks = {}, {}, {}
     callbacks, updates = {}, {}
@@ -163,7 +198,7 @@ def scan_trace(path, *, require_mte=False):
                 copy_count=len(intervals),
                 overlaps_excluded=overlaps,
                 scope=MEMCPY_GAP_SCOPE,
-                **_stats(durations),
+                **_gap_stats(durations, large_gap_us),
             )
         )
 
@@ -204,7 +239,7 @@ def scan_trace(path, *, require_mte=False):
                     pid=pid,
                     direction=direction,
                     overlaps_excluded=overlaps[direction],
-                    **_stats(by_direction[direction]),
+                    **_gap_stats(by_direction[direction], large_gap_us),
                 )
             )
 
@@ -287,7 +322,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_root", type=Path)
     parser.add_argument(
+        "--cache-policy-backend", choices=("python", "cpp"), default="python", help="选择采集目录和服务日志中的策略后端"
+    )
+    parser.add_argument(
         "--gaps-only", action="store_true", help="仅输出基本检查与 Host/MEMCPY 间隔，省略轨道和日志详情"
+    )
+    parser.add_argument(
+        "--large-gap-us", type=positive_gap_us, help="额外统计大于等于此微秒阈值的间隙，同时保留全部间隙统计"
     )
     args = parser.parse_args(argv)
     root = args.run_root.resolve()
@@ -295,7 +336,7 @@ def main(argv=None):
     print("不启动模型、不导入 Torch、不修改采集；JSON 会读到文件末尾。单位 us。", flush=True)
     complete = True
     for backend in ("callback", "mte"):
-        directory = root / "profile" / backend / "python"
+        directory = root / "profile" / backend / args.cache_policy_backend
         traces = []
         for path in directory.rglob("trace_view.json"):
             traces.append(path)
@@ -309,7 +350,7 @@ def main(argv=None):
         for path in sorted(traces):
             print(f"TRACE {path.relative_to(root)}; bytes={path.stat().st_size}", flush=True)
             try:
-                report = scan_trace(path, require_mte=backend == "mte")
+                report = scan_trace(path, require_mte=backend == "mte", large_gap_us=args.large_gap_us)
             except (OSError, UnicodeError, ValueError) as exc:
                 print(f"UNUSABLE: {type(exc).__name__}: {exc}", flush=True)
                 complete = False
@@ -335,12 +376,15 @@ def main(argv=None):
                 print(f"MEMCPY_GAP omitted={len(report['memcpy_gaps']) - MAX_PRINT_STREAMS}", flush=True)
             complete = complete and report["usable"]
         if not args.gaps_only:
-            for context in service_warning_context(root / backend / "inference_python.log"):
+            for context in service_warning_context(root / backend / f"inference_{args.cache_policy_backend}.log"):
                 print("SERVICE_WARNING " + json.dumps(context, ensure_ascii=False), flush=True)
     print("Host 间隔仅按同一进程的时间相邻回调统计，重叠不计入；不是设备空泡，也不跨时钟归因。", flush=True)
     print("Host 间隔覆盖整个采集窗口内的相邻回调，不是仅 Decode，也未限定同层或同一权重批次。", flush=True)
     print("MEMCPY 间隙按设备进程及流分别统计；零间隙计入，重叠排除；不跨流混算。", flush=True)
     print(MEMCPY_GAP_SCOPE + "。", flush=True)
+    if args.large_gap_us is not None:
+        print(f"两后端统一阈值={args.large_gap_us:g}us；保留全样本统计、筛选数量及占比。", flush=True)
+        print(LARGE_GAP_SCOPE + "。", flush=True)
     print("日志警告不能独立判定时间线无效；EngineDeadError 的清理阶段归属需另核对。", flush=True)
     print("BASIC_VISUALIZATION=" + ("PASS" if complete else "PARTIAL_OR_UNVERIFIED"), flush=True)
     print("PASS 只表示基本轨道和区间可用，不证明全部采集完整、CPU/NPU关联或推理正确。", flush=True)

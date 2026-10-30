@@ -1,14 +1,15 @@
 # MoE 卸载 MTE 交接改造：修改内容与完整执行流程
 
-> 历史文档副本：2026-10-29 从 `D:\华为\nano2\vllm-ascend\docs` 复制。
-> 下文保留原工作树当时的实现及实验记录，其中 CPU 重排、Storage 适配等
-> **不是当前 worker-poll 旧阻塞基线的默认实现**，历史通过结果也不能用于证明当前版本通过。
-> 请结合[最新交接与版本边界](moe_mte_block_handoff_20261029_zh.md)和实际代码阅读。
+> 当前进度（2026-10-30）：**第12节介绍当前已通过有限请求验证的阻塞规避方案**：
+> 预取请求仍提前发布，把严格AIV等待和映射写回放到消费者汇合处。
+> 保留原始权重拷贝，不新增CPU重排或scale的Storage字节适配，不限核、不替换成报告回调。
+> 已有callback/MTE输出一致性对照，用户已能查看最新两组profile；尚不能宣称底层阻塞机制完全查明或获得稳定加速。
 
-本文说明截至 2026-10-22 的实现。关闭诊断后的 callback/MTE 同轮短请求对比已完成，
-两组生成文本一致；本轮 MTE 请求平均时延增加约 3.31%，尚未获得整体加速证据。
-MTE 本轮设备侧 profile 原始数据缺失，交接时间线仍待重新采集验证。
-本文描述当前实现，不把尚未验证的推测写成结论。
+第1–11节保留历史说明：本文原于2026-10-22记录早期实现，2026-10-29从
+`D:\华为\nano2\vllm-ascend\docs`复制，随后补入旧阻塞基线的诊断记录。
+其中CPU重排、scale Storage适配和旧性能结果属于当时的方案，**不能当作当前worker-poll方案**。
+旧轮次profile缺失也不代表当前轮次profile不可用。新方案的流程、代码位置和验证边界以第12节为准；
+完整实验演进见[重新审视与实测记录](moe_mte_reassessment_20261029_zh.md)。
 
 原流程与入图基础见 [CPU/NPU 卸载流程说明](moe_offload_cpu_npu_flow_zh.md)；
 实验命令和联调记录见 [MTE 接入说明](moe_host_sync_integration_zh.md)。
@@ -149,7 +150,7 @@ MTE 图内卸载交接不再调用 `_launch_host_func`，也不通过该处的�
 因此只能说替换了卸载交接的报告回调机制，不能宣称整个推理已经没有中断或系统调用，
 更不能把旧版本所有空泡都归因于中断，再认为已被消除。
 
-## 3. 按八步理解当前完整流程
+## 3. 按八步理解早期完整流程（历史实现）
 
 ### 第一步：初始化加载资源和常驻工作线程
 
@@ -323,7 +324,7 @@ CPU 提交线程        NPU 计算流                 CPU 报告线程          
 这条路径没有本次新增的 request/done 控制区，也没有本次新增的 AIV 轮询等待算子。
 报告线程如何等待通知、Runtime 如何解除设备侧依赖，详见原 `_launch_host_func` 流程文档。
 
-### 4.2 当前 MTE 版
+### 4.2 早期 MTE 版（紧接发布便等待）
 
 捕获时交接位置记录发布和等待算子；重放时通过共享控制区通知新增工作线程：
 
@@ -414,7 +415,7 @@ BEGIN、SUBMITTED、COMPLETE，定位第一个未完成的操作。它会改变�
 正常关闭时先同步设备，确保图不再访问控制地址，再停止监控线程、结束设备访问租约、
 停止 worker、注销 Host 映射并释放内存。不能在图仍等待或访问控制区时先释放它。
 
-## 8. 已验证结果与当前边界
+## 8. 2026-10-22 的验证结果与当时边界
 
 独立测试已经覆盖 Host worker、注册内存、MTE 握手、图重放，以及实际路由/权重/映射传输链路。
 真实模型最初卡在第 1 层预取；分阶段诊断证明大权重拷贝完成，随后 scale Tensor 拷贝无法完成。
@@ -451,7 +452,7 @@ MTP 一步可以涉及多行 token，不能简单认为一个 token 就对应一
 `MteHostDispatcher.launch` 分配新的交接槽位。重放不重新执行这个 Python 方法，
 但 CPU 工作线程仍需每次执行内层卸载任务。
 
-## 10. 当前阻塞定位：旧版全 MTE 路径复现（2026-10-27）
+## 10. 历史阻塞定位：旧版全 MTE 路径复现（2026-10-27）
 
 可以这样向导师汇报：**共享内存轮询交接已经能够正常发布任务、唤起 CPU 工作线程；目前阻塞发生在 CPU 执行预取时，等待 `w13_weight_scale` 量化参数的设备任务完成。已经定位到具体操作，但它在设备侧无法完成的底层原因尚未证实。**
 
@@ -612,3 +613,172 @@ load_stream.synchronize()
 
 Host 扩展通过 pybind 暴露 `Session` 给 Python；设备算子动态库通过 `ctypes` 暴露 launch 包装。
 两者职责不同：前者管理 CPU 线程与共享信号，后者向指定设备流提交 kernel。
+
+## 12. 当前阻塞规避：提前发布预取，在消费者处严格等待（2026-10-30）
+
+### 12.1 问题边界与本次修改的目标
+
+旧全MTE方案在预取流上连续提交发布算子`host_sync_publish`和严格等待算子`host_sync_wait`。
+CPU工作线程收到请求后执行原权重加载；在真实模型中，量化参数`w13_weight_scale.copy_()`引出的
+加载流设备任务无法按时完成，工作线程卡在加载流同步，因而不能写回完成序号。
+后续Runtime日志把相应加载流任务进一步对应到Transpose布局转换算子；前面的主权重拷贝已经通过。
+因此不能再把现象笼统说成“w13主权重没有搬完”，也不能只凭`copy_`返回就认为其所有设备任务已完成。
+
+现有对照支持**预取AIV严格等待与真实模型并行执行的组合参与触发**：独立握手/拷贝图可以完成，
+延后等待可以完成真实请求；在映射同样延后的条件下，把严格等待恢复到早发布之后又复现加载同步超时。
+这把修改目标缩小到等待的执行位置，但尚未证明底层一定是算力资源互等、轮询访存争用或其他Runtime依赖。
+
+本次修复的目标是改变这段重叠关系，同时保留“真实权重和映射就绪后才允许消费者继续”的条件。
+它是一条经过有限验证的阻塞规避路径，不是通过跳过完成检查掩盖超时，也不是权重搬运算法重写。
+
+### 12.2 与旧方案相比，具体改了什么
+
+| 部分 | 旧全MTE早等待 | 当前消费者处等待 |
+| --- | --- | --- |
+| 预测路由回传、发布预取请求 | 提前进行 | 保持提前进行 |
+| CPU工作线程、专家选择、加载流 | 原MTE工作线程和SyncLaunchStream | 保持相同角色和原始拷贝路径 |
+| 预取AIV严格等待 | 紧接publish，可能与中间模型计算同时运行 | 先等主计算流到达消费者gate，再执行严格等待 |
+| 预取映射H2D写回 | 原预取入口中，等待之后 | 消费者gate之后、严格等待之后 |
+| 主流使用权重 | 等待预取done事件 | 仍等待done；done必须在映射写回之后 |
+| 按需交接 | 主流publish→strict wait | 保持原MTE按需交接 |
+
+当前没有追加CPU重排，没有把scale Tensor改成Storage字节搬运，也没有通过限核或有界轮询超时放行。
+主权重原本就通过Storage切片拷贝；这里“没有Storage适配”专指没有新增历史方案中的scale适配，
+并不表示所有权重都必须用Tensor接口。
+
+### 12.3 新流程需要知道的对象
+
+- 方法`MteHostDispatcher.defer_prefetch`：捕获时记录这一层的提前发布和待完成的映射写回。
+- 方法`publish_for_join`：提交发布算子并返回Python令牌`token`，令牌用于找到同一交接槽位的等待信息。
+  它不是传给NPU的新flag；跨CPU/NPU的信号仍是注册Host内存中的request/done generation。
+- 字典`deferred_prefetch`和`deferred_waits`：捕获期间保存尚未配对的预取及等待记录，不是每轮重放都要CPU查表。
+- 事件对象`gate`：记录在主计算流上，表示该流已经执行完消费者之前的任务；这是流顺序事件，
+  与模型中计算专家路由的gate网络是两个概念。
+- 事件对象`done`：在预取流完成严格等待和映射写回之后记录，供主流等待。
+- 方法`finish_prefetch_at_join`：在消费者位置补上gate、严格等待、映射写回和done节点。
+
+`gate`和`done`进入同一张捕获图；重放时这些依赖由NPU执行。新增的是图内事件依赖与捕获记录，
+不是每次重放唤醒一个新CPU线程，也不是把完整Python流程重新执行一遍。
+
+### 12.4 按八步串起CPU与NPU的实际流程
+
+**第一步：初始化角色和控制内存。** 卸载管理器`ExpertOffloadManager`创建加载流`SyncLaunchStream`，
+交接管理器`MteHostDispatcher`创建注册Host控制区、NPU状态张量和常驻C++工作线程。
+这些机制沿用当前MTE基线；本次晚等待没有改变request/done协议或为预取额外创建线程。
+
+**第二步：捕获时提前发布预取。** 方法`_dispatch_prefetch`在预测路由已经回传、原有ready事件已满足的位置，
+调用方法`defer_prefetch`。后者通过方法`publish_for_join`登记回调、参数和交接槽位，
+向原预取流提交发布算子`host_sync_publish`。此处返回，不立即提交严格等待、映射写回或done事件。
+预测及预取启动位置仍然提前，不能把“晚等”理解为“晚开始搬权重”。
+
+**第三步：在消费者位置记录主流gate。** 下一层外层方法`update_weights`调用方法
+`finish_prefetch_at_join`。它在主计算流上记录事件`gate`，表示此前模型操作的完成边界。
+随后在原预取流提交对`gate`的等待。这个步骤使预取AIV等待在主流到达这一位置后才具备执行条件。
+
+**第四步：补齐预取完成依赖。** 方法`wait_for_join`使用第二步的令牌找到同一个交接槽位，
+仍在原预取流提交严格等待算子`host_sync_wait`。其后调用Tensor方法`destination.copy_(source)`，
+把CPU维护的`log2phy_h`映射写回该层NPU映射；然后记录事件`done`。
+外层方法`update_weights`沿用原有的预取事件汇合逻辑，让主流等待`done`。
+至此捕获结构为`预取流等gate→严格wait→映射写回→record done`，主流为`record gate→wait done`。
+
+**第五步：重放时NPU和CPU并行推进。** NPU重放到第二步的发布节点，写入本轮request generation；
+常驻C++工作线程轮询到变化，获取GIL，执行Python方法`MteHostDispatcher._run`，
+再进入预取任务函数`_prefetch_host_cb`和内层方法`_update_weights`。
+与此同时，主计算流可以执行发布位置与消费者gate之间的模型任务；预取流此时先受gate事件约束，
+还没有提前进入长期驻留的AIV严格等待。
+
+**第六步：CPU提交并确认真实权重加载。** 内层方法`_update_weights`仍按缓存策略选专家与槽位，
+调用原加载路径提交主权重、scale等任务。方法`_synchronize_h2d`仍等待加载流实际完成，
+包括Tensor拷贝所需的设备布局转换。CPU任务成功完成后，会话类`Session`才发布对应done generation。
+启用`cpp` LRC时，仅策略的observe、评分/淘汰与状态计算进入C++，加载任务及该同步条件保持不变。
+
+**第七步：消费者到达后检查完成并发布映射。** 主流到达gate，预取流的gate等待解除，
+AIV严格等待开始检查本轮done generation。若CPU已经完成则很快通过；若仍未完成则继续严格等待。
+因此等待只是换了位置，并没有被删除。只有该等待通过后，NPU才执行映射H2D并记录done事件。
+
+**第八步：按需补齐，再执行专家计算。** 主流观察到done后，继续处理该层实际路由和按需交接。
+实际需要但预取未加载的专家仍由原按需`_update_weights`处理；按需MTE路径保持publish、严格wait、
+映射写回的原顺序。主流完成这些条件后才执行专家计算，随后进入下一层的预取/按需周期。
+
+第二至第四步描述捕获时的Python建图过程，第五至第八步描述重放时的执行。
+CPU完成信号可能早于或晚于主流到达gate；图内依赖在两种情况下都要求权重和映射就绪后再消费。
+
+### 12.5 时间线与不会反向相等的依赖
+
+```text
+旧早等待（省略细节）
+主计算流：路由/预测 ───── 中间模型计算 ───── 等预取done ─→ 按需/专家计算
+预 取 流：等ready → publish → [AIV严格等CPU] → 映射H2D → record done
+CPU worker：             选专家 → 提交权重 → 等加载流完成 → 写done generation
+
+当前晚等待
+主计算流：路由/预测 ───── 中间模型计算 ───── record gate → wait done ─→ 按需/专家计算
+预 取 流：等ready → publish → wait gate ────────────────→ strict wait → 映射H2D → record done
+CPU worker：             选专家 → 提交权重 → 等加载流完成 → 写done generation
+加载流：                          主权重/scale H2D及原有布局转换
+```
+
+新增依赖是“主流先记录gate，再等待预取done”。因此没有把gate放到主流的wait done之后，
+避免构造“主流等done、预取流等尚未记录的gate”的显式依赖环。
+两个事件都在同一捕获范围内建立；代码还检查目标层、原始预取流、令牌是否重复/过期和捕获结束时是否仍有未汇合记录。
+事件对象在Dispatcher中保留，防止捕获后立即失去引用。共享预取暂存区在前一任务未汇合时不允许第二个生产者覆盖。
+这些检查保证修改后的顺序可以审查，不替代真实NPU上的正确性验证。
+
+### 12.6 代码调用链与开启方式
+
+```text
+图捕获包装 ACLGraphWrapper
+  → MteHostDispatcher.prefetch_join_capture()
+  → 预取触发 → ExpertOffloadManager._dispatch_prefetch()
+      → MteHostDispatcher.defer_prefetch()
+          → publish_for_join() → _publish_task() → host_sync_publish_launch()
+  → 消费者外层 ExpertOffloadManager.update_weights()
+      → finish_prefetch_at_join()
+          → 主流record gate → 预取流wait gate
+          → wait_for_join() → host_sync_wait_strict_launch()
+          → log2phy映射copy_ → 预取流record done
+      → 主流wait done → 原按需交接 → 专家计算
+
+每次重放的CPU任务：Session工作线程
+  → MteHostDispatcher._run() → _prefetch_host_cb() → _update_weights()
+  → 选专家/构造加载任务 → TorchCopyH2DTransport.copy_batch()
+  → _synchronize_h2d() → 成功后发布done generation
+```
+
+相关实现位于[host_sync.py](../vllm_ascend/expert_offload/host_sync.py)、
+[expert_offload_manager.py](../vllm_ascend/expert_offload/expert_offload_manager.py)和
+[acl_graph.py](../vllm_ascend/compilation/acl_graph.py)。
+需要显式选择`host_sync_backend=mte`和`host_sync_diagnose_prefetch_wait_at_join=true`；
+默认后端仍为callback，单独选择mte也不自动打开晚等待。
+当前实验不启用`host_sync_diagnose_prefetch_wait_before_gate`，后者是恢复早等待的诊断对照。
+配置限制为单卡、现有fate预取与完整图捕获，不允许混用报告等待、有限轮询放行、限核或scale改写。
+
+### 12.7 当前copy_submit：调用内容相同，提交上下文不同
+
+计时段`copy_submit`包住原Torch搬运后端逐项提交任务的过程。两组都走原主权重Storage切片与
+scale Tensor的`copy_`，不会因打开C++ LRC就换成C++拷贝实现。
+回调版由Torch/CANN报告线程调用，加载流是普通`Stream`；MTE版由常驻工作线程调用，
+加载流是`SyncLaunchStream`。
+
+torch_npu开启Host任务队列时，普通流的异步拷贝可以先入队，由后台提交线程向Runtime下发；
+SyncLaunchStream则由当前调用线程直接调用相应Runtime接口。算子提交也有相同的分支，
+因此Tensor拷贝可能需要的布局转换在Host端的提交工作，也会影响该计时段。
+依据为torch_npu 2.10的[异步拷贝提交实现](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/core/npu/interface/AsyncTaskQueueInterface.cpp#L80-L103)
+与[算子提交实现](https://github.com/Ascend/pytorch/blob/v2.10.0/torch_npu/csrc/framework/OpCommand.cpp#L169-L212)。
+服务器使用`2.10.0.post4.dev20260715`构建，上述公开源码解释提交机制，不代替对该构建每项耗时的实测归因。
+
+所以两组`copy_submit`都是调用线程的墙钟时间，但包含的入队/直接提交工作可能不同；
+它不是设备上的MEMCPY持续时间。两组都仍通过`_synchronize_h2d()`确认设备任务完成。
+当前实测提交增加、后续等待减少，符合这类计时分布差异的可能性，不能据此把全部增量归因于队列，
+也不能忽略提交＋等待仍存在的差异。
+
+### 12.8 已验证内容和仍待确认的内容
+
+三种输入各32个生成token的callback/MTE对照，在图调试转储开启和关闭的两轮中均输出摘要、usage一致。
+最新短profile对照则为每组3次预热、1次测量，`max_tokens=5`；两组均完成请求并导出可视化。
+该轮两组均为Python LRC，回调请求3185.172ms、MTE请求3229.634ms；不能说已获得端到端收益。
+这些数据支持当前路径在有限负载下能推进且与基线输出一致，不覆盖所有输入、捕获尺寸和长期运行；
+部分结束阶段异常与具体底层资源依赖仍未解释。
+
+下一轮将两组同时设为已验证的`cpp` LRC，保留原权重路径，以同一负载比较callback与晚等待MTE。
+运行入口及结果判读见[实测记录的C++ LRC对照章节](moe_mte_reassessment_20261029_zh.md#17-开启cpp-lrc后的回调与晚等待mte对照2026-10-30)。

@@ -15,13 +15,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
-from inspect_moe_profile import scan_trace
+from inspect_moe_profile import positive_gap_us, scan_trace
 from inspect_mte_runtime_task import inspect_run
 from mte_join_cost import prepare_cost_source, print_cost_comparison
 from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, run_step
 from run_host_sync_stage2 import target_cmake_args
 from run_host_sync_stage3 import select_build_directory
-from run_verified_cpp_tests import VERIFICATION_MAX_TOKENS, VERIFICATION_PROMPTS, SummaryTee, inference, launch_spec
+from run_verified_cpp_tests import (
+    VERIFICATION_MAX_TOKENS,
+    VERIFICATION_PROMPTS,
+    SummaryTee,
+    inference,
+    launch_spec,
+    progress,
+)
 
 MAX_ENGINE_ERROR_LINE_CHARS = 800
 
@@ -210,9 +217,11 @@ def failure_excerpt(text):
     )
 
 
-def assess_profile_report(report, service_log, profile_dir=None, *, require_mte=False):
+def assess_profile_report(
+    report, service_log, profile_dir=None, *, require_mte=False, retain_trace_data=False, large_gap_us=None
+):
     """Request success and an exported filename do not validate profiler output."""
-    errors, warnings, checks = [], [], []
+    errors, warnings, checks, trace_data = [], [], [], []
     for line in service_log.splitlines():
         if "profiler.py" in line and "run failed" in line:
             errors.append(line.strip()[:500])
@@ -227,7 +236,11 @@ def assess_profile_report(report, service_log, profile_dir=None, *, require_mte=
             errors.append("No exported trace_view.json despite completed export")
         for path in traces:
             try:
-                check = scan_trace(path, require_mte=require_mte)
+                options = {} if large_gap_us is None else {"large_gap_us": large_gap_us}
+                with progress(f"stream profile intervals: {path}") if retain_trace_data else contextlib.nullcontext():
+                    check = scan_trace(path, require_mte=require_mte, **options)
+                if retain_trace_data:
+                    trace_data.append(dict(file=str(path), **check))
                 checks.append(
                     dict(
                         file=str(path),
@@ -248,6 +261,8 @@ def assess_profile_report(report, service_log, profile_dir=None, *, require_mte=
     report["profile_errors"] = list(dict.fromkeys(errors))[:4]
     report["profile_warnings"] = list(dict.fromkeys(warnings))[:4]
     report["profile_checks"] = checks
+    if retain_trace_data:
+        report["profile_trace_data"] = trace_data
     report["engine_error_seen"] = "EngineDeadError" in service_log
     report["engine_error_log_positions"] = engine_error_log_positions(service_log)
     return report
@@ -352,7 +367,7 @@ def prepare_runtime_artifacts(source, target):
     print(f"Runtime artifacts: copied missing files={copied}; existing files preserved; source={source}", flush=True)
 
 
-def main():
+def parse_args(argv=None, *, profile_compare=False):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--compare-join-cost",
@@ -361,6 +376,9 @@ def main():
     )
     parser.add_argument("--npu", type=npu_number, required=True)
     parser.add_argument("--backend", choices=("both", "callback", "mte"), default="both")
+    parser.add_argument(
+        "--cache-policy-backend", choices=("python", "cpp"), default="python", help="LRC observe/choose implementation"
+    )
     parser.add_argument("--worker-scan", choices=("all", "allocated"), default="all")
     parser.add_argument("--worker-probe", choices=("locked", "atomic"), default="locked")
     parser.add_argument("--worker-idle", choices=("yield", "spin"), default="yield")
@@ -436,18 +454,21 @@ def main():
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=300)
     parser.add_argument("--profile-timeout", type=int, default=120)
+    if profile_compare:
+        parser.add_argument("--large-gap-us", type=positive_gap_us, default=100.0)
     parser.add_argument("--port", type=int)
     parser.add_argument("--timing-port", type=int, default=18155)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    args.profile_compare = profile_compare
     if args.requests is None:
-        args.requests = 10 if args.compare_join_cost else 3
+        args.requests = 1 if profile_compare else (10 if args.compare_join_cost else 3)
     if args.warmup_requests is None:
-        args.warmup_requests = 3 if args.compare_join_cost else 1
-    if args.compare_join_cost:
+        args.warmup_requests = 3 if args.compare_join_cost or profile_compare else 1
+    if args.compare_join_cost or profile_compare:
         conflicts = [name for name, value in vars(args).items() if name.startswith("diagnose_") and value]
         if (
             conflicts
@@ -455,12 +476,13 @@ def main():
             or args.trace_startup
             or args.backend != "both"
             or (args.worker_scan, args.worker_probe, args.worker_idle) != ("all", "locked", "yield")
+            or (profile_compare and (args.compare_join_cost or args.skip_profile or args.cache_policy_backend != "cpp"))
         ):
-            parser.error("join cost preset requires both backends and original worker policy; no diagnosis switches")
+            parser.error("comparison requires both backends and original worker policy; no diagnosis switches")
         args.diagnose_prefetch_wait_at_join = True
         args.no_load_diagnostics = True
         args.no_graph_dump = True
-        args.skip_profile = True
+        args.skip_profile = not profile_compare
     if args.diagnose_prefetch_wait_before_gate and not (
         args.backend == "mte"
         and args.diagnose_prefetch_wait_at_join
@@ -469,7 +491,9 @@ def main():
         and not args.verification_suite
     ):
         parser.error("early-wait diagnosis requires MTE, join capture, graph dump and no load diagnostics")
-    if args.no_graph_dump and (args.diagnose_graph_dump or not (args.verification_suite or args.compare_join_cost)):
+    if args.no_graph_dump and (
+        args.diagnose_graph_dump or not (args.verification_suite or args.compare_join_cost or profile_compare)
+    ):
         parser.error("--no-graph-dump requires --verification-suite or cost mode; conflicts with graph dump")
     if args.trace_startup and (args.backend not in ("mte", "both") or not args.diagnose_prefetch_wait_at_join):
         parser.error("--trace-startup requires MTE and --diagnose-prefetch-wait-at-join")
@@ -516,6 +540,11 @@ def main():
         parser.error("Run inside the Linux NPU container")
     if min(args.requests, args.warmup_requests, args.startup_timeout, args.request_timeout, args.profile_timeout) < 1:
         parser.error("Counts/timeouts must be positive")
+    return args
+
+
+def main():
+    args = parse_args()
     root = (args.output_dir or REPOSITORY_ROOT / "bench_results" / f"moe_host_sync_{uuid4().hex[:8]}").resolve()
     root.mkdir(parents=True, exist_ok=False)
     with (
@@ -529,7 +558,7 @@ def main():
             return run(args, root)
         except Exception as exc:
             print(f"FAILED: {type(exc).__name__}: {exc}", flush=True)
-            for log in root.glob("*/inference_python.log"):
+            for log in root.glob(f"*/inference_{args.cache_policy_backend}.log"):
                 print(
                     f"SERVICE LOG TAIL: {log}\n" + failure_excerpt(log.read_text(encoding="utf-8", errors="replace")),
                     flush=True,
@@ -543,6 +572,10 @@ def main():
 
 
 def run(args, root):
+    cache_policy_backend = getattr(args, "cache_policy_backend", "python")
+    profile_compare = getattr(args, "profile_compare", False)
+    if cache_policy_backend not in ("python", "cpp"):
+        raise ValueError("Only Python or verified C++ LRC is supported")
     if getattr(args, "trace_startup", False):
         for name in ("test_mte_startup_bootstrap.py", "test_startup_diagnostics.py"):
             if not run_step(
@@ -552,6 +585,27 @@ def run(args, root):
                 return 1
     if args.runtime_source is not None:
         prepare_runtime_artifacts(args.runtime_source, REPOSITORY_ROOT)
+    if cache_policy_backend == "cpp":
+        for label, command in (
+            (
+                "build verified C++ LRC extension",
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "./csrc/lrc_policy",
+                    "--no-build-isolation",
+                    "--no-deps",
+                ],
+            ),
+            (
+                "required C++ LRC parity",
+                [sys.executable, "-B", "tests/ut/expert_offload/test_lrc_cpp.py", "--require-cpp"],
+            ),
+        ):
+            if not run_step(label, command, 600):
+                return 1
     backends = ("callback", "mte") if args.backend == "both" else (args.backend,)
     build = select_build_directory(None, False)
     library = build / "lib/libhost_sync_device.so"
@@ -599,9 +653,9 @@ def run(args, root):
                 return 1
     source = args.test_script.read_text(encoding="utf-8")
     cost_mode = getattr(args, "compare_join_cost", False)
-    if cost_mode:
+    if cost_mode or profile_compare:
         source = prepare_cost_source(source)
-    _, command, _, _ = launch_spec(source, "python", args.npu, args.port, args.timing_port)
+    _, command, _, _ = launch_spec(source, cache_policy_backend, args.npu, args.port, args.timing_port)
     port = int(command[command.index("--port") + 1])
     if not 1024 <= port <= 65535 or not 1024 <= args.timing_port <= 65535 or port == args.timing_port:
         raise ValueError("Use distinct serve/timing ports in 1024..65535")
@@ -609,7 +663,7 @@ def run(args, root):
     env = os.environ.copy()
     env["ASCEND_RT_VISIBLE_DEVICES"] = str(args.npu)
     print(
-        "REAL MOE: LRC=python in both groups; model/MTP/prefetch configuration inherited from test_graph2.sh",
+        f"REAL MOE: LRC={cache_policy_backend} in both groups; model/MTP/prefetch inherited from test_graph2.sh",
         flush=True,
     )
     print(
@@ -636,6 +690,7 @@ def run(args, root):
             mstx=not cost_mode,
             skip_profile=args.skip_profile,
             compare_join_cost=cost_mode,
+            profile_compare=profile_compare,
             trace_startup=getattr(args, "trace_startup", False) and backend == "mte",
             verification_suite=getattr(args, "verification_suite", False),
         )
@@ -674,13 +729,23 @@ def run(args, root):
                 getattr(args, "no_graph_dump", False),
                 getattr(args, "diagnose_prefetch_wait_before_gate", False),
             ),
-            "python",
+            cache_policy_backend,
             env,
         )
-        log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
+        log = (directory / f"inference_{cache_policy_backend}.log").read_text(encoding="utf-8", errors="replace")
         assess_profile_report(
-            reports[backend], log, root / "profile" / backend / "python", require_mte=backend == "mte"
+            reports[backend],
+            log,
+            root / "profile" / backend / cache_policy_backend,
+            require_mte=backend == "mte",
+            retain_trace_data=profile_compare,
+            large_gap_us=getattr(args, "large_gap_us", None) if profile_compare else None,
         )
+        reports[backend].update(
+            host_backend=backend, cache_policy_backend=cache_policy_backend, load_backend="python", h2d_backend="torch"
+        )
+        if profile_compare:
+            (directory / "profile_report.json").write_text(json.dumps(reports[backend]), encoding="utf-8")
         if cost_mode:
             # Preserve each completed group before comparing results or starting
             # the next service, so a later failure does not lose measurements.
@@ -707,7 +772,9 @@ def run(args, root):
                 if "[MOE-MTE WAIT_CONTROL]" not in log:
                     raise RuntimeError("Missing evidence that prefetch report-wait control was used")
             if args.diagnose_load_stages or args.diagnose_prefetch_poll_budget:
-                print(f"DIAGNOSTIC EXCERPT (full log: {directory / 'inference_python.log'}):", flush=True)
+                print(
+                    f"DIAGNOSTIC EXCERPT (full log: {directory / f'inference_{cache_policy_backend}.log'}):", flush=True
+                )
                 print(failure_excerpt(log), flush=True)
             if "[MOE-MTE] first real offload callback completed" not in log:
                 raise RuntimeError("No evidence that real offload callbacks executed through MTE")
@@ -716,6 +783,7 @@ def run(args, root):
             + json.dumps(
                 {
                     "host_backend": backend,
+                    "cache_policy_backend": cache_policy_backend,
                     "request_mean_us": reports[backend]["request_us"],
                     "digests": reports[backend]["digests"],
                     "usage": reports[backend]["usage"],
@@ -733,7 +801,7 @@ def run(args, root):
             ),
             flush=True,
         )
-    if cost_mode:
+    if cost_mode or profile_compare:
         return reports
     if getattr(args, "verification_suite", False):
         compare_verification_reports(reports)

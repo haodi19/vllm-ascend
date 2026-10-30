@@ -513,7 +513,7 @@ def _inference(args, source, backend, env, log):
         report["request_specs"] = request_specs
         if untimed is not None:
             report["untimed"] = untimed
-        if getattr(args, "mstx", False) and profile_enabled:
+        if getattr(args, "mstx", False) and profile_enabled and not getattr(args, "profile_compare", False):
             report["mstx_trace_occurrences"] = inspect_mstx_trace(profile_dir)
             if profile_status == "complete":
                 analyze = runpy.run_path(str(REPO / "script/analyze_callback_gaps.py"))["analyze"]

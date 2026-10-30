@@ -51,12 +51,12 @@ class MoeProfileAuditTests(unittest.TestCase):
             dict(name="process_name", ph="M", pid="100", args=dict(name="Ascend Hardware")),
         ]
 
-    def scan(self, data, *, require_mte=True, wrapped=False):
+    def scan(self, data, *, require_mte=True, wrapped=False, large_gap_us=None):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.json"
             value = dict(traceEvents=data, displayTimeUnit="ms") if wrapped else data
             path.write_text(json.dumps(value), encoding="utf-8")
-            return self.module.scan_trace(path, require_mte=require_mte)
+            return self.module.scan_trace(path, require_mte=require_mte, large_gap_us=large_gap_us)
 
     def test_bare_and_wrapped_events_with_metadata_last(self):
         for wrapped in (False, True):
@@ -253,6 +253,110 @@ class MoeProfileAuditTests(unittest.TestCase):
         with patch.object(self.module, "MAX_INTERVALS", 8), self.assertRaises(ValueError):
             self.scan(self.trace())
 
+    def test_large_memcpy_gaps_keep_full_stats_and_include_threshold_equality(self):
+        data = self.without_copies()
+        data.extend(
+            self.memcpy(100, 21, start, duration)
+            for start, duration in ((0, 10), (5, 2), (10, 10), (70, 10), (180, 10), (390, 10))
+        )
+        original = self.scan(data)["memcpy_gaps"][0]
+        filtered = self.scan(data, large_gap_us=100)["memcpy_gaps"][0]
+        self.assertEqual({key: filtered[key] for key in original}, original)
+        self.assertEqual(filtered["count"], 4)  # Zero/50/100/200; overlap remains excluded.
+        self.assertEqual(filtered["overlaps_excluded"], 1)
+        self.assertEqual(filtered["large_gap_threshold_us"], 100)
+        self.assertEqual(filtered["large_gap_fraction"], 0.5)
+        self.assertEqual(
+            filtered["large_gaps"],
+            dict(count=2, total_us=300, mean_us=150, p50_us=150, p95_us=195, max_us=200),
+        )
+        self.assertNotIn("large_gaps", original)
+
+    def test_large_host_gaps_remain_separate_by_direction(self):
+        data = [event for event in self.trace() if not event["name"].startswith("moe_offload/")]
+        for call, start in enumerate((10, 50, 170, 390, 415, 535), start=1):
+            kind = "prefetch" if call % 2 else "reactive"
+            for name, offset, duration in (("host_callback", 0, 20), ("update_weights", 2, 15)):
+                data.append(
+                    dict(
+                        name=f"moe_offload/{name}|call={call}|kind={kind}|layer=1",
+                        ph="X",
+                        pid=7,
+                        tid=9,
+                        ts=start + offset,
+                        dur=duration,
+                    )
+                )
+        original = {item["direction"]: item for item in self.scan(data)["host_gaps"]}
+        filtered = {item["direction"]: item for item in self.scan(data, large_gap_us=100)["host_gaps"]}
+        self.assertEqual(set(original), set(filtered))
+        for direction, values in original.items():
+            self.assertEqual({key: filtered[direction][key] for key in values}, values)
+        first, second = filtered["prefetch->reactive"], filtered["reactive->prefetch"]
+        self.assertEqual(first["count"], 3)
+        self.assertEqual(first["large_gaps"]["count"], 2)
+        self.assertEqual(first["large_gaps"]["total_us"], 300)
+        self.assertEqual(first["large_gap_fraction"], 2 / 3)
+        self.assertEqual(second["count"], 2)
+        self.assertEqual(second["large_gaps"]["count"], 1)
+        self.assertEqual(second["large_gaps"]["total_us"], 100)
+        self.assertEqual(second["large_gap_fraction"], 0.5)
+
+    def test_large_gap_zero_matches_and_no_samples_are_distinct(self):
+        report = self.scan(self.trace(), large_gap_us=100)
+        host, copy_gap = report["host_gaps"][0], report["memcpy_gaps"][0]
+        self.assertEqual(host["count"], 1)
+        self.assertEqual(host["large_gap_fraction"], 0)
+        self.assertEqual(copy_gap["count"], 0)
+        self.assertIsNone(copy_gap["large_gap_fraction"])
+        for gap in (host, copy_gap):
+            self.assertEqual(gap["large_gaps"]["count"], 0)
+            self.assertEqual(gap["large_gaps"]["total_us"], 0)
+            self.assertIsNone(gap["large_gaps"]["mean_us"])
+            self.assertIsNone(gap["large_gaps"]["p95_us"])
+        data = self.trace()
+        data[2]["ts"], data[3]["ts"] = 20, 22
+        overlap = self.scan(data, large_gap_us=100)["host_gaps"][0]
+        self.assertEqual(overlap["overlaps_excluded"], 1)
+        self.assertIsNone(overlap["large_gap_fraction"])
+
+    def test_invalid_large_gap_threshold_fails_before_reading_trace(self):
+        for value in (0, -1, float("nan"), float("inf"), float("-inf"), True, "bad"):
+            with (
+                self.subTest(value=value),
+                patch.object(self.module, "events", side_effect=AssertionError("Must validate before file read")),
+                self.assertRaisesRegex(ValueError, "正的有限"),
+            ):
+                self.module.scan_trace("does-not-exist.json", large_gap_us=value)
+
+    def test_cli_large_gap_threshold_is_shared_by_both_backends(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for backend in ("callback", "mte"):
+                path = root / "profile" / backend / "python/worker/trace_view.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(self.trace()), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = self.module.main([str(root), "--gaps-only", "--large-gap-us", "20"])
+            self.assertEqual(code, 0)
+            host_rows, copy_rows = [], []
+            for line in output.getvalue().splitlines():
+                if line.startswith("HOST_CALLBACK_GAP "):
+                    host_rows.append(json.loads(line.split(" ", 1)[1]))
+                elif line.startswith("MEMCPY_GAP "):
+                    copy_rows.append(json.loads(line.split(" ", 1)[1]))
+            self.assertEqual(len(host_rows), 2)
+            self.assertEqual(len(copy_rows), 2)
+            self.assertTrue(all(row["large_gap_threshold_us"] == 20 for row in host_rows + copy_rows))
+            self.assertTrue(all(row["large_gaps"]["count"] == 1 for row in host_rows))
+            self.assertIn("仅按时长 >= 阈值筛选", output.getvalue())
+
+    def test_cli_rejects_nonpositive_and_nonfinite_large_gap_threshold(self):
+        for text in ("0", "-2", "nan", "inf", "abc"):
+            with self.subTest(text=text), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.module.main(["unused", f"--large-gap-us={text}"])
+
     def test_gaps_only_keeps_results_without_verbose_tracks_or_logs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -313,6 +417,34 @@ class MoeProfileAuditTests(unittest.TestCase):
             contexts = self.module.service_warning_context(root / "mte/inference_python.log")
             self.assertEqual(len(contexts), 2)
             self.assertTrue(all(len(context["context"]) <= 5 for context in contexts))
+
+    def test_cli_selects_cpp_profile_and_logs_and_keeps_python_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            for backend in ("callback", "mte"):
+                for policy in ("python", "cpp"):
+                    path = root / "profile" / backend / policy / "worker/trace_view.json"
+                    path.parent.mkdir(parents=True)
+                    path.write_text(json.dumps(self.trace()), encoding="utf-8")
+            for options, policy in (([], "python"), (["--cache-policy-backend", "cpp"], "cpp")):
+                with (
+                    self.subTest(policy=policy),
+                    contextlib.redirect_stdout(io.StringIO()),
+                    patch.object(self.module, "scan_trace", wraps=self.module.scan_trace) as scan,
+                    patch.object(self.module, "service_warning_context", return_value=[]) as warnings,
+                ):
+                    self.assertEqual(self.module.main([str(root), *options]), 0)
+                    self.assertEqual(
+                        [call.args[0] for call in scan.call_args_list],
+                        [
+                            root / "profile" / backend / policy / "worker/trace_view.json"
+                            for backend in ("callback", "mte")
+                        ],
+                    )
+                    self.assertEqual(
+                        [call.args[0] for call in warnings.call_args_list],
+                        [root / backend / f"inference_{policy}.log" for backend in ("callback", "mte")],
+                    )
 
 
 if __name__ == "__main__":

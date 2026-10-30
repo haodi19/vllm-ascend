@@ -5,11 +5,12 @@
 HEAD 为 `ce6900977e6a25377cd11205e3613ec2ec0208a4`。最初编写时未收到辅助流单组补跑结果；
 另一对话中该组已通过短请求，现已合并到第14节，不能继续把它当作未执行实验。
 
-**最新：第16节的callback/晚wait MTE采集均完成请求和stop，原加载阻塞未复现。
-load_prepare接近原版；提交＋等待均值仍有小幅差异。正在离线核对已有profile，避免重跑模型。**
+**最新：第16节的callback/晚wait MTE采集均完成请求和stop，原加载阻塞未复现，用户已能查看profile。
+load_prepare接近原版；提交＋等待均值仍有小幅差异。第17节准备两组同时启用C++ LRC的新对照，
+包括大间隔阈值统计，尚待绿区结果；不是再次修改权重搬运或等待协议。**
 根因仍未证实，停止继续枚举核数。等待位置实验检验“等待与消费者之前的真实模型计算重叠”
 是否参与触发，不能直接区分资源调度、模型算子内部停滞和轮询访存影响。
-第1–15节保留实验设计、运行命令与取证记录；当前判断以第16节为准。
+第1–15节保留实验设计、运行命令与取证记录；最新实测见第16节，待执行实验见第17节。
 
 ## 1. 原项目与当前改造的完整顺序
 
@@ -887,3 +888,85 @@ python -B script/inspect_moe_profile.py bench_results/mte_join_profile_01 --gaps
 
 Host回调间隔和设备拷贝间隔分别使用自己的时间轴；其中可能有其他计算或传输，均不直接解释为
 整个NPU空闲或纯CPU–NPU同步开销。当前只扩展离线统计，不改MoE运行机制。
+
+## 17. 开启cpp LRC后的回调与晚等待MTE对照（2026-10-30）
+
+### 17.1 实验目的与固定条件
+
+此前最新profile两组均使用Python LRC。本轮将两组同时切到已验证的`cpp`策略，
+比较原callback交接与消费者处严格等待的MTE交接，观察分项时延及时间线间隔。
+`cpp`包含observe、choose_victims及其配套状态管理；没有开启`cpp_fused`融合规划、
+C++ load_submit或ACL搬运实验。原Python策略仍可选，原callback运行机制没有被替换。
+
+当前晚等待修复的CPU/NPU八步流程、事件保护和copy_submit差异，已详细补入
+[MTE交接流程第12节](moe_mte_handoff_flow_zh.md#12-当前阻塞规避提前发布预取在消费者处严格等待2026-10-30)。
+这次仅扩展实验运行器与统计，不改变该修复的设备协议、权重布局或加载方法。
+
+| 项目 | 两组设置 |
+| --- | --- |
+| 输入与生成 | 原短提示词，temperature=0，max_tokens=5 |
+| 预热/测量 | 每组3次预热、1次采集请求；预热不进入profile |
+| LRC | cpp，先构建独立扩展并强制通过Python/C++策略一致性检查 |
+| 模型、MTP、预取层数和容量 | 读取指定test_graph2.sh的实际配置，不另设一套模型参数 |
+| 权重准备与搬运 | 原Python任务准备＋Torch拷贝，无新增CPU重排/scale Storage适配 |
+| MTE工作线程 | all/locked/yield，保持上一轮，不混入其它worker优化 |
+| 诊断干预 | 关闭Runtime DEBUG、图转储、逐项加载诊断、限核和调试打印 |
+| 采集 | 开启MSTX、内部计时和torch profiler；两组顺序运行，各保存独立profile |
+
+默认只采集一个请求，是为了减少把多个HTTP请求之间的停顿纳入大间隔统计；
+这也保持与上一轮短profile一致。可通过`--requests`增加数量，但整个采集窗口的间隔统计
+会包含请求边界，不会自动只保留层内/层间时间。该轮端到端仍含采集扰动，不是无profiler的稳定性能验收。
+
+### 17.2 一次执行
+
+绿区同步提交后，在worker-poll仓库中执行；脚本内部没有Git操作：
+
+```bash
+python -B script/run_cpp_mte_profile_compare.py --npu 7 \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --large-gap-us 100 \
+  --output-dir bench_results/cpp_mte_profile_01
+```
+
+物理NPU编号可修改，输出目录须未存在。默认停止/导出预算120秒，超时保留已测时延和已产生文件，
+清理自己启动的服务后继续另一组，不伪造缺失的profile统计。扩展构建或策略一致性检查失败则不启动模型。
+完整构建/推理详情保留在绿区日志，关键数据在输出目录`summary.txt`，只需复制经检查的该文件文本。
+
+两个profile分别位于：
+
+```text
+bench_results/cpp_mte_profile_01/profile/callback/cpp/<worker>_ascend_pt/
+bench_results/cpp_mte_profile_01/profile/mte/cpp/<worker>_ascend_pt/
+```
+
+本轮保持原trace_view.json供MindStudio查看，不额外复制一份带人工overlay的完整时间线。
+服务日志名为`inference_cpp.log`，其中cpp表示LRC策略；父目录callback或mte才表示交接方式。
+通用运行器也新增`--cache-policy-backend cpp`，不指定时仍默认python。
+
+### 17.3 大间隔筛选与数据判读
+
+参数`--large-gap-us 100`的精确定义是：仅把**长度大于等于100μs**的间隔纳入大间隔子集。
+两组使用相同阈值，继续保留全部间隔的样本数/均值/p50/p95/最大值；额外打印大间隔数量、
+占全部间隔的比例、累计时长及其均值/分位数。某组无大间隔时数量为0、均值为空，不能写成0μs均值收益。
+因为有些间隔优化后会落到阈值以下，不能只比较剩下的大间隔均值而忽略数量变化。
+
+阈值可以滤掉多数批次内部的小间隔，但并不识别权重批次。较慢的批次内间隔仍可能被选中，
+较快的真实批次边界也可能被排除；MEMCPY统计仍按实际设备进程和流分别输出。
+Host的两个方向依然单独统计。它们是时间线区间统计，不能直接写成纯同步开销或整卡空闲时间。
+
+同一脚本会给出请求时间、输出摘要/usage一致性、按预取/按需及token_rows分组的回调分项表，
+包括observe、choose_victims、load_prepare、copy_submit、scale_refresh、load_submit、synchronize、
+内层total与外围指标，另计算load_submit+synchronize的均值。p95不通过分项相加推导。
+两组计时错误、样本丢失、输出不一致须明确失败；工作量摘要不同则不作为等工作量收益结论。
+profile导出或解析失败与已经取得的CPU计时分别报告。
+
+已有profile也可用不同阈值重新离线统计，无需重跑模型：
+
+```bash
+python -B script/inspect_moe_profile.py bench_results/cpp_mte_profile_01 \
+  --cache-policy-backend cpp --gaps-only --large-gap-us 100
+```
+
+本节记录实验配置与执行方式；当前新一轮C++ LRC＋晚等待MTE的绿区结果尚未返回，
+不把之前Python LRC数据标成此次C++实验结果。
