@@ -270,6 +270,10 @@ class PrefetchJoinTests(unittest.TestCase):
             "host_sync_library": str(Path(__file__).resolve()),
         }
         self.module.validate_host_sync_config(valid)
+        self.module.validate_host_sync_config({**valid, "host_sync_diagnose_graph_dump": False})
+        self.module.validate_host_sync_config(
+            {key: value for key, value in valid.items() if key != "host_sync_diagnose_graph_dump"}
+        )
         for changes in (
             {"host_sync_diagnose_prefetch_wait_at_join": 1},
             {"host_sync_backend": "callback"},

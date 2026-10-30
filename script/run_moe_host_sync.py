@@ -45,7 +45,10 @@ def configured_source(
     diagnose_native_stream_limits=False,
     diagnose_prefetch_wait_at_join=False,
     no_load_diagnostics=False,
+    no_graph_dump=False,
 ):
+    if no_graph_dump and diagnose_graph_dump:
+        raise ValueError("no-graph-dump conflicts with diagnose-graph-dump")
     if no_load_diagnostics and any(
         (diagnose_load, diagnose_native_wait, diagnose_split_scale, diagnose_scale_context, diagnose_load_vector_cores)
     ):
@@ -105,6 +108,8 @@ def configured_source(
         # Override inherited launch-script values explicitly, not just CLI defaults.
         offload["host_sync_diagnose_load"] = False
         offload["host_sync_diagnose_native_wait"] = False
+    if no_graph_dump:
+        offload["host_sync_diagnose_graph_dump"] = False
     words[index] = json.dumps(config)
     return source[: start.start()] + shlex.join(words) + "\n"
 
@@ -327,6 +332,11 @@ def main():
     parser.add_argument("--test-script", type=Path, default=REPOSITORY_ROOT / "script/test_graph2.sh")
     parser.add_argument("--requests", type=int, default=3)
     parser.add_argument("--diagnose-graph-dump", action="store_true")
+    parser.add_argument(
+        "--no-graph-dump",
+        action="store_true",
+        help="Verification suite without NPUGraph debug APIs; strict handoffs remain enabled",
+    )
     parser.add_argument("--diagnose-routing-vector-cores", type=int, default=0, choices=range(57))
     parser.add_argument("--diagnose-compute-cube-cores", type=int, default=0, choices=range(29))
     parser.add_argument("--diagnose-dsa-cube-cores", type=int, default=0, choices=range(29))
@@ -343,6 +353,8 @@ def main():
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args()
+    if args.no_graph_dump and (args.diagnose_graph_dump or not args.verification_suite):
+        parser.error("--no-graph-dump requires --verification-suite and conflicts with --diagnose-graph-dump")
     if args.trace_startup and (args.backend not in ("mte", "both") or not args.diagnose_prefetch_wait_at_join):
         parser.error("--trace-startup requires MTE and --diagnose-prefetch-wait-at-join")
     if args.no_load_diagnostics:
@@ -363,12 +375,13 @@ def main():
         and args.skip_profile
         and args.no_load_diagnostics
         and args.diagnose_prefetch_wait_at_join
-        and args.diagnose_graph_dump
+        and (args.diagnose_graph_dump or args.no_graph_dump)
         and args.requests == len(VERIFICATION_PROMPTS)
         and args.warmup_requests == 1
     ):
         parser.error(
-            "verification suite requires both backends, join wait, graph dump, no load diagnostics, "
+            "verification suite requires both backends, join wait, an explicit graph debug choice, "
+            "no load diagnostics, "
             "skip profile, 1 warmup and 3 requests"
         )
     if args.diagnose_load_vector_cores:
@@ -536,6 +549,7 @@ def run(args, root):
                 args.diagnose_native_stream_limits,
                 args.diagnose_prefetch_wait_at_join,
                 getattr(args, "no_load_diagnostics", False),
+                getattr(args, "no_graph_dump", False),
             ),
             "python",
             env,
@@ -543,6 +557,10 @@ def run(args, root):
         log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
         assess_profile_report(reports[backend], log)
         if backend == "mte":
+            if getattr(args, "no_graph_dump", False) and (
+                "[MOE-MTE GRAPH_DUMP_" in log or (directory / "graph_debug").exists()
+            ):
+                raise RuntimeError("Unexpected graph debug evidence despite --no-graph-dump")
             if getattr(args, "no_load_diagnostics", False) and "[MOE-MTE LOAD]" in log:
                 raise RuntimeError("Per-load diagnostic records appeared despite --no-load-diagnostics")
             expected_policy = (

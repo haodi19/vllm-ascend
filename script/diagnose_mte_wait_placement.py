@@ -163,7 +163,9 @@ def wrapper_cleanup_marker(process, log, reason):
         )
 
 
-def run_once(root, run_dir, npu, trace_startup=False, no_load_diagnostics=False, verify_callback=False):
+def run_once(
+    root, run_dir, npu, trace_startup=False, no_load_diagnostics=False, verify_callback=False, no_graph_dump=False
+):
     command = [
         sys.executable,
         "-B",
@@ -202,6 +204,9 @@ def run_once(root, run_dir, npu, trace_startup=False, no_load_diagnostics=False,
         ]
     if trace_startup:
         command.append("--trace-startup")
+    if no_graph_dump:
+        command.remove("--diagnose-graph-dump")
+        command.append("--no-graph-dump")
     if no_load_diagnostics:
         command.append("--no-load-diagnostics")
     with (run_dir.parent / "wrapper.log").open("w", encoding="utf-8") as log:
@@ -231,7 +236,7 @@ def run_once(root, run_dir, npu, trace_startup=False, no_load_diagnostics=False,
             raise
 
 
-def append_evidence(dest, run_dir, code, trace_startup=False, verify_callback=False):
+def append_evidence(dest, run_dir, code, trace_startup=False, verify_callback=False, no_graph_dump=False):
     report_path = run_dir / "graph_diagnosis.txt"
     report = report_path.read_text(encoding="utf-8", errors="replace") if report_path.is_file() else ""
     runner_summary = run_dir / "summary.txt"
@@ -284,7 +289,12 @@ def append_evidence(dest, run_dir, code, trace_startup=False, verify_callback=Fa
     dest.write(f"WAIT_PLACEMENT_RECORDS={len(placements)}; CAPTURE_END_RECORDS={len(end_records)}\n")
     for line in dict.fromkeys(placements[:2] + end_records[-6:] + placements[-2:]):
         dest.write(line[:2000] + "\n")
-    dest.write("\n".join(graph_evidence(run_dir)) + "\n")
+    if no_graph_dump:
+        dump_records = sum("[MOE-MTE GRAPH_DUMP_" in line for line in service.splitlines())
+        dest.write(f"GRAPH_DUMP_REQUESTED=False; GRAPH_DUMP_RECORDS={dump_records}\n")
+        dest.write("GATE_GRAPH=NOT_REQUESTED；仅有CPU捕获登记与汇合检查，不能独立证明本轮设备图依赖结构。\n")
+    else:
+        dest.write("\n".join(graph_evidence(run_dir)) + "\n")
     if verify_callback:
         dest.write("输出对照与MTE捕获结构分开判读；仅覆盖三种固定输入，不证明logits精度、全部捕获尺寸或性能。\n")
     if state in ("inconclusive", "inconclusive_or_mismatch"):
@@ -295,7 +305,8 @@ def append_evidence(dest, run_dir, code, trace_startup=False, verify_callback=Fa
         if not verify_callback:
             dest.write(kernel_failure_context() + "\n")
     dest.write("请求结果与捕获结构分开判读；图时间字段不是运行时PC/核占用。\n")
-    dest.write("没有结构证据不等于没有干预；若结构不符，先检查本轮图，不重跑限核组。\n")
+    if not no_graph_dump:
+        dest.write("没有结构证据不等于没有干预；若结构不符，先检查本轮图，不重跑限核组。\n")
     if not verify_callback:
         dest.write("通过仅支持等待位置/重叠窗口参与触发，不证明资源死锁、输出精度或性能收益。\n")
     dest.write("仍失败时使用本轮快照，不套旧PID任务号；不自动追加其他实验。\n")
@@ -305,6 +316,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", required=True, type=npu_number)
     parser.add_argument("--trace-startup", action="store_true", help="Trace this single run's startup and child exits")
+    parser.add_argument(
+        "--no-graph-dump",
+        action="store_true",
+        help="Only with --verify-callback: disable graph debug, keep other settings",
+    )
     parser.add_argument(
         "--verify-callback",
         action="store_true",
@@ -318,6 +334,8 @@ def main():
     args = parser.parse_args()
     if args.verify_callback and not args.no_load_diagnostics:
         parser.error("--verify-callback requires --no-load-diagnostics")
+    if args.no_graph_dump and not args.verify_callback:
+        parser.error("--no-graph-dump requires --verify-callback")
     if sys.platform != "linux":
         parser.error("请在绿区 Linux NPU 容器运行")
     root = Path(__file__).resolve().parents[1]
@@ -332,6 +350,8 @@ def main():
             dest.write("有限正确性对照：先callback、后MTE，各启动一次服务，前一服务清理后才启动后一服务。\n")
             dest.write("同一启动源配置；三种不同输入、最多32个生成token；比较逐请求文本摘要与usage，不作性能比较。\n")
         dest.write("MTE等待位置设置：早发布，预取严格等待与映射写回延后到主流消费者汇合点。\n")
+        if args.no_graph_dump:
+            dest.write("本组关闭NPUGraph图debug/转储；保留启动观察、Runtime日志、计时与MSTX，仍不是性能测量。\n")
         if args.verify_callback:
             dest.write("callback保留原报告回调及加载流；MTE保留当前SyncLaunchStream和worker策略。\n")
         dest.write("不改核数、原始拷贝、worker策略和加载流，不作性能比较。\n")
@@ -345,9 +365,17 @@ def main():
         dest.write(host_memory_snapshot() + "\n")
         dest.flush()
         code = run_once(
-            root, output / "consumer_join", args.npu, args.trace_startup, args.no_load_diagnostics, args.verify_callback
+            root,
+            output / "consumer_join",
+            args.npu,
+            args.trace_startup,
+            args.no_load_diagnostics,
+            args.verify_callback,
+            args.no_graph_dump,
         )
-        append_evidence(dest, output / "consumer_join", code, args.trace_startup, args.verify_callback)
+        append_evidence(
+            dest, output / "consumer_join", code, args.trace_startup, args.verify_callback, args.no_graph_dump
+        )
     print(f"仅返回检查脱敏后的文件内容：{summary}", flush=True)
 
 

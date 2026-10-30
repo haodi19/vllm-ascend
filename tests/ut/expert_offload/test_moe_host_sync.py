@@ -96,6 +96,7 @@ class MoeHostSyncTests(unittest.TestCase):
                                 cache_policy_enabled=True,
                                 expert_prefetch_enabled=True,
                                 num_device_experts=24,
+                                host_sync_diagnose_graph_dump=True,
                             )
                         )
                     )
@@ -130,12 +131,30 @@ class MoeHostSyncTests(unittest.TestCase):
             ):
                 self.assertEqual(self.runner.main(), 0)
             args = parsed.call_args.args[0]
-            for fail_callback in (False, True):
-                output = root / str(fail_callback)
+            for no_graph_dump, fail_callback, unexpected_debug in (
+                (False, False, False),
+                (False, True, False),
+                (True, False, False),
+                (True, True, False),
+                (True, False, True),
+            ):
+                args.no_graph_dump = no_graph_dump
+                args.diagnose_graph_dump = not no_graph_dump
+                output = root / f"case_{no_graph_dump}_{fail_callback}_{unexpected_debug}"
                 output.mkdir()
                 seen = []
 
-                def infer(run_args, configured, backend, env, *, seen=seen, fail_callback=fail_callback):
+                def infer(
+                    run_args,
+                    configured,
+                    backend,
+                    env,
+                    *,
+                    seen=seen,
+                    fail_callback=fail_callback,
+                    no_graph_dump=no_graph_dump,
+                    unexpected_debug=unexpected_debug,
+                ):
                     words = shlex.split(configured)
                     config = json.loads(words[words.index("--additional-config") + 1])["expert_offload_config"]
                     host = config["host_sync_backend"]
@@ -145,7 +164,7 @@ class MoeHostSyncTests(unittest.TestCase):
                     self.assertFalse(config["host_sync_diagnose_load"])
                     self.assertFalse(config["host_sync_diagnose_native_wait"])
                     self.assertEqual(config["host_sync_diagnose_prefetch_wait_at_join"], host == "mte")
-                    self.assertEqual(config["host_sync_diagnose_graph_dump"], host == "mte")
+                    self.assertEqual(config["host_sync_diagnose_graph_dump"], host == "mte" and not no_graph_dump)
                     self.assertEqual(run_args.trace_startup, host == "mte")
                     self.assertTrue(run_args.verification_suite)
                     self.assertTrue(run_args.skip_profile)
@@ -159,6 +178,8 @@ class MoeHostSyncTests(unittest.TestCase):
                         else "callback service",
                         encoding="utf-8",
                     )
+                    if unexpected_debug and host == "mte":
+                        (run_args.output_dir / "graph_debug").mkdir()
                     return dict(self.suite_report(), request_us=1, profile_status="skipped")
 
                 with (
@@ -169,6 +190,9 @@ class MoeHostSyncTests(unittest.TestCase):
                 ):
                     if fail_callback:
                         with self.assertRaisesRegex(RuntimeError, "baseline failed"):
+                            self.runner.run(args, output)
+                    elif unexpected_debug:
+                        with self.assertRaisesRegex(RuntimeError, "Unexpected graph debug evidence"):
                             self.runner.run(args, output)
                     else:
                         self.assertEqual(self.runner.run(args, output), 0)

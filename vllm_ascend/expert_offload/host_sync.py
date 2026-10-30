@@ -35,10 +35,11 @@ def validate_host_sync_config(config):
         if not (
             config.get("host_sync_backend") == "mte"
             and config.get("expert_prefetch_enabled")
-            and config.get("host_sync_diagnose_graph_dump")
             and config.get("expert_predictor", "fate") == "fate"
         ):
-            raise ValueError("prefetch wait-at-join diagnosis requires MTE, fate prefetch and graph dump")
+            raise ValueError("prefetch wait-at-join diagnosis requires MTE and fate prefetch")
+        # Graph debugging observes the handoff; lifecycle and completion guards
+        # remain enforced independently by the full-capture context.
         incompatible = (
             "host_sync_diagnose_prefetch_report_wait",
             "host_sync_diagnose_prefetch_poll_budget",

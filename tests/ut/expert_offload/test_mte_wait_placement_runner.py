@@ -169,6 +169,33 @@ class WaitPlacementRunnerTests(unittest.TestCase):
             self.assertIn("--prefetch-wait-at-join", command)
             self.assertNotIn("--native-stream-limits", command)
 
+    def test_no_graph_dump_reaches_runner_and_summary_does_not_infer_graph_structure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(self.module.subprocess, "Popen", return_value=Mock(wait=Mock(return_value=0))) as launch:
+                self.module.run_once(root, root / "case", 7, True, True, True, True)
+            command = launch.call_args.args[0]
+            self.assertIn("--no-graph-dump", command)
+            self.assertNotIn("--diagnose-graph-dump", command)
+            with (
+                patch.object(sys, "argv", [*command[2:], "--output-dir", str(root / "parsed")]),
+                patch.object(sys, "platform", "linux"),
+                patch.object(self.runner, "run", return_value=0) as parsed,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(self.runner.main(), 0)
+            self.assertTrue(parsed.call_args.args[0].no_graph_dump)
+            self.assertFalse(parsed.call_args.args[0].diagnose_graph_dump)
+            (root / "summary.txt").write_text('PAIR_RESULT {"status": "passed"}', encoding="utf-8")
+            output = io.StringIO()
+            with patch.object(self.module, "graph_evidence", side_effect=AssertionError("graph debug disabled")):
+                self.module.append_evidence(output, root, 0, verify_callback=True, no_graph_dump=True)
+            self.assertIn("RESULT=finite_output_match", output.getvalue())
+            self.assertIn("GATE_GRAPH=NOT_REQUESTED", output.getvalue())
+            self.assertNotIn("structural_pairs=", output.getvalue())
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            self.runner.configured_source("unused", "mte", "/lib.so", diagnose_graph_dump=True, no_graph_dump=True)
+
     def test_graph_runner_removes_native_diagnostic_request_and_keeps_workload(self):
         graph = SimpleNamespace(enable_debug_mode=lambda: None, debug_dump=lambda self, path: None)
         with tempfile.TemporaryDirectory() as directory:

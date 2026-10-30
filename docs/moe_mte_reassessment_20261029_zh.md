@@ -4,10 +4,10 @@
 默认关闭诊断。参考仓库 `D:\华为\nano2\vllm-ascend\vLLM-ascend-DSA` 仅只读审阅，
 HEAD 为 `ce6900977e6a25377cd11205e3613ec2ec0208a4`。没有收到辅助流单组补跑的新结果。
 
-**最新：关闭前8批加载诊断后仍有限通过；下一步比较callback/MTE在三种不同输入上的输出，见第11节。**
+**最新：三种输入各32 tokens的callback/MTE对照通过；下一步关闭图debug/转储验证，见第12节。**
 根因仍未证实，停止继续枚举核数。等待位置实验检验“等待与消费者之前的真实模型计算重叠”
 是否参与触发，不能直接区分资源调度、模型算子内部停滞和轮询访存影响。
-第1–10节保留实验设计、首次运行命令与启动取证记录；后续操作以第11节为准。
+第1–11节保留实验设计、首次运行命令与启动取证记录；后续操作以第12节为准。
 
 ## 1. 原项目与当前改造的完整顺序
 
@@ -486,3 +486,70 @@ python -B script/diagnose_mte_wait_placement.py --npu 7 --trace-startup --no-loa
 原始响应落盘、异常清理、callback配置保持与失败后停止、结果缺失/空输出/不匹配拒绝、摘要失败路径。
 7个修改的Python文件通过Ruff检查和格式检查，`git diff --check`通过；`format.sh ci`因缺少pre-commit
 无法启动完整检查。新对照尚待绿区NPU结果。
+
+## 12. 三种输入输出一致：验证是否依赖图debug（2026-10-30）
+
+用户返回 `mte_wait_placement_6e30a074/summary.txt`，对应提交 `ea74b9d4`；日志事件发生于10月29日晚。
+callback、MTE两次服务均完成1次预热和3次请求，wrapper退出0、`PAIR_RESULT.status=passed`。
+三个不同输入的文本SHA256逐项一致，完整usage也逐项一致：prompt为13、11、17 tokens，
+completion均为32 tokens。这构成32-token范围内的有限输出对照，不是完整回答语义、logits或通用精度验收。
+
+MTE的加载诊断保持关闭，记录数0；capture1登记与汇合各42槽，pending=0。
+`capture_mmw60xf8/graph_dump`确认42对结构，依然是早publish、主流gate、严格wait、mapping、done join。
+callback保持原报告回调及加载流，MTE保持SyncLaunchStream；模型、MTP、缓存、策略、输入顺序相同。
+两组约4.939秒与4.983秒的请求均值不作性能比较。
+
+### 12.1 两项尚未解释的观测
+
+- 业务计时记录分别为3825、3826，errors和dropped均为0。`CallbackTimings.wrap_update()`按活动计时窗口
+  或外层上下文纳入记录，`stop()`停止新窗口并等待已纳入调用排空；它不是逐generation协议账本。
+  当前没有相同输出必须对应相同业务调用数的已证不变量，也没有从本次分组数据定位相差1次的来源。
+  不把差值直接判为漏调/重复执行，也不声称它已被解释。
+- MTE EngineCore PID98738在runner记录 `cleanup_begin reason=completed`、父进程请求SIGTERM之后，
+  被观测为 `exitcode=-9 (SIGKILL)`。相对terminate请求约128毫秒；本地 `stop_owned_service()` 的
+  SIGKILL兜底在SIGTERM后30秒才发出，因此摘要不能用该兜底解释这次SIGKILL。观察器不覆盖所有直接
+  `os.kill`、进程组信号或外部发送者，发送来源仍未知。请求已经完成不等于退出方式正常；此记录也不能
+  反推请求阶段复现了旧阻塞。MTE唯一EngineDeadError行在清理标记之后；callback未启用该观察器，
+  其同名错误行位置仍为null，不能借用MTE的顺序给callback归因。旧启动失败根因同样未明。
+
+暂不为上述结束阶段信息重新启动离线取证循环；保留本轮日志，若后续出现清理前异常或服务无法退出，
+再按真实发送者与时间线补证。启动阶段没有未闭合phase，不能把此轮退出称为启动崩溃。
+
+### 12.2 下一步的代码依据与边界
+
+当前 `validate_host_sync_config()` 把join等待与graph dump绑定；但 `ACLGraphWrapper` 中
+`_moe_join_wait`独立控制capture上下文、pending检查，`_moe_graph_dump`只控制显式
+`NPUGraph.enable_debug_mode()`和转储接口。已有三次MTE通过全部处于图debug开启状态，
+尚未验证不调用这些接口时是否仍能推进。因此下一步解除这一条校验绑定，核验非图debug捕获。
+这不是重新假设图debug已被证明影响调度，而是补齐从诊断路径走向实际使用的明确证据缺口。
+
+本轮不改publish/wait/generation协议、映射顺序或加载实现。保留单卡MTE/fate预取、完整图捕获要求，
+以及禁止限核、report等待、改写scale拷贝等混合配置的校验。默认仍关闭join等待选项。
+新增脚本选项 `--no-graph-dump` 只允许用于现有callback/MTE验证套件，显式覆盖继承的graph dump=true；
+如MTE仍出现转储标记或新图目录，运行器拒绝报告成功。对照运行保持Runtime debug日志、MSTX、
+计时、启动观察、输入与生成长度，因而仍不能作为生产性能结果。
+
+无图debug时，capture登记/汇合记录及pending检查继续保留，但它们只是CPU捕获路径证据。
+摘要将标记 `GATE_GRAPH=NOT_REQUESTED`，不把旧运行的42对设备图配对当成本轮的实测结构，
+也不把主动关闭转储解释为取证失败。
+
+### 12.3 绿区命令
+
+```bash
+cd /home/l00992607/vllm-ascend-worker-poll
+git pull --ff-only origin dev/moeoffload-worker-poll
+python -B script/diagnose_mte_wait_placement.py --npu 7 --trace-startup --no-load-diagnostics --verify-callback --no-graph-dump
+```
+
+仍顺序启动两个服务，各1次预热+3次相同输入、最多32个生成token。比较新的callback/MTE结果，
+避免把不同运行环境下的旧输出直接充作当前基线。返回新建summary的检查脱敏文本。
+判据为有效配置graph dump=false、`GRAPH_DUMP_REQUESTED=False`/记录0，capture pending=0，
+两组请求完整、三个text_match/usage_match均为true。没有图文件是预期行为。
+
+若通过，说明此轮推进及有限输出一致不依赖显式图debug接口；后续再评估去除其余诊断、扩大覆盖。
+若失败，先区分启动退出、请求停滞与输出差异，用本轮日志定位；不能直接证明图debug改变了某种硬件资源。
+
+相关146项CPU测试中144项通过，2项因Windows平台能力限制跳过；覆盖无转储配置合法性、继承值覆盖、
+完整套件参数传递、意外转储拒绝成功，以及摘要不推断设备图结构。6个修改的Python文件Ruff检查和
+格式检查通过，`git diff --check`通过。`format.sh ci`仍因缺少pre-commit未能运行完整检查，
+本轮新增配置的NPU结果待上述命令返回。
