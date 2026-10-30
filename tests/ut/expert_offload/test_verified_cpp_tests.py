@@ -178,8 +178,14 @@ class TestVerifiedRunner(unittest.TestCase):
 
     def test_startup_exit_keeps_error_and_marks_cleanup_before_signaling(self):
         fn = self.module["_inference"]
-        for enabled, broken_log in ((False, False), (True, False), (True, True)):
-            with self.subTest(enabled=enabled, broken_log=broken_log):
+        for enabled, broken_log, profile_enabled in (
+            (False, False, False),
+            (False, False, True),
+            (True, False, False),
+            (True, False, True),
+            (True, True, True),
+        ):
+            with self.subTest(enabled=enabled, broken_log=broken_log, profile=profile_enabled):
                 args = types.SimpleNamespace(
                     npu=7,
                     port=8155,
@@ -187,6 +193,7 @@ class TestVerifiedRunner(unittest.TestCase):
                     profile_run_dir=Path("profile"),
                     startup_timeout=20,
                     trace_startup=enabled,
+                    skip_profile=not profile_enabled,
                 )
                 process = Mock(pid=123, returncode=1)
                 process.poll.return_value = 1
@@ -195,7 +202,9 @@ class TestVerifiedRunner(unittest.TestCase):
                 if broken_log:
                     log.write.side_effect = OSError("diagnostic output unavailable")
 
-                def cleanup(child, expected=process, log=service, traced=enabled and not broken_log):
+                def cleanup(
+                    child, expected=process, log=service, traced=(enabled or profile_enabled) and not broken_log
+                ):
                     self.assertIs(child, expected)
                     self.assertEqual("cleanup_begin" in log.getvalue(), traced)
 
@@ -211,7 +220,7 @@ class TestVerifiedRunner(unittest.TestCase):
                     fn(args, self.source, "python", {}, log)
                 shell = launch.call_args.args[0][-1]
                 self.assertEqual("mte_startup_bootstrap.py" in shell, enabled)
-                if enabled:
+                if enabled or profile_enabled:
                     record = json.loads(output.getvalue().split("[MOE-MTE RUNNER] ", 1)[1].splitlines()[0])
                     self.assertEqual(record["api_pid"], 123)
                     self.assertEqual(record["api_returncode"], 1)

@@ -524,9 +524,10 @@ def _inference(args, source, backend, env, log):
                         print(f"GAP ANALYSIS NOT VERIFIED: {exc}", flush=True)
         return report
     finally:
-        if getattr(args, "trace_startup", False) or getattr(args, "compare_join_cost", False):
+        if profile_enabled or getattr(args, "trace_startup", False) or getattr(args, "compare_join_cost", False):
             error_type = sys.exc_info()[0]
-            startup_cleanup_marker(child, log, error_type.__name__ if error_type else "completed")
+            with contextlib.suppress(Exception):
+                startup_cleanup_marker(child, log, error_type.__name__ if error_type else "completed")
         with progress(f"{backend} service cleanup and port release; up to 50s"):
             stop_owned_service(child)
             wait_service_ports_free(args)

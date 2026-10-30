@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from inspect_moe_profile import scan_trace
 from inspect_mte_runtime_task import inspect_run
 from mte_join_cost import prepare_cost_source, print_cost_comparison
 from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, run_step
@@ -209,19 +210,44 @@ def failure_excerpt(text):
     )
 
 
-def assess_profile_report(report, service_log):
+def assess_profile_report(report, service_log, profile_dir=None, *, require_mte=False):
     """Request success and an exported filename do not validate profiler output."""
-    errors = []
+    errors, warnings, checks = [], [], []
     for line in service_log.splitlines():
-        if ("profiler.py" in line and "run failed" in line) or (
-            "External init callback must run in same thread" in line
-        ):
+        if "profiler.py" in line and "run failed" in line:
             errors.append(line.strip()[:500])
+        elif "External init callback must run in same thread" in line:
+            # Upstream Kineto logs this when client initialization uses another
+            # thread. It does not itself establish an invalid Ascend timeline.
+            # Retain the diagnostic, then inspect the exported trace separately.
+            warnings.append(line.strip()[:500])
+    if profile_dir is not None and report.get("profile_status") == "complete":
+        traces = sorted(profile_dir.rglob("ASCEND_PROFILER_OUTPUT/trace_view.json"))
+        if not traces:
+            errors.append("No exported trace_view.json despite completed export")
+        for path in traces:
+            try:
+                check = scan_trace(path, require_mte=require_mte)
+                checks.append(
+                    dict(
+                        file=str(path),
+                        json_complete=check["json_complete"],
+                        usable=check["usable"],
+                        issues=check["issues"],
+                    )
+                )
+            except (ValueError, OSError) as exc:
+                errors.append(f"{path.name}: {exc}")
     if errors:
         report["profile_status"] = "invalid"
-    elif report.get("profile_status") == "complete" and report.get("mstx_trace_occurrences") == 0:
-        report["profile_status"] = "unverified"
+    elif report.get("profile_status") == "complete":
+        if (checks and not all(check["usable"] for check in checks)) or report.get("mstx_trace_occurrences") == 0:
+            report["profile_status"] = "unverified"
+        elif warnings:
+            report["profile_status"] = "complete_with_warnings" if checks else "unverified"
     report["profile_errors"] = list(dict.fromkeys(errors))[:4]
+    report["profile_warnings"] = list(dict.fromkeys(warnings))[:4]
+    report["profile_checks"] = checks
     report["engine_error_seen"] = "EngineDeadError" in service_log
     report["engine_error_log_positions"] = engine_error_log_positions(service_log)
     return report
@@ -652,7 +678,9 @@ def run(args, root):
             env,
         )
         log = (directory / "inference_python.log").read_text(encoding="utf-8", errors="replace")
-        assess_profile_report(reports[backend], log)
+        assess_profile_report(
+            reports[backend], log, root / "profile" / backend / "python", require_mte=backend == "mte"
+        )
         if cost_mode:
             # Preserve each completed group before comparing results or starting
             # the next service, so a later failure does not lose measurements.
@@ -693,6 +721,8 @@ def run(args, root):
                     "usage": reports[backend]["usage"],
                     "profile_status": reports[backend]["profile_status"],
                     "profile_errors": reports[backend]["profile_errors"],
+                    "profile_warnings": reports[backend]["profile_warnings"],
+                    "profile_checks": reports[backend]["profile_checks"],
                     "engine_error_seen": reports[backend]["engine_error_seen"],
                     "engine_error_log_positions": reports[backend]["engine_error_log_positions"],
                     "callbacks": reports[backend]["count"],

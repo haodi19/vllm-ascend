@@ -3,46 +3,129 @@
 import argparse
 import collections
 import json
+import math
 from pathlib import Path
 
 MAX_INTERVALS = 1000000
+READ_CHUNK_CHARS = 64 * 1024
+MAX_VALUE_CHARS = 32 * 1024 * 1024
+
+
+def _reject_constant(value):
+    raise ValueError(f"非法 JSON 常量：{value}")
+
+
+class _TraceReader:
+    """Bound memory by one JSON value, rather than the complete event array."""
+
+    def __init__(self, source):
+        self.source = source
+        self.buffer = ""
+        self.offset = 0
+        self.eof = False
+        self.decoder = json.JSONDecoder(parse_constant=_reject_constant)
+
+    def fill(self):
+        self.buffer = self.buffer[self.offset :]
+        self.offset = 0
+        chunk = self.source.read(READ_CHUNK_CHARS)
+        self.eof = not chunk
+        self.buffer += chunk
+
+    def peek(self):
+        while True:
+            while self.offset < len(self.buffer) and self.buffer[self.offset] in " \n\r\t":
+                self.offset += 1
+            if self.offset < len(self.buffer):
+                return self.buffer[self.offset]
+            if self.eof:
+                return ""
+            self.fill()
+
+    def take(self, expected):
+        if self.peek() != expected:
+            raise ValueError(f"时间线 JSON 不完整或格式错误：预期 {expected!r}")
+        self.offset += 1
+
+    def value(self):
+        if not self.peek():
+            raise ValueError("时间线未完整导出，缺少 JSON 值")
+        while True:
+            try:
+                item, end = self.decoder.raw_decode(self.buffer, self.offset)
+            except json.JSONDecodeError:
+                if self.eof:
+                    raise ValueError("时间线未完整导出或 JSON 值格式错误") from None
+            else:
+                if end - self.offset > MAX_VALUE_CHARS:
+                    raise ValueError("单个时间线 JSON 值超过大小上限")
+                # A scalar number may span a chunk boundary (e.g. 1e+3).
+                # Require a delimiter or EOF before accepting a decoded value.
+                if end < len(self.buffer) and self.buffer[end] in " \n\r\t,:]}":
+                    self.offset = end
+                    return item
+                if self.eof:
+                    if end != len(self.buffer):
+                        raise ValueError("时间线 JSON 值后存在非法字符")
+                    self.offset = end
+                    return item
+            if len(self.buffer) - self.offset > MAX_VALUE_CHARS:
+                raise ValueError("单个时间线 JSON 值超过大小上限")
+            self.fill()
+
+    def event_array(self):
+        self.take("[")
+        if self.peek() == "]":
+            self.take("]")
+            return
+        while True:
+            item = self.value()
+            if not isinstance(item, dict):
+                raise ValueError("时间线事件必须是 JSON 对象")
+            yield item
+            if self.peek() == "]":
+                self.take("]")
+                return
+            self.take(",")
+            if self.peek() == "]":
+                raise ValueError("时间线数组不能包含尾随逗号")
 
 
 def events(path):
-    """流式读取 traceEvents 数组，避免将数 GB 的时间线全部载入内存。"""
-    decoder = json.JSONDecoder()
-    with path.open(encoding="utf-8") as source:
-        buf = ""
-        while '"traceEvents"' not in buf:
-            chunk = source.read(65536)
-            if not chunk:
-                raise ValueError("找不到 traceEvents 数组")
-            buf += chunk
-            if len(buf) > 1024 * 1024:
-                raise ValueError("traceEvents 不在文件头 1MB 内")
-        buf = buf[buf.index('"traceEvents"') + len('"traceEvents"') :]
-        while "[" not in buf:
-            chunk = source.read(65536)
-            if not chunk:
-                raise ValueError("traceEvents 数组不完整")
-            buf += chunk
-        buf = buf[buf.index("[") + 1 :]
-        while True:
-            buf = buf.lstrip(" \n\r\t,")
-            if buf.startswith("]"):
-                return
-            try:
-                item, end = decoder.raw_decode(buf)
-            except json.JSONDecodeError:
-                chunk = source.read(65536)
-                if not chunk:
-                    raise ValueError("时间线未完整导出，无法完成分析") from None
-                buf += chunk
-                if len(buf) > 32 * 1024 * 1024:
-                    raise ValueError("单个时间线事件超过 32MB")
-                continue
-            yield item
-            buf = buf[end:]
+    """流式读取根数组或 traceEvents 对象；遍历结束时验证整个 JSON 已闭合。"""
+    with path.open(encoding="utf-8-sig") as source:
+        reader = _TraceReader(source)
+        first = reader.peek()
+        if first == "[":
+            yield from reader.event_array()
+        elif first == "{":
+            reader.take("{")
+            found = False
+            if reader.peek() != "}":
+                while True:
+                    key = reader.value()
+                    if not isinstance(key, str):
+                        raise ValueError("时间线对象的键必须为字符串")
+                    reader.take(":")
+                    if key == "traceEvents":
+                        if found:
+                            raise ValueError("存在重复 traceEvents，无法确定唯一时间线")
+                        found = True
+                        yield from reader.event_array()
+                    else:
+                        reader.value()
+                    if reader.peek() == "}":
+                        break
+                    reader.take(",")
+                    if reader.peek() == "}":
+                        raise ValueError("时间线对象不能包含尾随逗号")
+            reader.take("}")
+            if not found:
+                raise ValueError("找不到顶层 traceEvents 数组")
+        else:
+            raise ValueError("时间线为空或顶层不是 JSON 数组/对象")
+        if reader.peek():
+            raise ValueError("时间线 JSON 结束后仍有多余内容")
 
 
 def fields(event):
@@ -58,6 +141,23 @@ def analyze(path, output):
             phases[event.get("ph")] += 1
         if event.get("ph") != "X" or "ts" not in event or "dur" not in event:
             continue
+        relevant = name.startswith(("moe_offload/update_weights|", "moe_offload/host_callback|")) or (
+            "MEMCPY_ASYNC" in name.upper()
+        )
+        if not relevant:
+            continue
+        # CANN may serialize timestamps as numbers or numeric strings.
+        for key in ("ts", "dur"):
+            value = event[key]
+            try:
+                if isinstance(value, bool):
+                    raise ValueError("boolean time")
+                number = float(value)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid trace {key}: {value!r}") from None
+            if not math.isfinite(number):
+                raise ValueError(f"Invalid trace {key}: {value!r}")
+            event[key] = number
         if event["dur"] < 0:
             continue
         if name.startswith("moe_offload/update_weights|"):

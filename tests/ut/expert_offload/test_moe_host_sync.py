@@ -393,6 +393,59 @@ class MoeHostSyncTests(unittest.TestCase):
         self.runner.assess_profile_report(report, "")
         self.assertEqual(report["profile_status"], "timeout")
 
+    def test_kineto_thread_diagnostic_needs_trace_evidence_not_blanket_invalid(self):
+        log = "ERROR: External init callback must run in same thread as registerClient (1 != 2)"
+        report = {"profile_status": "complete", "request_us": 123, "mstx_trace_occurrences": 50}
+        self.runner.assess_profile_report(report, log)
+        self.assertEqual(report["profile_status"], "unverified")
+        self.assertEqual(report["profile_errors"], [])
+        self.assertEqual(report["profile_warnings"], [log])
+        self.assertEqual(report["request_us"], 123)
+        report = {"profile_status": "skipped"}
+        with patch.object(self.runner, "scan_trace") as scan:
+            self.runner.assess_profile_report(report, log, Path("not-a-profile"))
+        scan.assert_not_called()
+        self.assertEqual(report["profile_status"], "skipped")
+
+    def test_profile_acceptance_checks_trace_and_keeps_compatibility_warning(self):
+        warning = "External init callback must run in same thread as registerClient"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = root / "worker/ASCEND_PROFILER_OUTPUT/trace_view.json"
+            trace.parent.mkdir(parents=True)
+            trace.write_text("[]", encoding="utf-8")
+            for usable, expected in ((True, "complete_with_warnings"), (False, "unverified")):
+                report = {"profile_status": "complete", "mstx_trace_occurrences": 20}
+                evidence = dict(json_complete=True, usable=usable, issues=[] if usable else ["missing device data"])
+                with (
+                    self.subTest(usable=usable),
+                    patch.object(self.runner, "scan_trace", return_value=evidence) as scan,
+                ):
+                    self.runner.assess_profile_report(report, warning, root, require_mte=True)
+                scan.assert_called_once_with(trace, require_mte=True)
+                self.assertEqual(report["profile_status"], expected)
+                self.assertEqual(report["profile_warnings"], [warning])
+                self.assertEqual(report["profile_checks"][0]["usable"], usable)
+            report = {"profile_status": "complete"}
+            with patch.object(self.runner, "scan_trace", side_effect=ValueError("truncated JSON")):
+                self.runner.assess_profile_report(report, warning, root)
+            self.assertEqual(report["profile_status"], "invalid")
+            self.assertIn("truncated JSON", report["profile_errors"][0])
+
+    def test_profile_missing_file_or_parser_failure_cannot_be_overruled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = {"profile_status": "complete"}
+            self.runner.assess_profile_report(report, "", root)
+            self.assertEqual(report["profile_status"], "invalid")
+            trace = root / "ASCEND_PROFILER_OUTPUT/trace_view.json"
+            trace.parent.mkdir()
+            trace.write_text("[]", encoding="utf-8")
+            report = {"profile_status": "complete"}
+            with patch.object(self.runner, "scan_trace", return_value=dict(json_complete=True, usable=True, issues=[])):
+                self.runner.assess_profile_report(report, "profiler.py Task [CANNTimelineParser] run failed", root)
+            self.assertEqual(report["profile_status"], "invalid")
+
     def test_engine_error_log_positions_preserve_raw_flag_and_do_not_guess_cause(self):
         cleanup = '[MOE-MTE RUNNER] {"event": "cleanup_begin", "reason": "completed"}'
         report = {}

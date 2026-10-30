@@ -5,11 +5,11 @@
 HEAD 为 `ce6900977e6a25377cd11205e3613ec2ec0208a4`。最初编写时未收到辅助流单组补跑结果；
 另一对话中该组已通过短请求，现已合并到第14节，不能继续把它当作未执行实验。
 
-**最新：第15节已收到早/晚wait对照。映射同样延后时，晚wait完成请求，早wait在预取加载同步处
-超时，支持提前等待窗口参与阻塞。停止重复定位这一点，转向晚wait与原callback的成本对比。**
+**最新：第16节的callback/晚wait MTE采集均完成请求和stop，原加载阻塞未复现。
+load_prepare接近原版；提交＋等待均值仍有小幅差异。正在离线核对已有profile，避免重跑模型。**
 根因仍未证实，停止继续枚举核数。等待位置实验检验“等待与消费者之前的真实模型计算重叠”
 是否参与触发，不能直接区分资源调度、模型算子内部停滞和轮询访存影响。
-第1–14节保留实验设计、运行命令与取证记录；当前判断以第15节为准。
+第1–15节保留实验设计、运行命令与取证记录；当前判断以第16节为准。
 
 ## 1. 原项目与当前改造的完整顺序
 
@@ -796,3 +796,63 @@ load_and_wait仅相加均值，不把两个p95相加。先核对输出、token�
 蓝区验证：成本配置/统计校验17项、成本运行器9项、原MoE dispatch 55项、原推理运行器20项、
 预取join 14项、等待位置运行器23项，共138项CPU测试通过。这里只验证脚本控制、计时窗口、
 数据判据与已有依赖保护；新的成本对比尚未在NPU上执行。本次没有更改设备算子或MoE运行逻辑。
+
+## 16. 短profile两组通过：分开判断加载阻塞、搬运成本与采集可用性（2026-10-30）
+
+用户返回 `bench_results/mte_join_profile_01`。callback PID106943、MTE PID107993；
+均为3次预热、随后采集1个5-token请求，开启MSTX/内部计时/profiler，moe_offload_debug=false。
+模型、MTP=2、预取层数1、原始权重拷贝一致；MTE只启用消费者处严格等待，未限核。
+
+本轮阻塞结论：两组请求通过，文本摘要和usage一致，各有170条有效回调计时、错误/丢弃为0。
+预取84次、加载76个专家；按需86次、加载401个专家，分组加载数量摘要相同。
+stop_profile分别10.3秒和7.9秒完成，均发现一个导出时间线及3164次MSTX标签字符串。
+没有复现原预取加载同步超时；但这些事实不能替代时间线本体检查。
+
+| Host均值（μs） | 预取callback | 预取MTE | 按需callback | 按需MTE |
+| --- | ---: | ---: | ---: | ---: |
+| load_prepare | 36.365 | 32.635 | 128.749 | 131.311 |
+| copy_submit | 42.451 | 134.191 | 157.736 | 606.596 |
+| load_submit | 91.059 | 183.276 | 333.363 | 803.908 |
+| synchronize | 212.187 | 125.326 | 1025.700 | 614.627 |
+| load_submit + synchronize | 303.246 | 308.602 | 1359.063 | 1418.535 |
+| 内层update_weights总时长 | 426.704 | 418.224 | 1499.643 | 1553.702 |
+
+当前load_prepare没有旧适配版本那样明显上升。主要差异落在copy_submit：MTE直接提交的Host时间
+更长，后续synchronize更短；这符合提交路径与异步工作重叠不同的可能性，不能仅凭分项断言
+拷贝实际执行更慢或全部增长都已被抵消。提交＋等待均值预取增加5.356μs（1.77%），
+按需增加59.472μs（4.38%）；仍是有采集扰动的有限样本。
+
+请求时延3185.172ms→3229.634ms，增加44.463ms（1.40%）。每组只有一个请求，
+不能称为稳定退化或收益。Host分项之和不等于设备MEMCPY间隙；本轮还没有量化设备空泡。
+gap_debug约0.25–0.34μs，与两组关闭调试输出相符，不能写成新C++迁移或MTE握手收益。
+
+### 16.1 两个分析脚本问题及修正
+
+第一，旧`analyze_callback_gaps.events()`只接受`{"traceEvents":[...]}`，不能读取此前Ascend
+出现过的顶层数组`[...]`。本轮“traceEvents不在文件头1MB内”不是文件截断证据。
+现补齐两种格式、完整外层与EOF校验，以及CANN数字字符串时间戳；不覆盖或修复原始采集。
+
+第二，旧`assess_profile_report()`看到`External init callback must run in same thread as registerClient`
+就标整组invalid，未检查NPU时间线。上游PyTorch2.10对应的
+[Kineto检查](https://github.com/pytorch/kineto/blob/31f85df8fbd89c188f14ef10f1ec65379786b943/libkineto/src/libkineto_api.cpp#L18-L30)
+是在初始化线程与注册线程不同时打印错误并跳过client初始化，不会直接宣告时间线导出失败。
+厂商安装包差异未验证，仍保留这条兼容性报错，不能直接说完全无影响。
+
+更新后的判据区分：JSON损坏或明确parser失败仍为invalid；目标轨道/标记未核实时为unverified；
+JSON与目标轨道基本检查通过但保留兼容性报错时为complete_with_warnings。这只说明基本内容
+可读、目标事件可见，不证明完整Host关联、跨时钟对齐或全部采集内容无损。
+
+本轮MTE还有一条EngineDeadError，旧入口没有记录唯一cleanup边界，原因未知；
+不能套用上一轮“确认在cleanup之后”的结论。后续采集入口补记cleanup边界，现有日志只读检查上下文。
+
+### 16.2 先检查已有文件，不重跑模型
+
+```bash
+python -B script/inspect_moe_profile.py bench_results/mte_join_profile_01
+```
+
+脚本不导入Torch、不初始化NPU、不写文件，流式检查两组JSON、Ascend Hardware任务、
+MTE publish/wait、实际MSTX区间与嵌套，打印同一Host进程上相邻host_callback的方向性间隔，
+并保留服务日志兼容性报错/退出上下文。这里只统计Host时间，不把它直接称为设备空泡或同步机制开销。
+通过基本检查后，在MindStudio打开原始`profile/{callback,mte}/python/*_ascend_pt`目录。
+缺少轨道或非法JSON则据离线结果处理，不能仅凭analyse.done或文件名宣布可用。
