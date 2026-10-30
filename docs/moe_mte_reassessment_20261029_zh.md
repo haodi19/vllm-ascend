@@ -853,6 +853,37 @@ python -B script/inspect_moe_profile.py bench_results/mte_join_profile_01
 
 脚本不导入Torch、不初始化NPU、不写文件，流式检查两组JSON、Ascend Hardware任务、
 MTE publish/wait、实际MSTX区间与嵌套，打印同一Host进程上相邻host_callback的方向性间隔，
-并保留服务日志兼容性报错/退出上下文。这里只统计Host时间，不把它直接称为设备空泡或同步机制开销。
-通过基本检查后，在MindStudio打开原始`profile/{callback,mte}/python/*_ascend_pt`目录。
-缺少轨道或非法JSON则据离线结果处理，不能仅凭analyse.done或文件名宣布可用。
+并保留服务日志兼容性报错/退出上下文。用户已能在MindStudio打开原始
+`profile/{callback,mte}/python/*_ascend_pt`目录并查看时间线；脚本检查不是打开可视化的前置条件。
+自动统计报错和MindStudio无法显示是不同的问题，不把前者写成后者。
+
+### 16.3 当前正确性范围、请求计时与间隔统计口径
+
+当前晚等待机制已在第12、13节的两轮对照中通过三种输入各32个生成token的文本摘要与usage一致性验证，
+其中一轮关闭图调试转储但仍启用图捕获/重放。后续`7bfefa35`只新增默认关闭的提前wait对照分支，
+晚wait路径保持gate等待→严格wait→映射写回→done；之后成本和profile脚本修改没有替换该运行机制。
+因此已有验证适用于当前方案，但不等于所有输入/图尺寸、多卡、长时间运行或logits精度已验收。
+本轮5-token请求也与callback输出一致；结束阶段EngineDeadError仍保留为未解释事项。
+
+请求时延在客户端调用`/v1/completions`前后计时，包含请求编码、HTTP往返、服务处理和完整响应解析；
+不包含服务启动、预热、start_profile/stop_profile、后续摘要计算。它不是纯NPU执行时间。
+本轮记录上MTE比callback多44.463ms，但每组只有一个带profiler/计时的请求，尚无稳定端到端收益结论。
+
+间隔按“后一个时间块的开始−前一个时间块的结束”计算，单位μs，输出样本数、均值、p50、p95、最大值。
+以下命令直接读取本轮已保存的两个profile，不启动模型、不占用NPU、不写文件：
+
+```bash
+python -B script/inspect_moe_profile.py bench_results/mte_join_profile_01 --gaps-only
+```
+
+- `HOST_CALLBACK_GAP`：同一Host进程中按时间相邻的回调，分别统计预取→按需和按需→预取；
+  范围是整个采集窗口，不自动认定属于同一层/同一次请求，也不是只统计Decode。
+- `MEMCPY_GAP`：同一Ascend Hardware进程、同一Stream内所有MEMCPY_ASYNC时间块之间的间隔，
+  不跨设备流拼接。重叠部分合并为已覆盖区间并单独计数，不作负的空闲时间；零间隔纳入统计。
+  缺少两个拷贝区间时返回无样本，不将其均值写成0。
+- 该流全部相邻拷贝包含同一批内w13/w2/scale之间的间隔和不同批之间的间隔，且可能包含路由/映射传输。
+  不能把这个总平均值自动标成预取→按需的批次间空泡。若要精确统计那类边界，需要按实际权重加载流
+  和可靠的任务/批次关联进一步筛选，不以时长阈值猜测归属。
+
+Host回调间隔和设备拷贝间隔分别使用自己的时间轴；其中可能有其他计算或传输，均不直接解释为
+整个NPU空闲或纯CPU–NPU同步开销。当前只扩展离线统计，不改MoE运行机制。

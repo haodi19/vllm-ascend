@@ -173,6 +173,111 @@ class MoeProfileAuditTests(unittest.TestCase):
         with patch.object(self.module, "MAX_INTERVALS", 2), self.assertRaises(ValueError):
             self.scan(self.trace())
 
+    @staticmethod
+    def memcpy(pid, tid, start, duration):
+        return dict(name="MEMCPY_ASYNC", ph="X", pid=pid, tid=tid, ts=start, dur=duration)
+
+    def without_copies(self):
+        return [event for event in self.trace() if event["name"] != "MEMCPY_ASYNC"]
+
+    def test_memcpy_gaps_sort_unordered_events_and_include_zero(self):
+        data = self.without_copies()
+        data[-2:-2] = [
+            self.memcpy(100, 21, "50", "5"),
+            self.memcpy(100, 21, "5", "5"),
+            self.memcpy(100, 21, "0", "5"),
+            self.memcpy(100, 21, "20", "0"),
+        ]
+        report = self.scan(data)
+        gap = report["memcpy_gaps"][0]
+        self.assertEqual(gap["copy_count"], 4)
+        self.assertEqual(gap["count"], 3)
+        self.assertEqual(gap["overlaps_excluded"], 0)
+        self.assertEqual(gap["mean_us"], 40 / 3)
+        self.assertEqual(gap["p50_us"], 10)
+        self.assertAlmostEqual(gap["p95_us"], 28)
+        self.assertEqual(gap["max_us"], 30)
+        self.assertEqual(gap["name"], "Stream 21")
+        self.assertTrue(report["usable"])
+
+    def test_memcpy_gaps_never_mix_streams_processes_or_host_copies(self):
+        data = self.without_copies()
+        data[-2:-2] = [
+            self.memcpy(100, 21, 0, 5),
+            self.memcpy(100, 21, 15, 5),
+            self.memcpy(100, 22, 0, 100),
+            self.memcpy(100, 22, 150, 10),
+            self.memcpy(200, 21, 1000, 1),
+            self.memcpy(200, 21, 1004, 1),
+            self.memcpy(7, 21, 0, 9999),
+            self.memcpy(7, 21, 10000, 1),
+        ]
+        data.append(dict(name="process_name", ph="M", pid=200, args=dict(name="Ascend Hardware")))
+        report = self.scan(data)
+        gaps = {(gap["pid"], gap["tid"]): gap for gap in report["memcpy_gaps"]}
+        self.assertEqual(set(gaps), {("100", "21"), ("100", "22"), ("200", "21")})
+        self.assertEqual(gaps[("100", "21")]["mean_us"], 10)
+        self.assertEqual(gaps[("100", "22")]["mean_us"], 50)
+        self.assertEqual(gaps[("200", "21")]["mean_us"], 3)
+
+    def test_nested_copy_does_not_create_false_idle_interval(self):
+        data = self.without_copies()
+        data[-2:-2] = [
+            self.memcpy(100, 21, 0, 100),
+            self.memcpy(100, 21, 10, 10),
+            self.memcpy(100, 21, 30, 10),
+            self.memcpy(100, 21, 90, 20),
+            self.memcpy(100, 21, 110, 0),
+            self.memcpy(100, 21, 120, 5),
+        ]
+        gap = self.scan(data)["memcpy_gaps"][0]
+        self.assertEqual(gap["overlaps_excluded"], 3)
+        self.assertEqual(gap["copy_count"], 6)
+        self.assertEqual(gap["count"], 2)
+        self.assertEqual(gap["mean_us"], 5)
+        self.assertEqual(gap["max_us"], 10)
+
+    def test_single_copy_reports_no_gap_sample_instead_of_zero_latency(self):
+        gap = self.scan(self.trace())["memcpy_gaps"][0]
+        self.assertEqual(gap["copy_count"], 1)
+        self.assertEqual(gap["count"], 0)
+        self.assertEqual(gap["overlaps_excluded"], 0)
+        for field in ("mean_us", "p50_us", "p95_us", "max_us"):
+            self.assertIsNone(gap[field])
+        self.assertEqual(self.scan(self.without_copies())["memcpy_gaps"], [])
+
+    def test_memcpy_retained_intervals_count_against_storage_cap(self):
+        # Four Host intervals, two tracks, one copy and two metadata entries.
+        with patch.object(self.module, "MAX_INTERVALS", 9):
+            self.assertTrue(self.scan(self.trace())["usable"])
+        with patch.object(self.module, "MAX_INTERVALS", 8), self.assertRaises(ValueError):
+            self.scan(self.trace())
+
+    def test_gaps_only_keeps_results_without_verbose_tracks_or_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for backend in ("callback", "mte"):
+                path = root / "profile" / backend / "python/worker/trace_view.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps(self.trace()), encoding="utf-8")
+            output = io.StringIO()
+            with (
+                contextlib.redirect_stdout(output),
+                patch.object(self.module, "service_warning_context", side_effect=AssertionError("Do not read logs")),
+            ):
+                code = self.module.main([str(root), "--gaps-only"])
+            self.assertEqual(code, 0)
+            self.assertIn("HOST_CALLBACK_GAP ", output.getvalue())
+            self.assertIn("MEMCPY_GAP ", output.getvalue())
+            self.assertNotIn("DEVICE_STREAM ", output.getvalue())
+            self.assertNotIn("SERVICE_WARNING ", output.getvalue())
+            for line in output.getvalue().splitlines():
+                if line.startswith("TRACE_CHECK "):
+                    self.assertEqual(
+                        set(json.loads(line.split(" ", 1)[1])),
+                        {"json_complete", "usable", "issues", "host_callbacks"},
+                    )
+
     def test_cli_and_warning_context_are_read_only_and_bounded(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -199,6 +304,10 @@ class MoeProfileAuditTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(before, after)
             self.assertIn("BASIC_VISUALIZATION=PASS", output.getvalue())
+            self.assertEqual(sum(line.startswith("MEMCPY_GAP ") for line in output.getvalue().splitlines()), 2)
+            for line in output.getvalue().splitlines():
+                if line.startswith("TRACE_CHECK "):
+                    self.assertNotIn("memcpy_gaps", json.loads(line.split(" ", 1)[1]))
             self.assertNotIn("SECRET", output.getvalue())
             self.assertNotIn("PRIVATE", output.getvalue())
             contexts = self.module.service_warning_context(root / "mte/inference_python.log")

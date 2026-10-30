@@ -13,6 +13,7 @@ from analyze_callback_gaps import MAX_INTERVALS, events, fields
 MAX_TRACE_FILES = 32
 MAX_PRINT_STREAMS = 32
 MAX_LOG_LINE_CHARS = 4096
+MEMCPY_GAP_SCOPE = "本设备进程/流的全部 MEMCPY_ASYNC 间隙，含批次内及批次间；非预取方向标注或设备全空闲"
 
 
 def _interval(event):
@@ -77,6 +78,7 @@ def scan_trace(path, *, require_mte=False):
     path = Path(path)
     process_names, thread_names, tracks = {}, {}, {}
     callbacks, updates = {}, {}
+    copy_intervals = []
     phases = collections.Counter()
     issues = []
     missing_identity = duplicates = event_count = 0
@@ -101,6 +103,8 @@ def scan_trace(path, *, require_mte=False):
             kind = _task_kind(name)
             summary = track.setdefault(kind, dict(count=0, total_us=0.0, max_us=0.0))
             _observe(summary, end - start)
+            if kind == "copy":
+                copy_intervals.append((pid, tid, start, end))
             target = None
             if name.startswith("moe_offload/host_callback|"):
                 target = callbacks
@@ -115,8 +119,11 @@ def scan_trace(path, *, require_mte=False):
                     duplicates += 1
                 else:
                     target[(pid, call)] = dict(start=start, end=end, tid=tid, kind=info.get("kind", "unknown"))
-        if len(callbacks) + len(updates) + len(tracks) + len(process_names) + len(thread_names) > MAX_INTERVALS:
-            raise ValueError("轨道或回调区间超过分析上限；请使用更短采集")
+        retained = (
+            len(callbacks) + len(updates) + len(tracks) + len(process_names) + len(thread_names) + len(copy_intervals)
+        )
+        if retained > MAX_INTERVALS:
+            raise ValueError("轨道、回调或拷贝区间超过分析上限；请使用更短采集")
 
     # Metadata may be emitted after all device tasks. Select tracks only after
     # the entire JSON has been parsed, including closing delimiters and EOF.
@@ -130,6 +137,35 @@ def scan_trace(path, *, require_mte=False):
             device_counts[kind] += summary["count"]
             summary["mean_us"] = summary["total_us"] / summary["count"]
         streams.append(dict(pid=pid, tid=tid, name=thread_names.get((pid, tid), ""), tasks=task_groups))
+
+    copies_by_stream = collections.defaultdict(list)
+    for pid, tid, start, end in copy_intervals:
+        if pid in hardware:
+            copies_by_stream[(pid, tid)].append((start, end))
+    memcpy_gaps = []
+    for (pid, tid), intervals in sorted(copies_by_stream.items()):
+        intervals.sort()
+        covered_end = intervals[0][1]
+        durations, overlaps = [], 0
+        for start, end in intervals[1:]:
+            # A nested/overlapping copy must not move the covered end backwards
+            # and fabricate an idle gap while an earlier copy is still running.
+            if start < covered_end:
+                overlaps += 1
+            else:
+                durations.append(start - covered_end)
+            covered_end = max(covered_end, end)
+        memcpy_gaps.append(
+            dict(
+                pid=pid,
+                tid=tid,
+                name=thread_names.get((pid, tid), ""),
+                copy_count=len(intervals),
+                overlaps_excluded=overlaps,
+                scope=MEMCPY_GAP_SCOPE,
+                **_stats(durations),
+            )
+        )
 
     matched = invalid_nesting = 0
     for key in callbacks.keys() & updates.keys():
@@ -199,6 +235,7 @@ def scan_trace(path, *, require_mte=False):
         nesting=nesting,
         streams=streams,
         host_gaps=gaps,
+        memcpy_gaps=memcpy_gaps,
         scope="basic visualization content only; Host gaps are not NPU bubbles or causal attribution",
     )
 
@@ -249,6 +286,9 @@ def service_warning_context(path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_root", type=Path)
+    parser.add_argument(
+        "--gaps-only", action="store_true", help="仅输出基本检查与 Host/MEMCPY 间隔，省略轨道和日志详情"
+    )
     args = parser.parse_args(argv)
     root = args.run_root.resolve()
     print(f"READ ONLY PROFILE AUDIT: {root}", flush=True)
@@ -274,18 +314,33 @@ def main(argv=None):
                 print(f"UNUSABLE: {type(exc).__name__}: {exc}", flush=True)
                 complete = False
                 continue
-            facts = {key: value for key, value in report.items() if key not in ("streams", "host_gaps", "scope")}
+            facts = {
+                key: value
+                for key, value in report.items()
+                if key not in ("streams", "host_gaps", "memcpy_gaps", "scope")
+            }
+            if args.gaps_only:
+                facts = {key: report[key] for key in ("json_complete", "usable", "issues", "host_callbacks")}
             print("TRACE_CHECK " + json.dumps(facts, ensure_ascii=False), flush=True)
-            for stream in report["streams"][:MAX_PRINT_STREAMS]:
-                print("DEVICE_STREAM " + json.dumps(stream, ensure_ascii=False), flush=True)
-            if len(report["streams"]) > MAX_PRINT_STREAMS:
-                print(f"DEVICE_STREAM omitted={len(report['streams']) - MAX_PRINT_STREAMS}", flush=True)
+            if not args.gaps_only:
+                for stream in report["streams"][:MAX_PRINT_STREAMS]:
+                    print("DEVICE_STREAM " + json.dumps(stream, ensure_ascii=False), flush=True)
+                if len(report["streams"]) > MAX_PRINT_STREAMS:
+                    print(f"DEVICE_STREAM omitted={len(report['streams']) - MAX_PRINT_STREAMS}", flush=True)
             for gap in report["host_gaps"]:
                 print("HOST_CALLBACK_GAP " + json.dumps(gap), flush=True)
+            for gap in report["memcpy_gaps"][:MAX_PRINT_STREAMS]:
+                print("MEMCPY_GAP " + json.dumps(gap, ensure_ascii=False), flush=True)
+            if len(report["memcpy_gaps"]) > MAX_PRINT_STREAMS:
+                print(f"MEMCPY_GAP omitted={len(report['memcpy_gaps']) - MAX_PRINT_STREAMS}", flush=True)
             complete = complete and report["usable"]
-        for context in service_warning_context(root / backend / "inference_python.log"):
-            print("SERVICE_WARNING " + json.dumps(context, ensure_ascii=False), flush=True)
+        if not args.gaps_only:
+            for context in service_warning_context(root / backend / "inference_python.log"):
+                print("SERVICE_WARNING " + json.dumps(context, ensure_ascii=False), flush=True)
     print("Host 间隔仅按同一进程的时间相邻回调统计，重叠不计入；不是设备空泡，也不跨时钟归因。", flush=True)
+    print("Host 间隔覆盖整个采集窗口内的相邻回调，不是仅 Decode，也未限定同层或同一权重批次。", flush=True)
+    print("MEMCPY 间隙按设备进程及流分别统计；零间隙计入，重叠排除；不跨流混算。", flush=True)
+    print(MEMCPY_GAP_SCOPE + "。", flush=True)
     print("日志警告不能独立判定时间线无效；EngineDeadError 的清理阶段归属需另核对。", flush=True)
     print("BASIC_VISUALIZATION=" + ("PASS" if complete else "PARTIAL_OR_UNVERIFIED"), flush=True)
     print("PASS 只表示基本轨道和区间可用，不证明全部采集完整、CPU/NPU关联或推理正确。", flush=True)
