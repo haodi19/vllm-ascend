@@ -644,6 +644,43 @@ python -B script/run_moe_worker_profile.py --npu 7 \
 profile 保存在该结果目录的 `profile/<组名>/cpp`，不包含之前的无采集请求。
 当前默认 worker 策略不变；绿区实测结果返回后再判断是否稳定改善。
 
+### allocated 与 atomic 组合验证
+
+2026-10-31 的三轮 atomic 复验中，按需→预取 Host 回调间隔均值分别减少 5.33、10.44、
+11.53 μs，但无采集请求均值变化为 -0.654%、+0.095%、+0.477%，未复现稳定整体加速。
+此前 allocated 也观察到局部间隔改善；spin 尚无明确稳定收益。因此选择组合 allocated 与
+atomic，保持 yield，不预设两者收益可以相加。缩小扫描范围后，原子预检查的增量可能变小。
+
+通过 `--combination-trials 2` 运行六个独立服务：
+
+| 组别 | 扫描范围 | 空槽预检查 | 空闲行为 |
+| --- | --- | --- | --- |
+| baseline | all | locked | yield |
+| allocated | allocated | locked | yield |
+| combined | allocated | atomic | yield |
+
+第一轮 baseline → allocated → combined，第二轮 combined → allocated → baseline。
+每个服务预热 5 次、无采集计时 20 次，随后单独采集 1 次 profile，max_tokens=5。
+保持 MTE 普通流、消费者处严格等待、C++ LRC、原始权重拷贝；不绑核、不启用 C++ 内部计时。
+本次只新增实验编排，运行时组合开关已有实现，默认策略保持原样。
+
+```bash
+python -B script/run_moe_worker_profile.py --npu 7 \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --combination-trials 2 --warmup-requests 5 --timing-requests 20 --requests 1 \
+  --request-timeout 120 --profile-timeout 120 \
+  --output-dir bench_results2/moe_worker_combination_01
+```
+
+`summary.txt` 逐轮保留请求分布、两个方向的 Host 回调间隔、MEMCPY 间隔和分项时延。
+末尾 `COMBINATION_TRIAL` 分别计算 allocated 相对基线、组合相对基线、组合相对 allocated
+的整体变化。判断首先看交接间隔是否改善、两轮方向是否一致，再看整体时延和尾部有无退化。
+搬运分项作为辅助信息，不作为这几项轮询改动的主要验收指标。
+两个独立轮次只能检查初步重复性；profile 每个服务仅采集一次，不与 20 次无采集请求混算。
+所有组核对输出及运行策略；失败保留已完成数据，profile 导出失败仍按原有逻辑限时跳过。
+组合收益目前待绿区验证，不更改默认配置。
+
 ## 独立测试的绿区执行
 
 首次建立独立目录，不在原目录或阻塞复现目录 reset：

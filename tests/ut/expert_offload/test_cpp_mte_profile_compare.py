@@ -547,7 +547,7 @@ class CppMteProfileTests(unittest.TestCase):
         return reports
 
     def test_worker_candidates_change_one_option_and_stop_on_failure(self):
-        for failure in (None, "timeout", "policy", "output", "dropped", "capacity", "trials"):
+        for failure in (None, "timeout", "policy", "output", "dropped", "capacity", "trials", "combination"):
             self.storage.reset_mock(side_effect=True)
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root, calls, configs = Path(directory), [], []
@@ -559,6 +559,11 @@ class CppMteProfileTests(unittest.TestCase):
                             "--cache-policy-backend",
                             "cpp",
                             *(["--atomic-trials", "3", "--timing-requests", "2"] if failure == "trials" else []),
+                            *(
+                                ["--combination-trials", "2", "--timing-requests", "2"]
+                                if failure == "combination"
+                                else []
+                            ),
                         ],
                         profile_compare=True,
                         worker_compare=True,
@@ -592,7 +597,7 @@ class CppMteProfileTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     report = self.report("incomplete")
-                    if failure == "trials":
+                    if failure in ("trials", "combination"):
                         self.assertEqual(run_args.timing_requests, 2)
                         report["request_window"] = dict(
                             count=2, **{field: report[field] * 2 for field in ("digests", "usage", "request_specs")}
@@ -612,13 +617,21 @@ class CppMteProfileTests(unittest.TestCase):
                     patch.object(self.runner, "inference", side_effect=fake_inference),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    if failure and failure != "trials":
+                    if failure and failure not in ("trials", "combination"):
                         with self.assertRaises((RuntimeError, TimeoutError)):
                             self.runner.run(args, root)
                         self.assertEqual(calls, ["baseline"] if failure == "capacity" else ["baseline", "allocated"])
                         self.assertTrue((root / "baseline/profile_report.json").exists())
                     else:
                         reports = self.runner.run(args, root)
+                        if failure == "combination":
+                            self.assertEqual(
+                                calls, ["baseline", "allocated", "combined", "combined_2", "allocated_2", "baseline_2"]
+                            )
+                            self.assertEqual(configs[:3], list(reversed(configs[3:])))
+                            self.assertEqual(sum(configs[0][key] != configs[2][key] for key in configs[0]), 2)
+                            self.assertEqual(sum(configs[1][key] != configs[2][key] for key in configs[0]), 1)
+                            continue
                         if failure == "trials":
                             self.assertEqual(
                                 calls, ["baseline", "atomic", "atomic_2", "baseline_2", "baseline_3", "atomic_3"]
@@ -690,6 +703,64 @@ class CppMteProfileTests(unittest.TestCase):
             self.assertRaises(SystemExit),
         ):
             self.runner.parse_args(["--npu", "7", "--atomic-trials", "3"], profile_compare=True, worker_compare=True)
+
+    def test_combination_rejects_mixed_trials_and_missing_window(self):
+        for options in (
+            ["--combination-trials", "2"],
+            ["--combination-trials", "2", "--atomic-trials", "3", "--timing-requests", "20"],
+        ):
+            with (
+                patch.object(sys, "platform", "linux"),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                self.runner.parse_args(["--npu", "7", *options], profile_compare=True, worker_compare=True)
+
+    def test_combination_entry_checks_identity_outputs_and_incremental_gain(self):
+        for failure in (None, "policy", "output"):
+
+            def fake_run(args, root, *, failure=failure):
+                reports = {}
+                for label, scan, probe, idle in self.runner.worker_profile_cases(
+                    combination_trials=args.combination_trials
+                ):
+                    report = copy.deepcopy(self.worker_reports()["baseline"])
+                    report["worker_policy"] = dict(scan=scan, probe=probe, idle=idle)
+                    value = 980 if label.startswith("combined") else 990 if label.startswith("allocated") else 1000
+                    report["request_window"] = dict(
+                        count=2,
+                        samples_us=[value, value],
+                        stats_us=dict(mean=value, p50=value, p95=value, min=value, max=value),
+                        stddev_us=0,
+                        **{field: report[field] * 2 for field in ("digests", "usage", "request_specs")},
+                    )
+                    reports[label] = report
+                if failure == "policy":
+                    reports["combined"]["worker_policy"]["probe"] = "locked"
+                if failure == "output":
+                    reports["combined"]["request_window"]["digests"] = [hashlib.sha256(b"wrong").hexdigest()] * 2
+                return reports
+
+            with (
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(sys, "platform", "linux"),
+                patch.object(self.compare, "run", side_effect=fake_run),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                root = Path(directory) / "run"
+                code = self.compare.main(
+                    ["--npu", "7", "--combination-trials", "2", "--timing-requests", "2", "--output-dir", str(root)],
+                    worker_compare=True,
+                )
+                self.assertEqual(code, 1 if failure else 0)
+                summary = (root / "summary.txt").read_text(encoding="utf-8")
+                if not failure:
+                    self.assertIn("COMBINATION_TRIAL 2: order=combined->allocated->baseline", summary)
+                    self.assertIn("allocated->combined; n=2/2", summary)
+                    self.assertIn("delta_pct=-1.010%", summary)
+                    self.assertIn(str(root / "profile/combined_2/cpp"), summary)
+                else:
+                    self.assertNotIn("COMBINATION_TRIAL", summary)
 
     def test_atomic_trials_entry_pairs_reverse_order_and_preserve_reports(self):
         def fake_run(args, root):

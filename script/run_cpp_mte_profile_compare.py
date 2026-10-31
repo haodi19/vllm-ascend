@@ -229,7 +229,7 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
             f"experts={'/'.join(format(group['loads']['mean'] * group['count'], '.1f') for group in groups)} "
             f"workload_summary_match={matched}"
         )
-        if worker_compare and len(labels) > 2:
+        if worker_compare and len(labels) > 3:
             print_worker_group_metrics(groups, labels)
             continue
         if len(labels) == 3:
@@ -255,7 +255,7 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
         f"all_profiles_usable={profiles_ok}"
     )
     print("分项时延与间隔是不同测量；上述统计不证明跨 CPU/NPU 时间线的因果关系。")
-    if worker_compare and len(labels) > 2:
+    if worker_compare and labels == tuple(case[0] for case in WORKER_PROFILE_CASES):
         print("baseline_repeat与baseline配置相同；若两端基线波动接近候选收益，不能宣称优化稳定有效。")
     return {
         "outputs_match": True,
@@ -390,6 +390,23 @@ def print_atomic_trials(reports, trials):
     print("该汇总是描述性结果；需同时查看顺序、组内波动及局部交接间隔，不自动宣称统计显著。")
 
 
+def print_combination_trials(reports, trials):
+    print("\n组合复验：负数表示候选更快；同时比较组合总效果及在 allocated 上添加 atomic 的增量。")
+    for trial in range(1, trials + 1):
+        suffix = "" if trial == 1 else f"_{trial}"
+        order = "baseline->allocated->combined" if trial % 2 else "combined->allocated->baseline"
+        for reference, candidate in (("baseline", "allocated"), ("baseline", "combined"), ("allocated", "combined")):
+            a, b = (reports[f"{label}{suffix}"]["request_window"] for label in (reference, candidate))
+            first, second = (window["stats_us"]["mean"] for window in (a, b))
+            print(
+                f"COMBINATION_TRIAL {trial}: order={order}; {reference}->{candidate}; n={a['count']}/{b['count']}; "
+                f"reference_ms={first / 1000:.3f}; candidate_ms={second / 1000:.3f}; "
+                f"delta_ms={(second - first) / 1000:+.3f}; delta_pct={100 * (second / first - 1):+.3f}%; "
+                f"median_delta_pct={100 * (b['stats_us']['p50'] / a['stats_us']['p50'] - 1):+.3f}%"
+            )
+    print("局部收益不预设可叠加；结合各轮 Host 间隔和无采集请求判断，不以搬运分项代替交接效果。")
+
+
 def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=False):
     stream_compare = stream_compare or three_way
     args = parse_args(
@@ -405,7 +422,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         labels = ("callback", "sync_launch", "ordinary")
         prefix = "moe_three_way"
     if worker_compare:
-        labels = tuple(case[0] for case in worker_profile_cases(args.atomic_trials))
+        labels = tuple(case[0] for case in worker_profile_cases(args.atomic_trials, args.combination_trials))
         prefix = "moe_worker_profile"
     root = (args.output_dir or REPO / "bench_results" / f"{prefix}_{uuid4().hex[:8]}").resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -413,7 +430,11 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         (root / "summary.txt").open("w", encoding="utf-8") as summary,
         contextlib.redirect_stdout(SummaryTee(sys.stdout, summary)),
     ):
-        if worker_compare and args.atomic_trials:
+        if worker_compare and args.combination_trials:
+            print("MTE普通流＋cpp LRC；组合测试独立服务顺序：" + " → ".join(labels))
+            print("baseline=all/locked/yield；allocated=allocated/locked/yield；combined=allocated/atomic/yield。")
+            print("不绑核、不启用C++轮询内部计时；每组保存profile，默认策略不变。")
+        elif worker_compare and args.atomic_trials:
             print("MTE普通流＋cpp LRC；独立服务顺序：" + " → ".join(labels))
             print("每轮仅改变 locked/atomic 预检查；scan=all、idle=yield。逐轮交换顺序，全部保存profile。")
         elif worker_compare:
@@ -449,7 +470,16 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
                         progress.flush()
             if not isinstance(reports, dict):
                 raise RuntimeError(f"构建、回归或运行失败（exit={reports}），详见 run_details.log")
-            if worker_compare and args.atomic_trials:
+            if worker_compare and args.combination_trials:
+                cases = worker_profile_cases(combination_trials=args.combination_trials)
+                for trial in range(1, args.combination_trials + 1):
+                    suffix = "" if trial == 1 else f"_{trial}"
+                    group = tuple(f"{name}{suffix}" for name in ("baseline", "allocated", "combined"))
+                    policies = tuple(next(case for case in cases if case[0] == label) for label in group)
+                    print(f"\n=== 组合对照第 {trial} 轮；表格按 baseline、allocated、combined 排列 ===")
+                    print_comparison({label: reports[label] for label in group}, root, group, worker_cases=policies)
+                print_combination_trials(reports, args.combination_trials)
+            elif worker_compare and args.atomic_trials:
                 for trial in range(1, args.atomic_trials + 1):
                     suffix = "" if trial == 1 else f"_{trial}"
                     pair = (f"baseline{suffix}", f"atomic{suffix}")

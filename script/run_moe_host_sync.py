@@ -43,8 +43,19 @@ WORKER_PROFILE_CASES = (
 )
 
 
-def worker_profile_cases(atomic_trials=0):
+def worker_profile_cases(atomic_trials=0, combination_trials=0):
     """Alternate pair order across fresh services; retain the original matrix."""
+    if combination_trials:
+        cases = []
+        for trial in range(1, combination_trials + 1):
+            suffix = "" if trial == 1 else f"_{trial}"
+            group = [
+                (f"baseline{suffix}", "all", "locked", "yield"),
+                (f"allocated{suffix}", "allocated", "locked", "yield"),
+                (f"combined{suffix}", "allocated", "atomic", "yield"),
+            ]
+            cases.extend(group if trial % 2 else reversed(group))
+        return tuple(cases)
     if not atomic_trials:
         return WORKER_PROFILE_CASES
     cases = []
@@ -405,12 +416,20 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_
         raise ValueError("stream comparison requires profile comparison preset")
     parser = argparse.ArgumentParser(description=__doc__)
     if worker_compare:
-        parser.add_argument(
+        trials = parser.add_mutually_exclusive_group()
+        trials.add_argument(
             "--atomic-trials",
             type=int,
             default=0,
             choices=range(5),
             help="Fresh baseline/atomic pairs with alternating order (0: original matrix)",
+        )
+        trials.add_argument(
+            "--combination-trials",
+            type=int,
+            default=0,
+            choices=range(4),
+            help="Fresh baseline/allocated/allocated+atomic services; reverse order on alternate trials",
         )
     parser.add_argument(
         "--compare-join-cost",
@@ -518,8 +537,8 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_
     args.worker_compare = worker_compare
     if getattr(args, "timing_requests", 0) < 0:
         parser.error("--timing-requests must be nonnegative")
-    if getattr(args, "atomic_trials", 0) and not args.timing_requests:
-        parser.error("--atomic-trials requires positive --timing-requests")
+    if (getattr(args, "atomic_trials", 0) or getattr(args, "combination_trials", 0)) and not args.timing_requests:
+        parser.error("worker trials require positive --timing-requests")
     if args.requests is None:
         args.requests = 1 if profile_compare else (10 if args.compare_join_cost else 3)
     if args.warmup_requests is None:
@@ -746,7 +765,9 @@ def run(args, root):
         cases = (("callback", "callback", "ordinary"), *cases)
     worker_policies = {
         label: (scan, probe, idle)
-        for label, scan, probe, idle in worker_profile_cases(getattr(args, "atomic_trials", 0))
+        for label, scan, probe, idle in worker_profile_cases(
+            getattr(args, "atomic_trials", 0), getattr(args, "combination_trials", 0)
+        )
     }
     if worker_compare:
         cases = tuple((label, "mte", "ordinary") for label in worker_policies)
