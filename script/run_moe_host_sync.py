@@ -49,6 +49,11 @@ HANDOFF_PROFILE_CASES = (
 )
 
 
+def handoff_profile_cases(include_legacy=False):
+    legacy = (("callback_legacy", "callback", "all", "locked", "yield"),) if include_legacy else ()
+    return legacy + HANDOFF_PROFILE_CASES
+
+
 def worker_profile_cases(atomic_trials=0, combination_trials=0):
     """Alternate pair order across fresh services; retain the original matrix."""
     if combination_trials:
@@ -147,6 +152,7 @@ def configured_source(
     no_graph_dump=False,
     diagnose_prefetch_wait_before_gate=False,
     mte_load_stream="ordinary",
+    moe_offload_debug=None,
 ):
     if mte_load_stream not in ("sync_launch", "ordinary"):
         raise ValueError("invalid MTE load stream")
@@ -165,6 +171,8 @@ def configured_source(
     index = words.index("--additional-config") + 1
     config = json.loads(words[index])
     offload = config["expert_offload_config"]
+    if moe_offload_debug is not None:
+        offload["moe_offload_debug"] = moe_offload_debug
     offload["host_sync_backend"] = backend
     offload["host_sync_load_stream"] = mte_load_stream
     if diagnose_prefetch_wait_at_join or "host_sync_diagnose_prefetch_wait_at_join" in offload:
@@ -431,6 +439,12 @@ def parse_args(
     if stream_compare and not profile_compare:
         raise ValueError("stream comparison requires profile comparison preset")
     parser = argparse.ArgumentParser(description=__doc__)
+    if handoff_compare:
+        parser.add_argument(
+            "--include-legacy-callback",
+            action="store_true",
+            help="Prepend callback with Python LRC and moe_offload_debug enabled on current code",
+        )
     if worker_compare:
         trials = parser.add_mutually_exclusive_group()
         trials.add_argument(
@@ -768,7 +782,8 @@ def run(args, root):
     env = os.environ.copy()
     env["ASCEND_RT_VISIBLE_DEVICES"] = str(args.npu)
     print(
-        f"REAL MOE: LRC={cache_policy_backend} in both groups; model/MTP/prefetch inherited from test_graph2.sh",
+        f"REAL MOE: LRC={cache_policy_backend}, except optional Python legacy group; "
+        "model/MTP/prefetch inherited from test_graph2.sh",
         flush=True,
     )
     print(
@@ -792,11 +807,14 @@ def run(args, root):
     if worker_compare:
         cases = tuple((label, "mte", "ordinary") for label in worker_policies)
     if handoff_compare:
-        cases = tuple((label, backend, "ordinary") for label, backend, *_ in HANDOFF_PROFILE_CASES)
-        worker_policies = {label: (scan, probe, idle) for label, _, scan, probe, idle in HANDOFF_PROFILE_CASES}
+        handoff_cases = handoff_profile_cases(getattr(args, "include_legacy_callback", False))
+        cases = tuple((label, backend, "ordinary") for label, backend, *_ in handoff_cases)
+        worker_policies = {label: (scan, probe, idle) for label, _, scan, probe, idle in handoff_cases}
     for label, backend, load_stream_mode in cases:
+        legacy_callback = handoff_compare and label == "callback_legacy"
+        case_policy = "python" if legacy_callback else cache_policy_backend
         if profile_compare:
-            ensure_profile_storage(root / "profile" / label / cache_policy_backend, stage=f"before service {label}")
+            ensure_profile_storage(root / "profile" / label / case_policy, stage=f"before service {label}")
         scan, probe, idle = (
             worker_policies[label]
             if worker_compare or handoff_compare
@@ -859,11 +877,12 @@ def run(args, root):
                 getattr(args, "no_graph_dump", False),
                 getattr(args, "diagnose_prefetch_wait_before_gate", False),
                 mte_load_stream=load_stream_mode,
+                moe_offload_debug=legacy_callback if handoff_compare else None,
             ),
-            cache_policy_backend,
+            case_policy,
             env,
         )
-        log = (directory / f"inference_{cache_policy_backend}.log").read_text(encoding="utf-8", errors="replace")
+        log = (directory / f"inference_{case_policy}.log").read_text(encoding="utf-8", errors="replace")
         if (
             (worker_compare or handoff_compare)
             and backend == "mte"
@@ -873,19 +892,21 @@ def run(args, root):
         assess_profile_report(
             reports[label],
             log,
-            root / "profile" / label / cache_policy_backend,
+            root / "profile" / label / case_policy,
             require_mte=backend == "mte",
             retain_trace_data=profile_compare,
             large_gap_us=getattr(args, "large_gap_us", None) if profile_compare else None,
         )
         reports[label].update(
             host_backend=backend,
-            cache_policy_backend=cache_policy_backend,
+            cache_policy_backend=case_policy,
             load_backend="python",
             h2d_backend="torch",
             load_stream_mode=load_stream_mode if backend == "mte" else "ordinary",
             worker_policy=dict(scan=scan, probe=probe, idle=idle) if backend == "mte" else None,
         )
+        if handoff_compare:
+            reports[label]["moe_offload_debug"] = legacy_callback
         if (stream_compare or worker_compare or handoff_compare) and backend == "mte":
             expected_type = "SyncLaunchStream" if load_stream_mode == "sync_launch" else "Stream"
             expected = f"[MOE-MTE] weight load stream={expected_type}; mode={load_stream_mode}; H2D wait retained"
@@ -901,7 +922,7 @@ def run(args, root):
             report = reports[label]
             if report.get("errors") != 0 or report.get("dropped") != 0 or report.get("count", 0) <= 0:
                 raise RuntimeError(f"{label}: invalid callback measurements; stop comparison")
-            baseline = reports["callback" if handoff_compare else "baseline"]
+            baseline = next(iter(reports.values())) if handoff_compare else reports["baseline"]
             if any(report.get(field) != baseline.get(field) for field in ("request_specs", "digests", "usage")):
                 raise RuntimeError(f"{label}: output differs from baseline; stop comparison")
             if getattr(args, "timing_requests", 0):
@@ -939,9 +960,7 @@ def run(args, root):
                 if "[MOE-MTE WAIT_CONTROL]" not in log:
                     raise RuntimeError("Missing evidence that prefetch report-wait control was used")
             if args.diagnose_load_stages or args.diagnose_prefetch_poll_budget:
-                print(
-                    f"DIAGNOSTIC EXCERPT (full log: {directory / f'inference_{cache_policy_backend}.log'}):", flush=True
-                )
+                print(f"DIAGNOSTIC EXCERPT (full log: {directory / f'inference_{case_policy}.log'}):", flush=True)
                 print(failure_excerpt(log), flush=True)
             if "[MOE-MTE] first real offload callback completed" not in log:
                 raise RuntimeError("No evidence that real offload callbacks executed through MTE")
@@ -950,7 +969,7 @@ def run(args, root):
             + json.dumps(
                 {
                     "host_backend": backend,
-                    "cache_policy_backend": cache_policy_backend,
+                    "cache_policy_backend": case_policy,
                     "request_mean_us": reports[label]["request_us"],
                     "digests": reports[label]["digests"],
                     "usage": reports[label]["usage"],

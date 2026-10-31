@@ -75,11 +75,19 @@ class CppMteProfileTests(unittest.TestCase):
         self.assertFalse(legacy.diagnose_prefetch_wait_at_join)
 
     def test_handoff_three_groups_runtime_configuration_and_failure_guards(self):
-        for failure in (None, "policy", "window", "timeout"):
+        for failure in (None, "policy", "window", "timeout", "legacy"):
             with tempfile.TemporaryDirectory() as directory, patch.object(sys, "platform", "linux"):
                 root, calls, settings = Path(directory), [], []
                 args = self.runner.parse_args(
-                    ["--npu", "7", "--cache-policy-backend", "cpp"], profile_compare=True, handoff_compare=True
+                    [
+                        "--npu",
+                        "7",
+                        "--cache-policy-backend",
+                        "cpp",
+                        *(["--include-legacy-callback"] if failure == "legacy" else []),
+                    ],
+                    profile_compare=True,
+                    handoff_compare=True,
                 )
                 self.assertEqual((args.timing_requests, args.warmup_requests, args.requests), (20, 5, 1))
 
@@ -90,16 +98,23 @@ class CppMteProfileTests(unittest.TestCase):
                     calls.append(label)
                     if failure == "timeout" and label == "mte_default":
                         raise TimeoutError("request timeout")
-                    self.assertEqual((run_args.timing_requests, run_args.max_tokens, policy), (20, 5, "cpp"))
+                    legacy = label == "callback_legacy"
+                    self.assertEqual(
+                        (run_args.timing_requests, run_args.max_tokens, policy), (20, 5, "python" if legacy else "cpp")
+                    )
                     self.assertFalse(run_args.skip_profile)
                     self.assertEqual(run_args.profile_run_dir, root / "profile" / label)
                     _, command, _, _ = self.runner.launch_spec(source, policy, 7, None, 18155)
                     config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
                     settings.append(config)
-                    expected = next(case for case in self.runner.HANDOFF_PROFILE_CASES if case[0] == label)
+                    expected = next(
+                        case for case in self.runner.handoff_profile_cases(failure == "legacy") if case[0] == label
+                    )
                     _, backend, scan, probe, idle = expected
                     self.assertEqual(config["host_sync_backend"], backend)
                     self.assertEqual(config["host_sync_load_stream"], "ordinary")
+                    self.assertEqual(config["moe_offload_debug"], legacy)
+                    self.assertEqual(config["cache_policy_backend"], policy)
                     self.assertEqual(config["host_sync_diagnose_prefetch_wait_at_join"], backend == "mte")
                     self.assertEqual(
                         tuple(config[f"host_sync_{key}"] for key in ("scan_mode", "idle_probe", "idle_mode")),
@@ -114,7 +129,7 @@ class CppMteProfileTests(unittest.TestCase):
                             f"[MOE-MTE WORKER] scan={scan} probe={probe} idle={idle}\n"
                             "[MOE-MTE] first real offload callback completed\n" + log
                         )
-                    (run_args.output_dir / "inference_cpp.log").write_text(log, encoding="utf-8")
+                    (run_args.output_dir / f"inference_{policy}.log").write_text(log, encoding="utf-8")
                     report = self.report("incomplete")
                     report["request_window"] = dict(
                         count=20, **{field: report[field] * 20 for field in ("request_specs", "digests", "usage")}
@@ -129,7 +144,7 @@ class CppMteProfileTests(unittest.TestCase):
                     patch.object(self.runner, "inference", side_effect=fake_inference),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    if failure:
+                    if failure and failure != "legacy":
                         with self.assertRaises((RuntimeError, TimeoutError)):
                             self.runner.run(args, root)
                         self.assertEqual(
@@ -140,22 +155,34 @@ class CppMteProfileTests(unittest.TestCase):
                         )
                     else:
                         reports = self.runner.run(args, root)
-                        self.assertEqual(list(reports), ["callback", "mte_default", "mte_combined"])
+                        self.assertEqual(
+                            list(reports),
+                            (["callback_legacy"] if failure == "legacy" else [])
+                            + ["callback", "mte_default", "mte_combined"],
+                        )
                         self.assertIsNone(reports["callback"]["worker_policy"])
-                        self.assertEqual(sum(settings[1][key] != settings[2][key] for key in settings[1]), 2)
+                        self.assertEqual(sum(settings[-2][key] != settings[-1][key] for key in settings[-2]), 2)
+                        if failure == "legacy":
+                            changed = {key for key in settings[0] if settings[0][key] != settings[1][key]}
+                            self.assertEqual(changed, {"cache_policy_backend", "moe_offload_debug"})
+                            self.assertTrue(reports["callback_legacy"]["moe_offload_debug"])
+                            self.assertEqual(reports["callback_legacy"]["cache_policy_backend"], "python")
                     self.assertTrue((root / "callback/profile_report.json").is_file())
 
     def test_handoff_entry_summary_labels_and_policy_validation(self):
-        for wrong_policy in (False, True):
+        for wrong_policy in (False, True, "legacy", "legacy_debug"):
 
             def fake_run(args, root, *, wrong_policy=wrong_policy):
                 reports = {}
-                for label, backend, scan, probe, idle in self.runner.HANDOFF_PROFILE_CASES:
+                for label, backend, scan, probe, idle in self.runner.handoff_profile_cases(
+                    args.include_legacy_callback
+                ):
                     report = self.report()
                     report.update(
                         host_backend=backend,
                         load_stream_mode="ordinary",
-                        cache_policy_backend="cpp",
+                        cache_policy_backend="python" if label == "callback_legacy" else "cpp",
+                        moe_offload_debug=label == "callback_legacy",
                         worker_policy=dict(scan=scan, probe=probe, idle=idle) if backend == "mte" else None,
                     )
                     report["request_window"] = dict(
@@ -166,8 +193,10 @@ class CppMteProfileTests(unittest.TestCase):
                         **{field: report[field] * 2 for field in ("request_specs", "digests", "usage")},
                     )
                     reports[label] = report
-                if wrong_policy:
+                if wrong_policy is True:
                     reports["mte_combined"]["worker_policy"]["scan"] = "all"
+                if wrong_policy == "legacy_debug":
+                    reports["callback_legacy"]["moe_offload_debug"] = False
                 return reports
 
             with (
@@ -177,14 +206,28 @@ class CppMteProfileTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 root = Path(directory) / "run"
-                code = self.compare.main(["--npu", "7", "--output-dir", str(root)], handoff_compare=True)
-                self.assertEqual(code, 1 if wrong_policy else 0)
-                if not wrong_policy:
+                code = self.compare.main(
+                    [
+                        "--npu",
+                        "7",
+                        "--output-dir",
+                        str(root),
+                        *(["--include-legacy-callback"] if isinstance(wrong_policy, str) else []),
+                    ],
+                    handoff_compare=True,
+                )
+                failed = wrong_policy is True or wrong_policy == "legacy_debug"
+                self.assertEqual(code, 1 if failed else 0)
+                if not failed:
                     summary = (root / "summary.txt").read_text(encoding="utf-8")
                     self.assertIn("NO_PROFILE_COMBINED_VS_DEFAULT", summary)
                     self.assertIn("mte_combined-mte_default=", summary)
                     self.assertIn(str(root / "profile/mte_combined/cpp"), summary)
                     self.assertNotIn("sync_launch-callback=", summary)
+                    if wrong_policy == "legacy":
+                        self.assertIn(str(root / "profile/callback_legacy/python"), summary)
+                        self.assertIn("callback-callback_legacy=", summary)
+                        self.assertIn("MOE_OFFLOAD_DEBUG callback_legacy: True", summary)
 
     def test_handoff_preset_rejects_conflicting_modes(self):
         with self.assertRaises(ValueError):

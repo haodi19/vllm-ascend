@@ -755,6 +755,38 @@ python -B script/run_moe_callback_worker_compare.py --npu 7 \
 保留已有计时并限时清理后继续，不能将失败 profile 当成有效可视化。
 本次每种配置仅一次服务启动，是当前三种方案的横向对照，不代替之前的独立服务重复实验。
 
+#### 增加 Python LRC 与 debug 开启的早期配置对照
+
+同一入口增加 `--include-legacy-callback` 后，最先执行 `callback_legacy`，其余三组保持原样：
+
+| 组名 | 交接方式 | LRC | moe_offload_debug | MTE worker |
+| --- | --- | --- | --- | --- |
+| callback_legacy | 原回调 | Python | true | 不使用 |
+| callback | 原回调 | C++ | false | 不使用 |
+| mte_default | MTE 晚等待 | C++ | false | all / locked / yield |
+| mte_combined | MTE 晚等待 | C++ | false | allocated / atomic / yield |
+
+早期组是在当前代码上恢复指定配置，不切换历史提交；仍保留相同的测量包装和 profiler。
+该组与 callback 同时改变了 LRC 实现和 debug 开关，只用于观察合计差异，不能将时延差全部
+归因于 C++ 迁移或者关闭 debug。debug 工作在无 profiler 请求中也保持开启，其成本计入结果。
+启动脚本先做公共配置清理，再单独将该组 debug 显式设置为 true；其他三组显式为 false。
+
+```bash
+python -B script/run_moe_callback_worker_compare.py --npu 7 \
+  --include-legacy-callback \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --warmup-requests 5 --timing-requests 20 --requests 1 \
+  --request-timeout 120 --profile-timeout 120 \
+  --output-dir bench_results2/moe_callback_mte_four_way_01
+```
+
+各组均预热 5 次，测 20 次无 profiler 请求，再采集 1 次 profile，max_tokens=5。
+新增组的可视化在 `profile/callback_legacy/python/`；其他三组仍在各自 `cpp/` 子目录。
+所有组请求输出和用量与最先完成的组核对，原有计时、失败保护和停止采集超时处理保持不变。
+`summary.txt` 明确输出各组 LRC 与 debug 设置，四列表格提供分项值和实际组名的差值。
+默认不带该参数仍执行三组，不改变产品默认配置。
+
 ## 独立测试的绿区执行
 
 首次建立独立目录，不在原目录或阻塞复现目录 reset：
