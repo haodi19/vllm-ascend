@@ -502,6 +502,133 @@ class CppMteProfileTests(unittest.TestCase):
         self.assertNotIn("scope", output)
         self.assertEqual(report, original)
 
+    def worker_reports(self):
+        reports = {}
+        for label, scan, probe, idle in self.runner.WORKER_PROFILE_CASES:
+            reports[label] = self.report()
+            reports[label].update(
+                host_backend="mte",
+                load_stream_mode="ordinary",
+                cache_policy_backend="cpp",
+                worker_policy=dict(scan=scan, probe=probe, idle=idle),
+            )
+        return reports
+
+    def test_worker_candidates_change_one_option_and_stop_on_failure(self):
+        for failure in (None, "timeout", "policy", "output", "dropped"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
+                root, calls, configs = Path(directory), [], []
+                with patch.object(sys, "platform", "linux"):
+                    args = self.runner.parse_args(
+                        ["--npu", "7", "--cache-policy-backend", "cpp"],
+                        profile_compare=True,
+                        worker_compare=True,
+                    )
+
+                def fake_inference(
+                    run_args, source, policy, env, *, calls=calls, root=root, configs=configs, failure=failure
+                ):
+                    label = run_args.output_dir.name
+                    calls.append(label)
+                    self.assertEqual((policy, run_args.max_tokens, run_args.requests), ("cpp", 5, 1))
+                    self.assertEqual(run_args.profile_run_dir, root / "profile" / label)
+                    self.assertFalse(run_args.skip_profile)
+                    _, command, _, _ = self.runner.launch_spec(source, policy, 7, None, 18155)
+                    config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
+                    self.assertEqual(config["host_sync_backend"], "mte")
+                    self.assertEqual(config["host_sync_load_stream"], "ordinary")
+                    self.assertTrue(config["host_sync_diagnose_prefetch_wait_at_join"])
+                    self.assertFalse(config["host_sync_diagnose_load"])
+                    configs.append(config)
+                    scan, probe, idle = (config[f"host_sync_{key}"] for key in ("scan_mode", "idle_probe", "idle_mode"))
+                    if label == "allocated" and failure == "policy":
+                        scan = "all"
+                    (run_args.output_dir / "inference_cpp.log").write_text(
+                        "[MOE-MTE] weight load stream=Stream; mode=ordinary; H2D wait retained\n"
+                        f"[MOE-MTE WORKER] scan={scan} probe={probe} idle={idle}\n"
+                        "[MOE-MTE] first real offload callback completed\n"
+                        '[MOE-MTE RUNNER] {"event": "cleanup_begin"}\n',
+                        encoding="utf-8",
+                    )
+                    report = self.report("incomplete")
+                    if label == "allocated":
+                        if failure == "timeout":
+                            raise TimeoutError("worker request timeout")
+                        if failure == "output":
+                            report["digests"] = [hashlib.sha256(b"different").hexdigest()]
+                        if failure == "dropped":
+                            report["dropped"] = 1
+                    return report
+
+                with (
+                    patch.object(self.runner, "run_step", return_value=True) as steps,
+                    patch.object(self.runner, "select_build_directory", return_value=root / "build"),
+                    patch.object(self.runner, "inference", side_effect=fake_inference),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    if failure:
+                        with self.assertRaises((RuntimeError, TimeoutError)):
+                            self.runner.run(args, root)
+                        self.assertEqual(calls, ["baseline", "allocated"])
+                        self.assertTrue((root / "baseline/profile_report.json").exists())
+                    else:
+                        reports = self.runner.run(args, root)
+                        self.assertEqual(calls, [case[0] for case in self.runner.WORKER_PROFILE_CASES])
+                        self.assertEqual(configs[0], configs[-1])
+                        for config in configs[1:-1]:
+                            self.assertEqual(sum(config[key] != configs[0][key] for key in config), 1)
+                        for label, scan, probe, idle in self.runner.WORKER_PROFILE_CASES:
+                            self.assertEqual(reports[label]["worker_policy"], dict(scan=scan, probe=probe, idle=idle))
+                        commands = [call.args[1] for call in steps.call_args_list]
+                        self.assertEqual(sum("install" in command for command in commands), 2)
+                        self.assertTrue(any("tests/ut/expert_offload/test_host_sync_session.py" in c for c in commands))
+
+    def test_worker_summary_checks_all_outputs_and_experiment_identity(self):
+        labels = tuple(case[0] for case in self.runner.WORKER_PROFILE_CASES)
+        for changed in labels:
+            reports = self.worker_reports()
+            reports[changed]["digests"] = [hashlib.sha256(b"wrong").hexdigest()]
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "输出不一致"):
+                self.compare.print_comparison(reports, Path("run"), labels)
+        reports = self.worker_reports()
+        reports["spin"]["worker_policy"]["idle"] = "yield"
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "identity"):
+            self.compare.print_comparison(reports, Path("run"), labels)
+
+    def test_worker_entry_preserves_profiles_metrics_and_repeated_baseline(self):
+        def fake_run(args, root):
+            self.assertTrue(args.worker_compare and args.diagnose_prefetch_wait_at_join)
+            return self.worker_reports()
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(sys, "platform", "linux"),
+            patch.object(self.compare, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            root = Path(directory) / "run"
+            self.assertEqual(self.compare.main(["--npu", "7", "--output-dir", str(root)], worker_compare=True), 0)
+            summary = (root / "summary.txt").read_text(encoding="utf-8")
+            for word in ("baseline_repeat", "allocated", "atomic", "spin", "copy_submit", "last_baseline"):
+                self.assertIn(word, summary)
+            self.assertIn(str(root / "profile/spin/cpp"), summary)
+
+    def test_worker_preset_rejects_confounded_modes(self):
+        with self.assertRaises(ValueError):
+            self.runner.parse_args([], worker_compare=True)
+        with self.assertRaises(ValueError):
+            self.runner.parse_args([], profile_compare=True, stream_compare=True, worker_compare=True)
+        with (
+            patch.object(sys, "platform", "linux"),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            self.runner.parse_args(
+                ["--npu", "7", "--cache-policy-backend", "cpp", "--worker-idle", "spin"],
+                profile_compare=True,
+                worker_compare=True,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

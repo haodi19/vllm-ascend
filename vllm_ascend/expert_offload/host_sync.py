@@ -13,8 +13,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 
-def create_offload_load_stream(npu, backend, mte_load_stream="sync_launch"):
-    """Default to direct MTE submission; allow an explicit ordinary-stream comparison."""
+def create_offload_load_stream(npu, backend, mte_load_stream="ordinary"):
+    """Default to ordinary submission; keep direct submission as an explicit control."""
     if mte_load_stream not in ("sync_launch", "ordinary"):
         raise ValueError("host_sync_load_stream must be sync_launch or ordinary")
     if backend == "callback":
@@ -32,7 +32,7 @@ def create_offload_load_stream(npu, backend, mte_load_stream="sync_launch"):
 
 
 def validate_host_sync_config(config):
-    if config.get("host_sync_load_stream", "sync_launch") not in ("sync_launch", "ordinary"):
+    if config.get("host_sync_load_stream", "ordinary") not in ("sync_launch", "ordinary"):
         raise ValueError("host_sync_load_stream must be sync_launch or ordinary")
     join_wait = config.get("host_sync_diagnose_prefetch_wait_at_join", False)
     early_wait = config.get("host_sync_diagnose_prefetch_wait_before_gate", False)

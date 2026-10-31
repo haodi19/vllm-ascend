@@ -1012,9 +1012,9 @@ class ExpertOffloadConfig:
         "callback_mstx_enabled": False,
         # Opt-in single-card graph handoff. Default preserves ACL callbacks.
         "host_sync_backend": "callback",
-        # MTE load submission comparison; default preserves direct Host submission.
+        # MTE load submission; ordinary is the validated late-wait experiment baseline.
         # ordinary selects torch_npu.npu.Stream; completion waits remain mandatory.
-        "host_sync_load_stream": "sync_launch",  # sync_launch / ordinary; MTE only
+        "host_sync_load_stream": "ordinary",  # ordinary / sync_launch; MTE only
         # MTE-only worker policies; defaults preserve original dispatch.
         "host_sync_scan_mode": "all",  # all / allocated (monotonic task prefix)
         "host_sync_idle_probe": "locked",  # locked / atomic (idle precheck)

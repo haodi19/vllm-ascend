@@ -244,7 +244,7 @@ class ExpertOffloadManager:
 
         from vllm_ascend.expert_offload.host_sync import create_offload_load_stream
         host_sync_backend = getattr(self.offload_config, "host_sync_backend", "callback")
-        load_stream_mode = getattr(self.offload_config, "host_sync_load_stream", "sync_launch")
+        load_stream_mode = getattr(self.offload_config, "host_sync_load_stream", "ordinary")
         self.load_stream = create_offload_load_stream(torch_npu.npu, host_sync_backend, load_stream_mode)
         if host_sync_backend == "mte":
             logger.info(

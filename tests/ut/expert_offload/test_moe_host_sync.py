@@ -686,19 +686,19 @@ class MoeHostSyncTests(unittest.TestCase):
 
     def test_mte_uses_direct_submission_load_stream(self):
         npu = SimpleNamespace(Stream=Mock(), SyncLaunchStream=Mock(return_value="direct"))
-        self.assertEqual(self.module.create_offload_load_stream(npu, "mte"), "direct")
+        self.assertEqual(self.module.create_offload_load_stream(npu, "mte", "sync_launch"), "direct")
         npu.SyncLaunchStream.assert_called_once_with()
         npu.Stream.assert_not_called()
 
     def test_missing_sync_stream_cannot_silently_fallback(self):
         npu = SimpleNamespace(Stream=Mock())
         with self.assertRaisesRegex(RuntimeError, "SyncLaunchStream"):
-            self.module.create_offload_load_stream(npu, "mte")
+            self.module.create_offload_load_stream(npu, "mte", "sync_launch")
         npu.Stream.assert_not_called()
 
-    def test_mte_ordinary_stream_is_explicit_and_does_not_require_sync_class(self):
+    def test_mte_defaults_to_ordinary_stream_without_sync_class(self):
         npu = SimpleNamespace(Stream=Mock(return_value="ordinary"))
-        self.assertEqual(self.module.create_offload_load_stream(npu, "mte", "ordinary"), "ordinary")
+        self.assertEqual(self.module.create_offload_load_stream(npu, "mte"), "ordinary")
         npu.Stream.assert_called_once_with()
 
     def test_invalid_load_stream_is_rejected_before_creation(self):
@@ -1074,7 +1074,7 @@ class MoeHostSyncTests(unittest.TestCase):
         self.assertEqual(new.pop("host_sync_scan_mode"), "all")
         self.assertEqual(new.pop("host_sync_idle_probe"), "locked")
         self.assertEqual(new.pop("host_sync_idle_mode"), "yield")
-        self.assertEqual(new.pop("host_sync_load_stream"), "sync_launch")
+        self.assertEqual(new.pop("host_sync_load_stream"), "ordinary")
         self.assertEqual(new, old)
         self.assertFalse(any(not word.strip() for word in after))
 

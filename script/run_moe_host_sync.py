@@ -32,6 +32,15 @@ from run_verified_cpp_tests import (
 
 MAX_ENGINE_ERROR_LINE_CHARS = 800
 
+# Each candidate changes exactly one worker option; the final baseline exposes drift.
+WORKER_PROFILE_CASES = (
+    ("baseline", "all", "locked", "yield"),
+    ("allocated", "allocated", "locked", "yield"),
+    ("atomic", "all", "atomic", "yield"),
+    ("spin", "all", "locked", "spin"),
+    ("baseline_repeat", "all", "locked", "yield"),
+)
+
 
 class CostProgressFile:
     """Keep full details locally; show only phase progress on the console."""
@@ -104,7 +113,7 @@ def configured_source(
     no_load_diagnostics=False,
     no_graph_dump=False,
     diagnose_prefetch_wait_before_gate=False,
-    mte_load_stream="sync_launch",
+    mte_load_stream="ordinary",
 ):
     if mte_load_stream not in ("sync_launch", "ordinary"):
         raise ValueError("invalid MTE load stream")
@@ -371,7 +380,9 @@ def prepare_runtime_artifacts(source, target):
     print(f"Runtime artifacts: copied missing files={copied}; existing files preserved; source={source}", flush=True)
 
 
-def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_way=False):
+def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_way=False, worker_compare=False):
+    if worker_compare and (not profile_compare or stream_compare or three_way):
+        raise ValueError("worker comparison requires its own profile preset")
     if three_way and not stream_compare:
         raise ValueError("three-way comparison requires stream comparison preset")
     if stream_compare and not profile_compare:
@@ -474,6 +485,7 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_
     args.profile_compare = profile_compare
     args.stream_compare = stream_compare
     args.three_way = three_way
+    args.worker_compare = worker_compare
     if args.requests is None:
         args.requests = 1 if profile_compare else (10 if args.compare_join_cost else 3)
     if args.warmup_requests is None:
@@ -583,6 +595,7 @@ def main():
 
 def run(args, root):
     stream_compare = getattr(args, "stream_compare", False)
+    worker_compare = getattr(args, "worker_compare", False)
     cache_policy_backend = getattr(args, "cache_policy_backend", "python")
     profile_compare = getattr(args, "profile_compare", False)
     if cache_policy_backend not in ("python", "cpp"):
@@ -662,6 +675,12 @@ def run(args, root):
         for label, command in commands:
             if not run_step(label, command, 600):
                 return 1
+        if worker_compare and not run_step(
+            "CPU Host lifecycle regression",
+            [sys.executable, "-B", "tests/ut/expert_offload/test_host_sync_session.py"],
+            120,
+        ):
+            return 1
     source = args.test_script.read_text(encoding="utf-8")
     cost_mode = getattr(args, "compare_join_cost", False)
     if cost_mode or profile_compare:
@@ -685,11 +704,17 @@ def run(args, root):
     cases = (
         (("sync_launch", "mte", "sync_launch"), ("ordinary", "mte", "ordinary"))
         if stream_compare
-        else tuple((backend, backend, "sync_launch") for backend in backends)
+        else tuple((backend, backend, "ordinary") for backend in backends)
     )
     if getattr(args, "three_way", False):
         cases = (("callback", "callback", "ordinary"), *cases)
+    worker_policies = {label: (scan, probe, idle) for label, scan, probe, idle in WORKER_PROFILE_CASES}
+    if worker_compare:
+        cases = tuple((label, "mte", "ordinary") for label in worker_policies)
     for label, backend, load_stream_mode in cases:
+        scan, probe, idle = (
+            worker_policies[label] if worker_compare else (args.worker_scan, args.worker_probe, args.worker_idle)
+        )
         directory = root / label
         directory.mkdir()
         run_args = SimpleNamespace(
@@ -714,8 +739,7 @@ def run(args, root):
         )
         print(f"\n=== REAL MOE HOST BACKEND: {backend}; case={label}; load_stream={load_stream_mode} ===", flush=True)
         print(
-            f"Requested worker policy: scan={args.worker_scan}; probe={args.worker_probe}; "
-            f"idle={args.worker_idle}; MTE only",
+            f"Requested worker policy: scan={scan}; probe={probe}; idle={idle}; MTE only",
             flush=True,
         )
         if args.diagnose_load_stages:
@@ -727,9 +751,9 @@ def run(args, root):
                 backend,
                 library,
                 args.diagnose_load_stages,
-                args.worker_scan,
-                args.worker_probe,
-                args.worker_idle,
+                scan,
+                probe,
+                idle,
                 args.diagnose_native_wait,
                 args.diagnose_split_scale,
                 args.diagnose_scale_context,
@@ -752,6 +776,8 @@ def run(args, root):
             env,
         )
         log = (directory / f"inference_{cache_policy_backend}.log").read_text(encoding="utf-8", errors="replace")
+        if worker_compare and f"[MOE-MTE WORKER] scan={scan} probe={probe} idle={idle}" not in log:
+            raise RuntimeError(f"{label}: missing runtime worker policy evidence")
         assess_profile_report(
             reports[label],
             log,
@@ -766,18 +792,26 @@ def run(args, root):
             load_backend="python",
             h2d_backend="torch",
             load_stream_mode=load_stream_mode if backend == "mte" else "ordinary",
+            worker_policy=dict(scan=scan, probe=probe, idle=idle) if backend == "mte" else None,
         )
-        if stream_compare and backend == "mte":
+        if (stream_compare or worker_compare) and backend == "mte":
             expected_type = "SyncLaunchStream" if load_stream_mode == "sync_launch" else "Stream"
             expected = f"[MOE-MTE] weight load stream={expected_type}; mode={load_stream_mode}; H2D wait retained"
             if expected not in log:
                 raise RuntimeError(f"Missing runtime load stream evidence: {expected}")
         if profile_compare:
             (directory / "profile_report.json").write_text(json.dumps(reports[label]), encoding="utf-8")
-        if stream_compare:
+        if stream_compare or worker_compare:
             positions = reports[label]["engine_error_log_positions"]
             if not positions["cleanup_marker_unique"] or positions["before_cleanup"] != 0:
                 raise RuntimeError(f"{label}: engine error before cleanup or missing cleanup boundary; stop comparison")
+        if worker_compare:
+            report = reports[label]
+            if report.get("errors") != 0 or report.get("dropped") != 0 or report.get("count", 0) <= 0:
+                raise RuntimeError(f"{label}: invalid callback measurements; stop comparison")
+            baseline = reports["baseline"]
+            if any(report.get(field) != baseline.get(field) for field in ("request_specs", "digests", "usage")):
+                raise RuntimeError(f"{label}: output differs from baseline; stop comparison")
         if cost_mode:
             # Preserve each completed group before comparing results or starting
             # the next service, so a later failure does not lose measurements.
@@ -794,9 +828,7 @@ def run(args, root):
                 raise RuntimeError("Unexpected graph debug evidence despite --no-graph-dump")
             if getattr(args, "no_load_diagnostics", False) and "[MOE-MTE LOAD]" in log:
                 raise RuntimeError("Per-load diagnostic records appeared despite --no-load-diagnostics")
-            expected_policy = (
-                f"[MOE-MTE WORKER] scan={args.worker_scan} probe={args.worker_probe} idle={args.worker_idle}"
-            )
+            expected_policy = f"[MOE-MTE WORKER] scan={scan} probe={probe} idle={idle}"
             if expected_policy not in log:
                 raise RuntimeError("Missing runtime evidence of requested MTE worker policies")
             print(expected_policy, flush=True)
