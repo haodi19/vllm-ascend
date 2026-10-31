@@ -755,6 +755,9 @@ class CppMteProfileTests(unittest.TestCase):
                 self.assertEqual(code, 1 if failure else 0)
                 summary = (root / "summary.txt").read_text(encoding="utf-8")
                 if not failure:
+                    self.assertIn("DELTA total: allocated-baseline=", summary)
+                    self.assertIn("combined_2-allocated_2=", summary)
+                    self.assertNotIn("sync_launch-callback=", summary)
                     self.assertIn("COMBINATION_TRIAL 2: order=combined->allocated->baseline", summary)
                     self.assertIn("allocated->combined; n=2/2", summary)
                     self.assertIn("delta_pct=-1.010%", summary)

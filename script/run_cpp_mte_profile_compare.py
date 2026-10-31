@@ -279,8 +279,9 @@ def print_three_group_metrics(groups, labels):
     for metric in ("copy_submit", "load_submit", "synchronize", "load_and_wait", "total"):
         values = totals if metric == "load_and_wait" else [group["metrics"][metric]["mean"] for group in groups]
         print(
-            f"DELTA {metric}: sync_launch-callback={values[1] - values[0]:+.3f} us; "
-            f"ordinary-callback={values[2] - values[0]:+.3f} us; ordinary-sync_launch={values[2] - values[1]:+.3f} us"
+            f"DELTA {metric}: {labels[1]}-{labels[0]}={values[1] - values[0]:+.3f} us; "
+            f"{labels[2]}-{labels[0]}={values[2] - values[0]:+.3f} us; "
+            f"{labels[2]}-{labels[1]}={values[2] - values[1]:+.3f} us"
         )
 
 
