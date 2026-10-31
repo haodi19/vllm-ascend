@@ -10,6 +10,7 @@ import os
 import re
 import runpy
 import shlex
+import shutil
 import signal
 import socket
 import statistics
@@ -23,6 +24,8 @@ import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+MIN_PROFILE_FREE_GIB = 20
+GIB = 1024**3
 VERIFICATION_PROMPTS = (
     "Explain why the sky appears blue during the day in two sentences.",
     "计算17乘以23，并简要说明计算过程。",
@@ -43,6 +46,31 @@ METRICS = (
     "scale_refresh",
     "load_other",
 )
+
+
+def ensure_profile_storage(path, *, stage):
+    """Check actual output filesystem before building, starting a service or profiling."""
+    directory = Path(path).resolve()
+    while not directory.exists():
+        directory = directory.parent
+    free_gib = shutil.disk_usage(directory).free / GIB
+    free_inodes = None
+    if hasattr(os, "statvfs"):
+        info = os.statvfs(directory)
+        if info.f_files > 0:
+            free_inodes = info.f_favail
+    print(
+        f"STORAGE: stage={stage}; path={directory}; free={free_gib:.2f} GiB; "
+        f"required={MIN_PROFILE_FREE_GIB} GiB; available_inodes={free_inodes}",
+        flush=True,
+    )
+    if free_gib < MIN_PROFILE_FREE_GIB or free_inodes == 0:
+        raise RuntimeError(
+            f"Insufficient profile storage at {directory}: free={free_gib:.2f} GiB, "
+            f"required={MIN_PROFILE_FREE_GIB} GiB, available_inodes={free_inodes}. "
+            "Stop comparison; completed results are retained. Free space or use a new output directory "
+            "on a filesystem with sufficient space."
+        )
 
 
 class SummaryTee:
@@ -493,6 +521,8 @@ def _inference(args, source, backend, env, log):
                 usage=[item[1] for item in baseline_requests],
             )
         if profile_enabled:
+            if getattr(args, "profile_compare", False):
+                ensure_profile_storage(profile_dir, stage="before start_profile")
             request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
         requests = []
         try:

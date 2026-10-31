@@ -34,6 +34,10 @@ class CppMteProfileTests(unittest.TestCase):
         with patch.object(sys, "platform", "linux"):
             return self.runner.parse_args([*prefix, *extra], profile_compare=profile)
 
+    def setUp(self):
+        self.storage = self.enterContext(patch.object(self.runner, "ensure_profile_storage"))
+        self.inference_storage = self.enterContext(patch.object(self.infer, "ensure_profile_storage"))
+
     def report(self, status="complete"):
         return dict(
             units="us",
@@ -362,6 +366,7 @@ class CppMteProfileTests(unittest.TestCase):
             compare_join_cost=False,
         )
         sequence = []
+        self.inference_storage.side_effect = lambda path, stage: sequence.append("STORAGE")
 
         def request(opener, port, path, payload=None, timeout=None):
             sequence.append(path)
@@ -389,7 +394,9 @@ class CppMteProfileTests(unittest.TestCase):
             result = self.infer._inference(args, self.source, "cpp", {}, log)
         self.assertEqual(
             sequence,
-            ["/health", "/status"] + ["/v1/completions"] * 3 + ["/start_profile", "/start", "/v1/completions", "/stop"],
+            ["/health", "/status"]
+            + ["/v1/completions"] * 3
+            + ["STORAGE", "/start_profile", "/start", "/v1/completions", "/stop"],
         )
         self.assertEqual(result["profile_status"], "incomplete")
         self.assertEqual(len(result["digests"]), 1)
@@ -515,7 +522,8 @@ class CppMteProfileTests(unittest.TestCase):
         return reports
 
     def test_worker_candidates_change_one_option_and_stop_on_failure(self):
-        for failure in (None, "timeout", "policy", "output", "dropped"):
+        for failure in (None, "timeout", "policy", "output", "dropped", "capacity"):
+            self.storage.reset_mock(side_effect=True)
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root, calls, configs = Path(directory), [], []
                 with patch.object(sys, "platform", "linux"):
@@ -530,6 +538,8 @@ class CppMteProfileTests(unittest.TestCase):
                 ):
                     label = run_args.output_dir.name
                     calls.append(label)
+                    if label == "baseline" and failure == "capacity":
+                        self.storage.side_effect = RuntimeError("Insufficient profile storage")
                     self.assertEqual((policy, run_args.max_tokens, run_args.requests), ("cpp", 5, 1))
                     self.assertEqual(run_args.profile_run_dir, root / "profile" / label)
                     self.assertFalse(run_args.skip_profile)
@@ -569,7 +579,7 @@ class CppMteProfileTests(unittest.TestCase):
                     if failure:
                         with self.assertRaises((RuntimeError, TimeoutError)):
                             self.runner.run(args, root)
-                        self.assertEqual(calls, ["baseline", "allocated"])
+                        self.assertEqual(calls, ["baseline"] if failure == "capacity" else ["baseline", "allocated"])
                         self.assertTrue((root / "baseline/profile_report.json").exists())
                     else:
                         reports = self.runner.run(args, root)
@@ -628,6 +638,12 @@ class CppMteProfileTests(unittest.TestCase):
                 profile_compare=True,
                 worker_compare=True,
             )
+
+    def test_low_storage_stops_before_build(self):
+        self.storage.side_effect = RuntimeError("Insufficient profile storage")
+        with patch.object(self.runner, "run_step") as build, self.assertRaisesRegex(RuntimeError, "storage"):
+            self.runner.run(self.args(), Path("unused-output"))
+        build.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from run_verified_cpp_tests import (
     VERIFICATION_MAX_TOKENS,
     VERIFICATION_PROMPTS,
     SummaryTee,
+    ensure_profile_storage,
     inference,
     launch_spec,
     progress,
@@ -57,7 +58,7 @@ class CostProgressFile:
             self.pending += text
             while "\n" in self.pending:
                 line, self.pending = self.pending.split("\n", 1)
-                if line.startswith(("START:", "PASS:", "WAIT:", "DONE:", "FAILED:", "=== REAL MOE")):
+                if line.startswith(("START:", "PASS:", "WAIT:", "DONE:", "FAILED:", "STORAGE:", "=== REAL MOE")):
                     self.console.write(line + "\n")
                     self.console.flush()
         return len(text)
@@ -598,6 +599,8 @@ def run(args, root):
     worker_compare = getattr(args, "worker_compare", False)
     cache_policy_backend = getattr(args, "cache_policy_backend", "python")
     profile_compare = getattr(args, "profile_compare", False)
+    if profile_compare:
+        ensure_profile_storage(root, stage="before build")
     if cache_policy_backend not in ("python", "cpp"):
         raise ValueError("Only Python or verified C++ LRC is supported")
     if getattr(args, "trace_startup", False):
@@ -712,6 +715,8 @@ def run(args, root):
     if worker_compare:
         cases = tuple((label, "mte", "ordinary") for label in worker_policies)
     for label, backend, load_stream_mode in cases:
+        if profile_compare:
+            ensure_profile_storage(root / "profile" / label / cache_policy_backend, stage=f"before service {label}")
         scan, probe, idle = (
             worker_policies[label] if worker_compare else (args.worker_scan, args.worker_probe, args.worker_idle)
         )
