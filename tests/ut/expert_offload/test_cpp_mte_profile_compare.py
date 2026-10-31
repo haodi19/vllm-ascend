@@ -348,7 +348,18 @@ class CppMteProfileTests(unittest.TestCase):
             scan.assert_not_called()
 
     def test_profile_inference_does_not_copy_or_rescan_trace_and_keeps_failed_export_report(self):
+        self.check_inference_sequence(0)
+
+    def test_repeated_requests_precede_profiler_and_survive_export_failure(self):
+        self.check_inference_sequence(4)
+
+    def test_repeated_window_rejects_active_timers_before_starting_profiler(self):
+        self.check_inference_sequence(4, timers_active=True)
+
+    def check_inference_sequence(self, timing_count, *, timers_active=False):
         args = SimpleNamespace(
+            timing_requests=timing_count,
+            output_dir=Path(self.enterContext(tempfile.TemporaryDirectory())),
             npu=7,
             port=8155,
             timing_port=18155,
@@ -371,7 +382,7 @@ class CppMteProfileTests(unittest.TestCase):
         def request(opener, port, path, payload=None, timeout=None):
             sequence.append(path)
             if path == "/status":
-                return dict(backend="cpp", load_backend="python", active=False, mstx_enabled=True)
+                return dict(backend="cpp", load_backend="python", active=timers_active, mstx_enabled=True)
             if path == "/v1/completions":
                 return dict(choices=[dict(text="text")], usage=dict(completion_tokens=5, total_tokens=10))
             if path == "/stop":
@@ -391,16 +402,30 @@ class CppMteProfileTests(unittest.TestCase):
             patch.object(self.infer, "inspect_mstx_trace", side_effect=AssertionError("duplicate scan")),
             contextlib.redirect_stdout(io.StringIO()),
         ):
+            if timers_active:
+                with self.assertRaisesRegex(RuntimeError, "inactive callback timers"):
+                    self.infer._inference(args, self.source, "cpp", {}, log)
+                self.assertNotIn("/start_profile", sequence)
+                finish.assert_not_called()
+                stop.assert_called_once_with(process)
+                return
             result = self.infer._inference(args, self.source, "cpp", {}, log)
         self.assertEqual(
             sequence,
             ["/health", "/status"]
             + ["/v1/completions"] * 3
+            + (["/status"] + ["/v1/completions"] * timing_count + ["/status"] if timing_count else [])
             + ["STORAGE", "/start_profile", "/start", "/v1/completions", "/stop"],
         )
         self.assertEqual(result["profile_status"], "incomplete")
         self.assertEqual(len(result["digests"]), 1)
         self.assertNotIn("untimed", result)
+        if timing_count:
+            window = json.loads((args.output_dir / "request_window.json").read_text(encoding="utf-8"))
+            self.assertEqual(window, result["request_window"])
+            self.assertEqual(window["count"], timing_count)
+            self.assertEqual(len(window["samples_us"]), timing_count)
+            self.assertEqual(window["digests"], result["digests"] * timing_count)
         finish.assert_called_once()
         stop.assert_called_once_with(process)
         self.assertIn('"event": "cleanup_begin"', log.getvalue())
@@ -644,6 +669,35 @@ class CppMteProfileTests(unittest.TestCase):
         with patch.object(self.runner, "run_step") as build, self.assertRaisesRegex(RuntimeError, "storage"):
             self.runner.run(self.args(), Path("unused-output"))
         build.assert_not_called()
+
+    def test_repeated_window_summary_validates_outputs_and_separates_profile(self):
+        reports = self.worker_reports()
+        labels = tuple(reports)
+        for report in reports.values():
+            report["request_window"] = dict(
+                count=4,
+                samples_us=[1000, 1000, 1000, 1000],
+                stats_us=dict(mean=1000, p50=1000, p95=1000, min=1000, max=1000),
+                stddev_us=0,
+                digests=report["digests"] * 4,
+                usage=report["usage"] * 4,
+                request_specs=report["request_specs"] * 4,
+            )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.compare.print_comparison(reports, Path("run"), labels)
+        self.assertIn("REQUEST_NO_PROFILE baseline: n=4", output.getvalue())
+        self.assertIn("REQUEST baseline: count=1", output.getvalue())
+        self.assertIn("first_half_mean_ms=1.000", output.getvalue())
+        reports["atomic"]["request_window"]["digests"][0] = "wrong"
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "独立请求窗口"):
+            self.compare.print_comparison(reports, Path("run"), labels)
+
+    def test_timing_request_cli_defaults_and_invalid_count(self):
+        self.assertEqual(self.args().timing_requests, 0)
+        self.assertEqual(self.args("--timing-requests", "20").timing_requests, 20)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args("--timing-requests", "-1")
 
 
 if __name__ == "__main__":

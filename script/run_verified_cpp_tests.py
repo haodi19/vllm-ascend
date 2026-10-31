@@ -501,6 +501,35 @@ def _inference(args, source, backend, env, log):
         with progress(f"{backend} warmup: {args.warmup_requests} requests"):
             for index in range(args.warmup_requests):
                 completion(payloads[index % len(payloads)], phase="warmup")
+        request_window = None
+        timing_count = getattr(args, "timing_requests", 0)
+        if timing_count:
+            if not profile_enabled or not getattr(args, "profile_compare", False):
+                raise ValueError("Repeated pre-profile requests require the profile comparison preset")
+            if request(opener, args.timing_port, "/status").get("active") is not False:
+                raise RuntimeError("Repeated request window requires inactive callback timers")
+            # Profiler has not started. Inactive callback wrappers skip both
+            # per-stage clocks and MSTX ranges; wrapper checks still remain.
+            with progress(f"{backend} no-profiler requests: {timing_count}"):
+                samples = [
+                    completion(payloads[index % len(payloads)], phase="no_profiler") for index in range(timing_count)
+                ]
+            if request(opener, args.timing_port, "/status").get("active") is not False:
+                raise RuntimeError("Callback timers became active during repeated request window")
+            summarize = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))["summarize"]
+            durations = [sample[0] for sample in samples]
+            request_window = dict(
+                count=timing_count,
+                instrumentation="profiler_not_started; callback_timers_inactive; wrappers_retained",
+                samples_us=durations,
+                stats_us=summarize(durations),
+                stddev_us=statistics.pstdev(durations),
+                request_specs=[request_specs[index % len(request_specs)] for index in range(timing_count)],
+                digests=[sample[2] for sample in samples],
+                usage=[sample[1] for sample in samples],
+            )
+            # Persist before profiling: export failures must not lose request measurements.
+            (args.output_dir / "request_window.json").write_text(json.dumps(request_window), encoding="utf-8")
         untimed = None
         if getattr(args, "compare_join_cost", False):
             if profile_enabled or getattr(args, "mstx", False):
@@ -541,6 +570,8 @@ def _inference(args, source, backend, env, log):
                 profile_status = finish_profile(opener, args, profile_dir) if profile_enabled else "skipped"
         report["profile_status"] = profile_status
         report["request_specs"] = request_specs
+        if request_window is not None:
+            report["request_window"] = request_window
         if untimed is not None:
             report["untimed"] = untimed
         if getattr(args, "mstx", False) and profile_enabled and not getattr(args, "profile_compare", False):

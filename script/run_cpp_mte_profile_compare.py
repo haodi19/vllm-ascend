@@ -122,6 +122,28 @@ def print_comparison(reports, root, labels=("callback", "mte")):
     print("大间隔阈值只按长度筛选，不自动识别同层预取→按需；MEMCPY 间隔不等于整卡空闲。")
     if set(reports) != set(labels):
         raise ValueError("对照组未全部完成；已完成组的 profile_report.json 和原始 profile 保留")
+    windows = {label: reports[label].get("request_window") for label in labels}
+    if any(windows.values()):
+        if not all(windows.values()):
+            raise ValueError("部分组缺少独立请求计时窗口，不能比较")
+        print("独立整体时延：profiler尚未启动，回调分项计时未开启；包装检查仍在，不是零插桩二进制。")
+        for label, window in windows.items():
+            print_request_window(label, window)
+        if any(
+            windows[label][key] != windows[labels[0]][key]
+            for label in labels[1:]
+            for key in ("count", "request_specs", "digests", "usage")
+        ):
+            raise ValueError("独立请求窗口输出/请求配置不一致，不能据此比较收益")
+        print("NO_PROFILE_OUTPUT_MATCH=True；以下百分比为请求均值变化，不是统计显著性检验。")
+        for label in labels[1:]:
+            value = windows[label]["stats_us"]["mean"]
+            first = windows[labels[0]]["stats_us"]["mean"]
+            last = windows[labels[-1]]["stats_us"]["mean"]
+            print(
+                f"NO_PROFILE_DELTA {label}: vs_first={100 * (value / first - 1):+.2f}%; "
+                f"vs_last={100 * (value / last - 1):+.2f}%"
+            )
     worker_compare = labels == tuple(case[0] for case in WORKER_PROFILE_CASES)
     if worker_compare:
         for label, scan, probe, idle in WORKER_PROFILE_CASES:
@@ -274,9 +296,32 @@ def print_worker_group_metrics(groups, labels):
         )
 
 
+def print_request_window(label, window):
+    samples = window["samples_us"]
+    if len(samples) != window["count"] or not samples or any(not math.isfinite(x) or x <= 0 for x in samples):
+        raise ValueError(f"{label}: invalid no-profiler request samples")
+    stats = window["stats_us"]
+    middle = max(1, len(samples) // 2)
+    first_half = sum(samples[:middle]) / middle
+    second_half = sum(samples[middle:]) / len(samples[middle:]) if samples[middle:] else first_half
+    print(
+        f"REQUEST_NO_PROFILE {label}: n={len(samples)}; "
+        + " ".join(f"{key}_ms={stats[key] / 1000:.3f}" for key in ("mean", "p50", "p95", "min", "max"))
+        + f" stddev_ms={window['stddev_us'] / 1000:.3f}; "
+        f"first_half_mean_ms={first_half / 1000:.3f}; second_half_mean_ms={second_half / 1000:.3f}"
+    )
+    print(f"REQUEST_SAMPLES_MS {label}: " + json.dumps([round(x / 1000, 3) for x in samples]))
+
+
 def print_partial_reports(root, labels=("callback", "mte")):
     print("PARTIAL：完整对照未成功，以下仅保留各组已取得的数据，不能据此比较收益。")
     for backend in labels:
+        window_path = root / backend / "request_window.json"
+        if window_path.is_file():
+            try:
+                print_request_window(backend, json.loads(window_path.read_text(encoding="utf-8")))
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                print(f"PARTIAL_REQUEST_WINDOW {backend}: {exc}")
         path = root / backend / "profile_report.json"
         if not path.is_file():
             print(f"PARTIAL {backend}: 未取得完成报告；service_log={root / backend / 'inference_cpp.log'}")
@@ -345,6 +390,10 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             print("两组均为MTE晚等待＋cpp LRC；只改变加载流：sync_launch → ordinary。")
             print("普通流若请求超时则终止本轮，不跳过设备完成检查，不继续推理。")
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
+        if args.timing_requests:
+            print(
+                f"整体时延另测每组{args.timing_requests}次请求，在profiler和回调计时开始之前执行；随后单独采profile。"
+            )
         print(
             f"配置：各组 cpp；MTE 严格 wait 延后到消费门控后；预热={args.warmup_requests}，"
             f"采集请求={args.requests}，max_tokens=5，大间隔阈值={args.large_gap_us:g} us。",

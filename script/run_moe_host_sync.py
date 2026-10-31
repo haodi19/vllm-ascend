@@ -476,6 +476,12 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_
     parser.add_argument("--profile-timeout", type=int, default=120)
     if profile_compare:
         parser.add_argument("--large-gap-us", type=positive_gap_us, default=100.0)
+        parser.add_argument(
+            "--timing-requests",
+            type=int,
+            default=0,
+            help="Repeated requests before profiler/timers start; profile requests remain separate",
+        )
     parser.add_argument("--port", type=int)
     parser.add_argument("--timing-port", type=int, default=18155)
     parser.add_argument("--output-dir", type=Path)
@@ -487,6 +493,8 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_
     args.stream_compare = stream_compare
     args.three_way = three_way
     args.worker_compare = worker_compare
+    if getattr(args, "timing_requests", 0) < 0:
+        parser.error("--timing-requests must be nonnegative")
     if args.requests is None:
         args.requests = 1 if profile_compare else (10 if args.compare_join_cost else 3)
     if args.warmup_requests is None:
@@ -729,6 +737,7 @@ def run(args, root):
             port=port,
             timing_port=args.timing_port,
             requests=args.requests,
+            timing_requests=getattr(args, "timing_requests", 0),
             warmup_requests=args.warmup_requests,
             max_tokens=VERIFICATION_MAX_TOKENS if getattr(args, "verification_suite", False) else 5,
             startup_timeout=args.startup_timeout,
@@ -817,6 +826,17 @@ def run(args, root):
             baseline = reports["baseline"]
             if any(report.get(field) != baseline.get(field) for field in ("request_specs", "digests", "usage")):
                 raise RuntimeError(f"{label}: output differs from baseline; stop comparison")
+            if getattr(args, "timing_requests", 0):
+                window, reference = report.get("request_window"), baseline.get("request_window")
+                if (
+                    not window
+                    or not reference
+                    or any(
+                        window.get(field) != reference.get(field)
+                        for field in ("count", "request_specs", "digests", "usage")
+                    )
+                ):
+                    raise RuntimeError(f"{label}: repeated request outputs differ from baseline; stop comparison")
         if cost_mode:
             # Preserve each completed group before comparing results or starting
             # the next service, so a later failure does not lose measurements.

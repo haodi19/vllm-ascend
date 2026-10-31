@@ -581,6 +581,44 @@ observe、choose_victims及外围时间；另外比较load_submit＋synchronize�
 可释放旧实验占用或选择另一有足够空间的文件系统，重新采集时使用新输出目录。
 不要复制其他组的start_info或给截断JSON补括号后用于性能比较。
 
+### 多请求整体时延与单请求profile分开测量
+
+前两轮每组只有3次预热和1次带profiler的测量请求。单次结果没有请求间分布，
+不足以区分微秒级交接改善和毫秒级运行波动。第二轮五组profile均通过检查；
+allocated两方向Host间隔均值降低，但请求时间反而升高，不能把局部收益当作整体收益。
+
+新增`--timing-requests`，默认0保持旧实验；设为20时，每个独立服务按以下顺序执行：
+
+1. 预热指定次数，所有组使用相同prompt、max_tokens=5和相同推理配置。
+2. 顺序发送20个请求测HTTP端到端墙钟时间。profiler尚未启动，回调分项计时未开启，
+   本项目的回调MSTX范围也未激活；包装函数及状态检查仍存在，不能称为完全无插桩。
+3. 单独开始profiler及回调计时，执行`--requests`指定的采集请求（建议维持1次）。
+4. 限时停止采集，检查profile并清理服务，再执行下一组。
+
+多请求窗口的逐次时间、输出摘要和token用量先保存在各组`request_window.json`，
+后续导出失败不丢失已取得的请求数据。summary中的`REQUEST_NO_PROFILE`报告均值、
+中位数、p95、最小/最大值、标准差和前后半段均值，`REQUEST_SAMPLES_MS`保留请求顺序。
+原`REQUEST`行仍是另一窗口的带profile请求，不能和无采集数据混算。
+脚本检查不同组多请求窗口的请求配置、输出摘要和用量一致。
+
+```bash
+python -B script/run_moe_worker_profile.py --npu 7 \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --warmup-requests 5 --timing-requests 20 --requests 1 \
+  --request-timeout 120 --profile-timeout 120 \
+  --output-dir bench_results2/moe_worker_stability_01
+```
+
+仍为baseline、allocated、atomic、spin、baseline_repeat五个独立服务，扩展构建一次。
+profile只包含最后的采集请求，不包含前面的20次整体计时；这避免把请求间停顿混入层间间隔，
+也避免将profile体积扩大20倍。更多请求会进一步改变/预热缓存状态，新的profile不与旧轮逐层混算。
+
+判断收益时分别看局部交接与整体分布。局部统计包含设备计算和依赖等待，不是纯轮询代码耗时；
+整体看候选对前后基线的均值、中位数和尾部变化。20次请求有助于评估服务内波动，
+但同一服务中的样本并非20次独立服务实验，仍不能完全排除固定运行顺序及服务间环境差异。
+若收益很小或前后基线仍不一致，再针对候选交替重启复测，不宣称已获统计显著收益。
+
 ## 独立测试的绿区执行
 
 首次建立独立目录，不在原目录或阻塞复现目录 reset：
