@@ -547,13 +547,19 @@ class CppMteProfileTests(unittest.TestCase):
         return reports
 
     def test_worker_candidates_change_one_option_and_stop_on_failure(self):
-        for failure in (None, "timeout", "policy", "output", "dropped", "capacity"):
+        for failure in (None, "timeout", "policy", "output", "dropped", "capacity", "trials"):
             self.storage.reset_mock(side_effect=True)
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root, calls, configs = Path(directory), [], []
                 with patch.object(sys, "platform", "linux"):
                     args = self.runner.parse_args(
-                        ["--npu", "7", "--cache-policy-backend", "cpp"],
+                        [
+                            "--npu",
+                            "7",
+                            "--cache-policy-backend",
+                            "cpp",
+                            *(["--atomic-trials", "3", "--timing-requests", "2"] if failure == "trials" else []),
+                        ],
                         profile_compare=True,
                         worker_compare=True,
                     )
@@ -586,6 +592,11 @@ class CppMteProfileTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     report = self.report("incomplete")
+                    if failure == "trials":
+                        self.assertEqual(run_args.timing_requests, 2)
+                        report["request_window"] = dict(
+                            count=2, **{field: report[field] * 2 for field in ("digests", "usage", "request_specs")}
+                        )
                     if label == "allocated":
                         if failure == "timeout":
                             raise TimeoutError("worker request timeout")
@@ -601,13 +612,21 @@ class CppMteProfileTests(unittest.TestCase):
                     patch.object(self.runner, "inference", side_effect=fake_inference),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    if failure:
+                    if failure and failure != "trials":
                         with self.assertRaises((RuntimeError, TimeoutError)):
                             self.runner.run(args, root)
                         self.assertEqual(calls, ["baseline"] if failure == "capacity" else ["baseline", "allocated"])
                         self.assertTrue((root / "baseline/profile_report.json").exists())
                     else:
                         reports = self.runner.run(args, root)
+                        if failure == "trials":
+                            self.assertEqual(
+                                calls, ["baseline", "atomic", "atomic_2", "baseline_2", "baseline_3", "atomic_3"]
+                            )
+                            self.assertEqual(configs[0], configs[3])
+                            self.assertEqual(configs[1], configs[2])
+                            self.assertEqual(sum(configs[0][key] != configs[1][key] for key in configs[0]), 1)
+                            continue
                         self.assertEqual(calls, [case[0] for case in self.runner.WORKER_PROFILE_CASES])
                         self.assertEqual(configs[0], configs[-1])
                         for config in configs[1:-1]:
@@ -663,6 +682,50 @@ class CppMteProfileTests(unittest.TestCase):
                 profile_compare=True,
                 worker_compare=True,
             )
+
+    def test_atomic_trials_require_request_window(self):
+        with (
+            patch.object(sys, "platform", "linux"),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            self.runner.parse_args(["--npu", "7", "--atomic-trials", "3"], profile_compare=True, worker_compare=True)
+
+    def test_atomic_trials_entry_pairs_reverse_order_and_preserve_reports(self):
+        def fake_run(args, root):
+            reports = {}
+            for label, scan, probe, idle in self.runner.worker_profile_cases(args.atomic_trials):
+                report = copy.deepcopy(self.worker_reports()["atomic" if probe == "atomic" else "baseline"])
+                value = 990 if probe == "atomic" else 1000
+                report["request_window"] = dict(
+                    count=2,
+                    samples_us=[value, value],
+                    stats_us=dict(mean=value, p50=value, p95=value, min=value, max=value),
+                    stddev_us=0,
+                    **{field: report[field] * 2 for field in ("digests", "usage", "request_specs")},
+                )
+                reports[label] = report
+            return reports
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(sys, "platform", "linux"),
+            patch.object(self.compare, "run", side_effect=fake_run),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            root = Path(directory) / "run"
+            self.assertEqual(
+                self.compare.main(
+                    ["--npu", "7", "--atomic-trials", "3", "--timing-requests", "2", "--output-dir", str(root)],
+                    worker_compare=True,
+                ),
+                0,
+            )
+            summary = (root / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("ATOMIC_TRIAL 2: order=atomic->baseline", summary)
+            self.assertIn("faster_pairs=3; mean_pair_delta_pct=-1.000%", summary)
+            self.assertIn("REQUEST_NO_PROFILE baseline_3", summary)
+            self.assertIn(str(root / "profile/atomic_3/cpp"), summary)
 
     def test_low_storage_stops_before_build(self):
         self.storage.side_effect = RuntimeError("Insufficient profile storage")

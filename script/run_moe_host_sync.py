@@ -43,6 +43,21 @@ WORKER_PROFILE_CASES = (
 )
 
 
+def worker_profile_cases(atomic_trials=0):
+    """Alternate pair order across fresh services; retain the original matrix."""
+    if not atomic_trials:
+        return WORKER_PROFILE_CASES
+    cases = []
+    for trial in range(1, atomic_trials + 1):
+        suffix = "" if trial == 1 else f"_{trial}"
+        pair = [
+            (f"baseline{suffix}", "all", "locked", "yield"),
+            (f"atomic{suffix}", "all", "atomic", "yield"),
+        ]
+        cases.extend(pair if trial % 2 else reversed(pair))
+    return tuple(cases)
+
+
 class CostProgressFile:
     """Keep full details locally; show only phase progress on the console."""
 
@@ -389,6 +404,14 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_
     if stream_compare and not profile_compare:
         raise ValueError("stream comparison requires profile comparison preset")
     parser = argparse.ArgumentParser(description=__doc__)
+    if worker_compare:
+        parser.add_argument(
+            "--atomic-trials",
+            type=int,
+            default=0,
+            choices=range(5),
+            help="Fresh baseline/atomic pairs with alternating order (0: original matrix)",
+        )
     parser.add_argument(
         "--compare-join-cost",
         action="store_true",
@@ -495,6 +518,8 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_
     args.worker_compare = worker_compare
     if getattr(args, "timing_requests", 0) < 0:
         parser.error("--timing-requests must be nonnegative")
+    if getattr(args, "atomic_trials", 0) and not args.timing_requests:
+        parser.error("--atomic-trials requires positive --timing-requests")
     if args.requests is None:
         args.requests = 1 if profile_compare else (10 if args.compare_join_cost else 3)
     if args.warmup_requests is None:
@@ -719,7 +744,10 @@ def run(args, root):
     )
     if getattr(args, "three_way", False):
         cases = (("callback", "callback", "ordinary"), *cases)
-    worker_policies = {label: (scan, probe, idle) for label, scan, probe, idle in WORKER_PROFILE_CASES}
+    worker_policies = {
+        label: (scan, probe, idle)
+        for label, scan, probe, idle in worker_profile_cases(getattr(args, "atomic_trials", 0))
+    }
     if worker_compare:
         cases = tuple((label, "mte", "ordinary") for label in worker_policies)
     for label, backend, load_stream_mode in cases:

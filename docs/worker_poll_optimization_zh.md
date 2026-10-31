@@ -619,6 +619,31 @@ profile只包含最后的采集请求，不包含前面的20次整体计时；�
 但同一服务中的样本并非20次独立服务实验，仍不能完全排除固定运行顺序及服务间环境差异。
 若收益很小或前后基线仍不一致，再针对候选交替重启复测，不宣称已获统计显著收益。
 
+### atomic 独立服务交替复验
+
+多请求实验中 atomic 的无采集请求均值比首次基线低约 1.28%，但每种配置仅启动了一次服务，
+仍需区分策略收益与服务间环境差异。增加 `--atomic-trials 3` 后只比较原子预检查，
+扫描范围仍为 all，空闲行为仍为 yield，保持 MTE 普通流、消费者处严格等待和 C++ LRC。
+
+三轮按 `baseline → atomic`、`atomic → baseline`、`baseline → atomic` 顺序运行，
+共启动六个独立服务；每个服务预热 5 次、无采集计时 20 次，再单独采集 1 次 profile。
+交换顺序可以检查运行先后影响，但三轮不能完全消除环境漂移，也不代表统计显著性证明。
+
+```bash
+python -B script/run_moe_worker_profile.py --npu 7 \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --atomic-trials 3 --warmup-requests 5 --timing-requests 20 --requests 1 \
+  --request-timeout 120 --profile-timeout 120 \
+  --output-dir bench_results2/moe_atomic_stability_01
+```
+
+汇总逐轮比较请求分布、输出一致性和交接间隔，末尾的 `ATOMIC_TRIAL` 给出每轮均值、
+中位数变化；`ATOMIC_TRIAL_SUMMARY` 统计变快轮数及各轮百分比变化范围。
+所有组的请求输出都与首组核对；构建一次，服务顺序启动和清理。
+profile 保存在该结果目录的 `profile/<组名>/cpp`，不包含之前的无采集请求。
+当前默认 worker 策略不变；绿区实测结果返回后再判断是否稳定改善。
+
 ## 独立测试的绿区执行
 
 首次建立独立目录，不在原目录或阻塞复现目录 reset：

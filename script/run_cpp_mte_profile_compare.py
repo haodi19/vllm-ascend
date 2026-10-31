@@ -10,7 +10,14 @@ import sys
 from uuid import uuid4
 
 from mte_join_cost import LOAD_STATS
-from run_moe_host_sync import WORKER_PROFILE_CASES, CostProgressFile, failure_excerpt, parse_args, run
+from run_moe_host_sync import (
+    WORKER_PROFILE_CASES,
+    CostProgressFile,
+    failure_excerpt,
+    parse_args,
+    run,
+    worker_profile_cases,
+)
 from run_verified_cpp_tests import REPO, SummaryTee
 
 METRICS = (
@@ -113,11 +120,11 @@ def print_profile(backend, report, root):
     return len(usable) == len(traces)
 
 
-def print_comparison(reports, root, labels=("callback", "mte")):
+def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=None):
     """Keep descriptive timings even when profile export fails; reject unequal outputs."""
     print(f"\n本轮{len(labels)}组 LRC=cpp（observe/choose_victims 及配套状态管理）；权重准备/提交仍用 Python/Torch。")
     print("未开启融合规划、ACL 搬运或 CPU 重排。")
-    print("计时含 profiler、MSTX 和内部计时开销；请求时延为辅助数据，不是无采集性能验收。")
+    print("采集窗口的 REQUEST 和分项计时含 profiler、MSTX 开销；无采集整体时延单独列为 REQUEST_NO_PROFILE。")
     print("间隔覆盖整个采集窗口：Host 仅同进程相邻回调；MEMCPY 仅同设备同流，包含批次内/批次间。")
     print("大间隔阈值只按长度筛选，不自动识别同层预取→按需；MEMCPY 间隔不等于整卡空闲。")
     if set(reports) != set(labels):
@@ -144,9 +151,10 @@ def print_comparison(reports, root, labels=("callback", "mte")):
                 f"NO_PROFILE_DELTA {label}: vs_first={100 * (value / first - 1):+.2f}%; "
                 f"vs_last={100 * (value / last - 1):+.2f}%"
             )
-    worker_compare = labels == tuple(case[0] for case in WORKER_PROFILE_CASES)
+    worker_cases = WORKER_PROFILE_CASES if worker_cases is None else worker_cases
+    worker_compare = labels == tuple(case[0] for case in worker_cases)
     if worker_compare:
-        for label, scan, probe, idle in WORKER_PROFILE_CASES:
+        for label, scan, probe, idle in worker_cases:
             report = reports[label]
             if (
                 report.get("host_backend") != "mte"
@@ -221,7 +229,7 @@ def print_comparison(reports, root, labels=("callback", "mte")):
             f"experts={'/'.join(format(group['loads']['mean'] * group['count'], '.1f') for group in groups)} "
             f"workload_summary_match={matched}"
         )
-        if worker_compare:
+        if worker_compare and len(labels) > 2:
             print_worker_group_metrics(groups, labels)
             continue
         if len(labels) == 3:
@@ -247,7 +255,7 @@ def print_comparison(reports, root, labels=("callback", "mte")):
         f"all_profiles_usable={profiles_ok}"
     )
     print("分项时延与间隔是不同测量；上述统计不证明跨 CPU/NPU 时间线的因果关系。")
-    if worker_compare:
+    if worker_compare and len(labels) > 2:
         print("baseline_repeat与baseline配置相同；若两端基线波动接近候选收益，不能宣称优化稳定有效。")
     return {
         "outputs_match": True,
@@ -357,6 +365,31 @@ def print_failure_logs(root, labels):
             print(failure_excerpt(tail))
 
 
+def print_atomic_trials(reports, trials):
+    print("\n独立服务复验：负数表示 atomic 更快；逐轮比较，不把请求当作独立服务重复。")
+    deltas = []
+    for trial in range(1, trials + 1):
+        suffix = "" if trial == 1 else f"_{trial}"
+        baseline, atomic = (reports[f"{name}{suffix}"]["request_window"] for name in ("baseline", "atomic"))
+        first, second = (window["stats_us"]["mean"] for window in (baseline, atomic))
+        delta = 100 * (second / first - 1)
+        deltas.append(delta)
+        median_delta = 100 * (atomic["stats_us"]["p50"] / baseline["stats_us"]["p50"] - 1)
+        order = "baseline->atomic" if trial % 2 else "atomic->baseline"
+        print(
+            f"ATOMIC_TRIAL {trial}: order={order}; n={baseline['count']}/{atomic['count']}; "
+            f"baseline_ms={first / 1000:.3f}; atomic_ms={second / 1000:.3f}; "
+            f"delta_ms={(second - first) / 1000:+.3f}; delta_pct={delta:+.3f}%; "
+            f"median_delta_pct={median_delta:+.3f}%"
+        )
+    print(
+        f"ATOMIC_TRIAL_SUMMARY trials={trials}; faster_pairs={sum(value < 0 for value in deltas)}; "
+        f"mean_pair_delta_pct={sum(deltas) / len(deltas):+.3f}%; "
+        f"range_pct=[{min(deltas):+.3f}, {max(deltas):+.3f}]"
+    )
+    print("该汇总是描述性结果；需同时查看顺序、组内波动及局部交接间隔，不自动宣称统计显著。")
+
+
 def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=False):
     stream_compare = stream_compare or three_way
     args = parse_args(
@@ -372,7 +405,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         labels = ("callback", "sync_launch", "ordinary")
         prefix = "moe_three_way"
     if worker_compare:
-        labels = tuple(case[0] for case in WORKER_PROFILE_CASES)
+        labels = tuple(case[0] for case in worker_profile_cases(args.atomic_trials))
         prefix = "moe_worker_profile"
     root = (args.output_dir or REPO / "bench_results" / f"{prefix}_{uuid4().hex[:8]}").resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -380,7 +413,10 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         (root / "summary.txt").open("w", encoding="utf-8") as summary,
         contextlib.redirect_stdout(SummaryTee(sys.stdout, summary)),
     ):
-        if worker_compare:
+        if worker_compare and args.atomic_trials:
+            print("MTE普通流＋cpp LRC；独立服务顺序：" + " → ".join(labels))
+            print("每轮仅改变 locked/atomic 预检查；scan=all、idle=yield。逐轮交换顺序，全部保存profile。")
+        elif worker_compare:
             print("MTE普通流＋cpp LRC：baseline → allocated → atomic → spin → baseline_repeat。")
             print("三个候选各自只改一个worker开关；不绑核、不启用C++轮询内部计时；全部保存profile。")
         elif three_way:
@@ -413,7 +449,16 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
                         progress.flush()
             if not isinstance(reports, dict):
                 raise RuntimeError(f"构建、回归或运行失败（exit={reports}），详见 run_details.log")
-            print_comparison(reports, root, labels)
+            if worker_compare and args.atomic_trials:
+                for trial in range(1, args.atomic_trials + 1):
+                    suffix = "" if trial == 1 else f"_{trial}"
+                    pair = (f"baseline{suffix}", f"atomic{suffix}")
+                    policies = tuple((label, "all", probe, "yield") for label, probe in zip(pair, ("locked", "atomic")))
+                    print(f"\n=== 独立对照第 {trial} 轮；表格统一按 baseline、atomic 排列 ===")
+                    print_comparison({label: reports[label] for label in pair}, root, pair, worker_cases=policies)
+                print_atomic_trials(reports, args.atomic_trials)
+            else:
+                print_comparison(reports, root, labels)
             return 0
         except Exception as exc:
             print(
