@@ -721,6 +721,40 @@ python -B script/run_moe_worker_profile.py --npu 7 \
 baseline/allocated/combined（第二轮为相应 `_2` 组）。表格表头、数值及运行配置正确；
 已修复为动态组名，无需重跑采集。
 
+### 回调、MTE 默认与 MTE 组合三组对照
+
+入口为 `script/run_moe_callback_worker_compare.py`，按 callback → mte_default → mte_combined
+顺序运行三个独立服务，构建扩展一次。三组均使用 C++ LRC、普通加载流、原始权重拷贝，
+模型和推理配置读取同一个 `script/test_graph2.sh`。
+
+| 组名 | CPU/NPU 交接 | worker 配置 |
+| --- | --- | --- |
+| callback | 原回调路径 | 不使用 MTE worker |
+| mte_default | MTE 发布，消费者处严格等待 | all / locked / yield |
+| mte_combined | 同上 | allocated / atomic / yield |
+
+这里的 MTE 默认版指已验证可运行的普通流、晚等待版本，不是早期发生阻塞的版本。
+选择组合是为了对照其局部交接改善，不代表已确认端到端加速；spin 不开启，不绑核。
+每组默认预热 5 次、20 次无 profiler 请求、另采集 1 次 profile 请求，max_tokens=5。
+无采集窗口不开回调分项计时，采集窗口开启 MSTX 与分项计时；C++ 轮询内部计时关闭。
+
+```bash
+python -B script/run_moe_callback_worker_compare.py --npu 7 \
+  --runtime-source /home/l00992607/vllm-ascend \
+  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
+  --warmup-requests 5 --timing-requests 20 --requests 1 \
+  --request-timeout 120 --profile-timeout 120 \
+  --output-dir bench_results2/moe_callback_mte_compare_01
+```
+
+汇总为结果目录的 `summary.txt`，可视化分别在 `profile/callback/cpp`、
+`profile/mte_default/cpp`、`profile/mte_combined/cpp` 的 worker 子目录中。
+汇总同时提供无采集请求分布、两方向 Host 回调间隔、同流 MEMCPY 间隔、回调分项计时。
+`NO_PROFILE_COMBINED_VS_DEFAULT` 单独展示组合相对 MTE 默认版的整体变化。
+输出/用量不一致、实际策略不符、请求失败或清理前引擎错误会停止后续组；profile 导出失败
+保留已有计时并限时清理后继续，不能将失败 profile 当成有效可视化。
+本次每种配置仅一次服务启动，是当前三种方案的横向对照，不代替之前的独立服务重复实验。
+
 ## 独立测试的绿区执行
 
 首次建立独立目录，不在原目录或阻塞复现目录 reset：

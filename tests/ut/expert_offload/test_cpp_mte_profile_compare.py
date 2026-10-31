@@ -74,6 +74,128 @@ class CppMteProfileTests(unittest.TestCase):
         self.assertEqual(args.profile_timeout, 120)
         self.assertFalse(legacy.diagnose_prefetch_wait_at_join)
 
+    def test_handoff_three_groups_runtime_configuration_and_failure_guards(self):
+        for failure in (None, "policy", "window", "timeout"):
+            with tempfile.TemporaryDirectory() as directory, patch.object(sys, "platform", "linux"):
+                root, calls, settings = Path(directory), [], []
+                args = self.runner.parse_args(
+                    ["--npu", "7", "--cache-policy-backend", "cpp"], profile_compare=True, handoff_compare=True
+                )
+                self.assertEqual((args.timing_requests, args.warmup_requests, args.requests), (20, 5, 1))
+
+                def fake_inference(
+                    run_args, source, policy, env, *, failure=failure, calls=calls, root=root, settings=settings
+                ):
+                    label = run_args.output_dir.name
+                    calls.append(label)
+                    if failure == "timeout" and label == "mte_default":
+                        raise TimeoutError("request timeout")
+                    self.assertEqual((run_args.timing_requests, run_args.max_tokens, policy), (20, 5, "cpp"))
+                    self.assertFalse(run_args.skip_profile)
+                    self.assertEqual(run_args.profile_run_dir, root / "profile" / label)
+                    _, command, _, _ = self.runner.launch_spec(source, policy, 7, None, 18155)
+                    config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
+                    settings.append(config)
+                    expected = next(case for case in self.runner.HANDOFF_PROFILE_CASES if case[0] == label)
+                    _, backend, scan, probe, idle = expected
+                    self.assertEqual(config["host_sync_backend"], backend)
+                    self.assertEqual(config["host_sync_load_stream"], "ordinary")
+                    self.assertEqual(config["host_sync_diagnose_prefetch_wait_at_join"], backend == "mte")
+                    self.assertEqual(
+                        tuple(config[f"host_sync_{key}"] for key in ("scan_mode", "idle_probe", "idle_mode")),
+                        (scan, probe, idle),
+                    )
+                    if failure == "policy" and label == "mte_combined":
+                        probe = "locked"
+                    log = '[MOE-MTE RUNNER] {"event": "cleanup_begin"}\n'
+                    if backend == "mte":
+                        log = (
+                            "[MOE-MTE] weight load stream=Stream; mode=ordinary; H2D wait retained\n"
+                            f"[MOE-MTE WORKER] scan={scan} probe={probe} idle={idle}\n"
+                            "[MOE-MTE] first real offload callback completed\n" + log
+                        )
+                    (run_args.output_dir / "inference_cpp.log").write_text(log, encoding="utf-8")
+                    report = self.report("incomplete")
+                    report["request_window"] = dict(
+                        count=20, **{field: report[field] * 20 for field in ("request_specs", "digests", "usage")}
+                    )
+                    if failure == "window" and label == "mte_default":
+                        report["request_window"]["digests"] = [hashlib.sha256(b"wrong").hexdigest()] * 20
+                    return report
+
+                with (
+                    patch.object(self.runner, "run_step", return_value=True),
+                    patch.object(self.runner, "select_build_directory", return_value=root / "build"),
+                    patch.object(self.runner, "inference", side_effect=fake_inference),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    if failure:
+                        with self.assertRaises((RuntimeError, TimeoutError)):
+                            self.runner.run(args, root)
+                        self.assertEqual(
+                            calls,
+                            ["callback", "mte_default", "mte_combined"]
+                            if failure == "policy"
+                            else ["callback", "mte_default"],
+                        )
+                    else:
+                        reports = self.runner.run(args, root)
+                        self.assertEqual(list(reports), ["callback", "mte_default", "mte_combined"])
+                        self.assertIsNone(reports["callback"]["worker_policy"])
+                        self.assertEqual(sum(settings[1][key] != settings[2][key] for key in settings[1]), 2)
+                    self.assertTrue((root / "callback/profile_report.json").is_file())
+
+    def test_handoff_entry_summary_labels_and_policy_validation(self):
+        for wrong_policy in (False, True):
+
+            def fake_run(args, root, *, wrong_policy=wrong_policy):
+                reports = {}
+                for label, backend, scan, probe, idle in self.runner.HANDOFF_PROFILE_CASES:
+                    report = self.report()
+                    report.update(
+                        host_backend=backend,
+                        load_stream_mode="ordinary",
+                        cache_policy_backend="cpp",
+                        worker_policy=dict(scan=scan, probe=probe, idle=idle) if backend == "mte" else None,
+                    )
+                    report["request_window"] = dict(
+                        count=2,
+                        samples_us=[1000, 1000],
+                        stddev_us=0,
+                        stats_us=dict(mean=1000, p50=1000, p95=1000, min=1000, max=1000),
+                        **{field: report[field] * 2 for field in ("request_specs", "digests", "usage")},
+                    )
+                    reports[label] = report
+                if wrong_policy:
+                    reports["mte_combined"]["worker_policy"]["scan"] = "all"
+                return reports
+
+            with (
+                tempfile.TemporaryDirectory() as directory,
+                patch.object(sys, "platform", "linux"),
+                patch.object(self.compare, "run", side_effect=fake_run),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                root = Path(directory) / "run"
+                code = self.compare.main(["--npu", "7", "--output-dir", str(root)], handoff_compare=True)
+                self.assertEqual(code, 1 if wrong_policy else 0)
+                if not wrong_policy:
+                    summary = (root / "summary.txt").read_text(encoding="utf-8")
+                    self.assertIn("NO_PROFILE_COMBINED_VS_DEFAULT", summary)
+                    self.assertIn("mte_combined-mte_default=", summary)
+                    self.assertIn(str(root / "profile/mte_combined/cpp"), summary)
+                    self.assertNotIn("sync_launch-callback=", summary)
+
+    def test_handoff_preset_rejects_conflicting_modes(self):
+        with self.assertRaises(ValueError):
+            self.runner.parse_args([], profile_compare=True, worker_compare=True, handoff_compare=True)
+        with (
+            patch.object(sys, "platform", "linux"),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            self.runner.parse_args(["--npu", "7", "--timing-requests", "0"], profile_compare=True, handoff_compare=True)
+
     def test_profile_rejects_confounded_settings(self):
         for options in (
             ("--cache-policy-backend", "python"),

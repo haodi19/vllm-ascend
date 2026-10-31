@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from mte_join_cost import LOAD_STATS
 from run_moe_host_sync import (
+    HANDOFF_PROFILE_CASES,
     WORKER_PROFILE_CASES,
     CostProgressFile,
     failure_excerpt,
@@ -129,6 +130,18 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
     print("大间隔阈值只按长度筛选，不自动识别同层预取→按需；MEMCPY 间隔不等于整卡空闲。")
     if set(reports) != set(labels):
         raise ValueError("对照组未全部完成；已完成组的 profile_report.json 和原始 profile 保留")
+    handoff_compare = labels == tuple(case[0] for case in HANDOFF_PROFILE_CASES)
+    if handoff_compare:
+        for label, backend, scan, probe, idle in HANDOFF_PROFILE_CASES:
+            report = reports[label]
+            policy = dict(scan=scan, probe=probe, idle=idle) if backend == "mte" else None
+            if (
+                report.get("host_backend"),
+                report.get("load_stream_mode"),
+                report.get("cache_policy_backend"),
+                report.get("worker_policy"),
+            ) != (backend, "ordinary", "cpp", policy):
+                raise ValueError(f"{label}: wrong handoff experiment identity")
     windows = {label: reports[label].get("request_window") for label in labels}
     if any(windows.values()):
         if not all(windows.values()):
@@ -150,6 +163,12 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
             print(
                 f"NO_PROFILE_DELTA {label}: vs_first={100 * (value / first - 1):+.2f}%; "
                 f"vs_last={100 * (value / last - 1):+.2f}%"
+            )
+        if handoff_compare:
+            first, second = (windows[label]["stats_us"]["mean"] for label in ("mte_default", "mte_combined"))
+            print(
+                f"NO_PROFILE_COMBINED_VS_DEFAULT: delta_ms={(second - first) / 1000:+.3f}; "
+                f"delta_pct={100 * (second / first - 1):+.3f}%"
             )
     worker_cases = WORKER_PROFILE_CASES if worker_cases is None else worker_cases
     worker_compare = labels == tuple(case[0] for case in worker_cases)
@@ -190,7 +209,7 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
             print(f"REQUEST_BOUNDARIES {backend}: 多个请求间停顿可能进入大间隔统计，不能当成层间空泡。")
         positions = report.get("engine_error_log_positions", {})
         print(f"ENGINE_ERRORS {backend}: {json.dumps(positions)}；只按日志顺序区分清理边界。")
-        if worker_compare:
+        if worker_compare or handoff_compare:
             print(f"WORKER {backend}: {json.dumps(report['worker_policy'])}")
         profiles_ok = print_profile(backend, report, root) and profiles_ok
     matching = {
@@ -408,7 +427,7 @@ def print_combination_trials(reports, trials):
     print("局部收益不预设可叠加；结合各轮 Host 间隔和无采集请求判断，不以搬运分项代替交接效果。")
 
 
-def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=False):
+def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=False, handoff_compare=False):
     stream_compare = stream_compare or three_way
     args = parse_args(
         ["--cache-policy-backend", "cpp", *(sys.argv[1:] if argv is None else argv)],
@@ -416,6 +435,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         stream_compare=stream_compare,
         three_way=three_way,
         worker_compare=worker_compare,
+        handoff_compare=handoff_compare,
     )
     labels = ("sync_launch", "ordinary") if stream_compare else ("callback", "mte")
     prefix = "mte_load_stream" if stream_compare else "cpp_mte_profile"
@@ -425,13 +445,20 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
     if worker_compare:
         labels = tuple(case[0] for case in worker_profile_cases(args.atomic_trials, args.combination_trials))
         prefix = "moe_worker_profile"
+    if handoff_compare:
+        labels = tuple(case[0] for case in HANDOFF_PROFILE_CASES)
+        prefix = "moe_callback_worker"
     root = (args.output_dir or REPO / "bench_results" / f"{prefix}_{uuid4().hex[:8]}").resolve()
     root.mkdir(parents=True, exist_ok=False)
     with (
         (root / "summary.txt").open("w", encoding="utf-8") as summary,
         contextlib.redirect_stdout(SummaryTee(sys.stdout, summary)),
     ):
-        if worker_compare and args.combination_trials:
+        if handoff_compare:
+            print("三组顺序运行：callback → mte_default → mte_combined；全部普通加载流＋cpp LRC。")
+            print("MTE默认=all/locked/yield；MTE改动=allocated/atomic/yield；两组均在消费者处严格等待。")
+            print("不绑核、不启用C++轮询内部计时；三个独立服务，分别保存profile。")
+        elif worker_compare and args.combination_trials:
             print("MTE普通流＋cpp LRC；组合测试独立服务顺序：" + " → ".join(labels))
             print("baseline=all/locked/yield；allocated=allocated/locked/yield；combined=allocated/atomic/yield。")
             print("不绑核、不启用C++轮询内部计时；每组保存profile，默认策略不变。")
@@ -497,7 +524,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
                 flush=True,
             )
             print_partial_reports(root, labels)
-            if stream_compare or worker_compare:
+            if stream_compare or worker_compare or handoff_compare:
                 print_failure_logs(root, labels)
             return 1
 

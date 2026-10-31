@@ -42,6 +42,12 @@ WORKER_PROFILE_CASES = (
     ("baseline_repeat", "all", "locked", "yield"),
 )
 
+HANDOFF_PROFILE_CASES = (
+    ("callback", "callback", "all", "locked", "yield"),
+    ("mte_default", "mte", "all", "locked", "yield"),
+    ("mte_combined", "mte", "allocated", "atomic", "yield"),
+)
+
 
 def worker_profile_cases(atomic_trials=0, combination_trials=0):
     """Alternate pair order across fresh services; retain the original matrix."""
@@ -407,7 +413,17 @@ def prepare_runtime_artifacts(source, target):
     print(f"Runtime artifacts: copied missing files={copied}; existing files preserved; source={source}", flush=True)
 
 
-def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_way=False, worker_compare=False):
+def parse_args(
+    argv=None,
+    *,
+    profile_compare=False,
+    stream_compare=False,
+    three_way=False,
+    worker_compare=False,
+    handoff_compare=False,
+):
+    if handoff_compare and (not profile_compare or stream_compare or three_way or worker_compare):
+        raise ValueError("handoff comparison requires its own profile preset")
     if worker_compare and (not profile_compare or stream_compare or three_way):
         raise ValueError("worker comparison requires its own profile preset")
     if three_way and not stream_compare:
@@ -521,7 +537,7 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_
         parser.add_argument(
             "--timing-requests",
             type=int,
-            default=0,
+            default=20 if handoff_compare else 0,
             help="Repeated requests before profiler/timers start; profile requests remain separate",
         )
     parser.add_argument("--port", type=int)
@@ -535,14 +551,17 @@ def parse_args(argv=None, *, profile_compare=False, stream_compare=False, three_
     args.stream_compare = stream_compare
     args.three_way = three_way
     args.worker_compare = worker_compare
+    args.handoff_compare = handoff_compare
     if getattr(args, "timing_requests", 0) < 0:
         parser.error("--timing-requests must be nonnegative")
+    if handoff_compare and not args.timing_requests:
+        parser.error("handoff comparison requires positive --timing-requests")
     if (getattr(args, "atomic_trials", 0) or getattr(args, "combination_trials", 0)) and not args.timing_requests:
         parser.error("worker trials require positive --timing-requests")
     if args.requests is None:
         args.requests = 1 if profile_compare else (10 if args.compare_join_cost else 3)
     if args.warmup_requests is None:
-        args.warmup_requests = 3 if args.compare_join_cost or profile_compare else 1
+        args.warmup_requests = 5 if handoff_compare else (3 if args.compare_join_cost or profile_compare else 1)
     if args.compare_join_cost or profile_compare:
         conflicts = [name for name, value in vars(args).items() if name.startswith("diagnose_") and value]
         if (
@@ -649,6 +668,7 @@ def main():
 def run(args, root):
     stream_compare = getattr(args, "stream_compare", False)
     worker_compare = getattr(args, "worker_compare", False)
+    handoff_compare = getattr(args, "handoff_compare", False)
     cache_policy_backend = getattr(args, "cache_policy_backend", "python")
     profile_compare = getattr(args, "profile_compare", False)
     if profile_compare:
@@ -730,7 +750,7 @@ def run(args, root):
         for label, command in commands:
             if not run_step(label, command, 600):
                 return 1
-        if worker_compare and not run_step(
+        if (worker_compare or handoff_compare) and not run_step(
             "CPU Host lifecycle regression",
             [sys.executable, "-B", "tests/ut/expert_offload/test_host_sync_session.py"],
             120,
@@ -771,11 +791,16 @@ def run(args, root):
     }
     if worker_compare:
         cases = tuple((label, "mte", "ordinary") for label in worker_policies)
+    if handoff_compare:
+        cases = tuple((label, backend, "ordinary") for label, backend, *_ in HANDOFF_PROFILE_CASES)
+        worker_policies = {label: (scan, probe, idle) for label, _, scan, probe, idle in HANDOFF_PROFILE_CASES}
     for label, backend, load_stream_mode in cases:
         if profile_compare:
             ensure_profile_storage(root / "profile" / label / cache_policy_backend, stage=f"before service {label}")
         scan, probe, idle = (
-            worker_policies[label] if worker_compare else (args.worker_scan, args.worker_probe, args.worker_idle)
+            worker_policies[label]
+            if worker_compare or handoff_compare
+            else (args.worker_scan, args.worker_probe, args.worker_idle)
         )
         directory = root / label
         directory.mkdir()
@@ -839,7 +864,11 @@ def run(args, root):
             env,
         )
         log = (directory / f"inference_{cache_policy_backend}.log").read_text(encoding="utf-8", errors="replace")
-        if worker_compare and f"[MOE-MTE WORKER] scan={scan} probe={probe} idle={idle}" not in log:
+        if (
+            (worker_compare or handoff_compare)
+            and backend == "mte"
+            and f"[MOE-MTE WORKER] scan={scan} probe={probe} idle={idle}" not in log
+        ):
             raise RuntimeError(f"{label}: missing runtime worker policy evidence")
         assess_profile_report(
             reports[label],
@@ -857,22 +886,22 @@ def run(args, root):
             load_stream_mode=load_stream_mode if backend == "mte" else "ordinary",
             worker_policy=dict(scan=scan, probe=probe, idle=idle) if backend == "mte" else None,
         )
-        if (stream_compare or worker_compare) and backend == "mte":
+        if (stream_compare or worker_compare or handoff_compare) and backend == "mte":
             expected_type = "SyncLaunchStream" if load_stream_mode == "sync_launch" else "Stream"
             expected = f"[MOE-MTE] weight load stream={expected_type}; mode={load_stream_mode}; H2D wait retained"
             if expected not in log:
                 raise RuntimeError(f"Missing runtime load stream evidence: {expected}")
         if profile_compare:
             (directory / "profile_report.json").write_text(json.dumps(reports[label]), encoding="utf-8")
-        if stream_compare or worker_compare:
+        if stream_compare or worker_compare or handoff_compare:
             positions = reports[label]["engine_error_log_positions"]
             if not positions["cleanup_marker_unique"] or positions["before_cleanup"] != 0:
                 raise RuntimeError(f"{label}: engine error before cleanup or missing cleanup boundary; stop comparison")
-        if worker_compare:
+        if worker_compare or handoff_compare:
             report = reports[label]
             if report.get("errors") != 0 or report.get("dropped") != 0 or report.get("count", 0) <= 0:
                 raise RuntimeError(f"{label}: invalid callback measurements; stop comparison")
-            baseline = reports["baseline"]
+            baseline = reports["callback" if handoff_compare else "baseline"]
             if any(report.get(field) != baseline.get(field) for field in ("request_specs", "digests", "usage")):
                 raise RuntimeError(f"{label}: output differs from baseline; stop comparison")
             if getattr(args, "timing_requests", 0):
