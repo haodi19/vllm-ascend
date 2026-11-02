@@ -53,6 +53,10 @@ class TestMstx(unittest.TestCase):
         self.assertEqual(call(self.args(prefetch=True)), 5)
         report = collector.stop()
         self.assertEqual(report["count"], 1)
+        self.assertEqual(set(report["groups"][0]["gap_samples_us"]), set(TIMING["GAP_METRICS"]))
+        self.assertEqual(
+            report["groups"][0]["metric_samples_us"]["total"][0], report["groups"][0]["metrics"]["total"]["mean"]
+        )
         starts = [e[2] for e in mstx.events if e[0] == "start"]
         self.assertEqual(
             [s.split("|")[0] for s in starts],

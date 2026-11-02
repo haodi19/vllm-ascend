@@ -9,6 +9,7 @@ import re
 import sys
 from uuid import uuid4
 
+from moe_outlier_stats import group_outliers, outlier_summary
 from mte_join_cost import LOAD_STATS
 from run_moe_host_sync import (
     WORKER_PROFILE_CASES,
@@ -135,6 +136,9 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
     print("采集窗口的 REQUEST 和分项计时含 profiler、MSTX 开销；无采集整体时延单独列为 REQUEST_NO_PROFILE。")
     print("间隔覆盖整个采集窗口：Host 仅同进程相邻回调；MEMCPY 仅同设备同流，包含批次内/批次间。")
     print("大间隔阈值只按长度筛选，不自动识别同层预取→按需；MEMCPY 间隔不等于整卡空闲。")
+    print("新增FILTERED为各组同一3×IQR规则；n<8或IQR=0保留原值，raw同时保留。")
+    print("未标FILTERED的原表和DELTA仍为raw；JSON中的outliers_us同时记录raw/filtered、界限和剔除数。")
+    print("逐指标独立筛选，clean分项不能相加；剔除统计长尾不证明它来自外部干扰。")
     if set(reports) != set(labels):
         raise ValueError("对照组未全部完成；已完成组的 profile_report.json 和原始 profile 保留")
     handoff_cases = handoff_profile_cases("callback_legacy" in labels)
@@ -166,6 +170,15 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
         ):
             raise ValueError("独立请求窗口输出/请求配置不一致，不能据此比较收益")
         print("NO_PROFILE_OUTPUT_MATCH=True；以下百分比为请求均值变化，不是统计显著性检验。")
+        filtered = {label: outlier_summary(window["samples_us"]) for label, window in windows.items()}
+        baseline_mean = filtered[labels[0]]["filtered"]["mean"]
+        for label in labels[1:]:
+            value = filtered[label]["filtered"]["mean"]
+            print(
+                f"NO_PROFILE_FILTERED_DELTA {label} vs {labels[0]}: "
+                f"delta_ms={(value - baseline_mean) / 1000:+.3f}; "
+                f"delta_pct={100 * (value / baseline_mean - 1):+.3f}%"
+            )
         for label in labels[1:]:
             value = windows[label]["stats_us"]["mean"]
             first = windows[labels[0]]["stats_us"]["mean"]
@@ -260,6 +273,7 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
             f"experts={'/'.join(format(group['loads']['mean'] * group['count'], '.1f') for group in groups)} "
             f"workload_summary_match={matched}"
         )
+        print_filtered_metrics(groups, labels)
         if worker_compare and len(labels) > 3:
             print_worker_group_metrics(groups, labels)
             continue
@@ -294,6 +308,21 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
         "no_precleanup_engine_error": clean,
         "both_profiles_usable": profiles_ok,
     }
+
+
+def print_filtered_metrics(groups, labels):
+    results = [group_outliers(group) for group in groups]
+    if not all(results):
+        print("FILTERED_TIMERS unavailable：旧报告没有完整逐回调样本，未从汇总值推算。")
+        return
+    print("FILTERED_TIMERS " + "  ".join(labels) + "；每列=保留/原数:mean/p95_us；原始统计见后表")
+    for name in sorted(set.intersection(*(set(result) for result in results))):
+        cells = []
+        for result in results:
+            row = result[name]
+            raw, clean = row["raw"], row["filtered"]
+            cells.append(f"{clean['n']}/{raw['n']}:{clean['mean']:.3f}/{clean['p95']:.3f}")
+        print(f"{name:20} " + "  ".join(cells))
 
 
 def print_three_group_metrics(groups, labels):
@@ -353,6 +382,8 @@ def print_request_window(label, window):
         f"first_half_mean_ms={first_half / 1000:.3f}; second_half_mean_ms={second_half / 1000:.3f}"
     )
     print(f"REQUEST_SAMPLES_MS {label}: " + json.dumps([round(x / 1000, 3) for x in samples]))
+    result = outlier_summary([x / 1000 for x in samples])
+    print(f"REQUEST_FILTERED_MS {label}: " + json.dumps(display_numbers(result), ensure_ascii=False))
 
 
 def print_partial_reports(root, labels=("callback", "mte")):

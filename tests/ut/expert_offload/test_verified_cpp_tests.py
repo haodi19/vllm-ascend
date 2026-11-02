@@ -85,6 +85,9 @@ class TestCallbackTimings(unittest.TestCase):
             "load_other": 5,
         }.items():
             self.assertEqual(metrics[key]["mean"], value)
+            self.assertEqual(groups["reactive"]["metric_samples_us"][key], [value])
+        self.assertEqual(groups["reactive"]["sample_layers"], [2])
+        self.assertEqual(groups["reactive"]["gap_samples_us"], {})
         self.assertEqual(groups["prefetch"]["metrics"]["observe"]["mean"], 0)
         self.assertEqual(groups["prefetch"]["token_rows"], 3)
         self.assertEqual(groups["reactive"]["loads"]["mean"], 2)

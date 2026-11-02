@@ -249,6 +249,15 @@ class CallbackTimings:
                     layers=sorted({r[0] for r in records}),
                     loads=summarize([r[1]["loads"] for r in records]),
                     metrics={key: summarize([r[1][key] / 1000 for r in records]) for key in METRICS},
+                    # Export after draining, not in the timed callback. Preserve
+                    # paired samples for offline filtering and derived totals.
+                    sample_layers=[r[0] for r in records],
+                    metric_samples_us={key: [r[1][key] / 1000 for r in records] for key in METRICS},
+                    gap_samples_us=(
+                        {key: [r[1][key] / 1000 for r in records] for key in GAP_METRICS}
+                        if self.mstx is not None
+                        else {}
+                    ),
                     gap_metrics=(
                         {key: summarize([r[1][key] / 1000 for r in records]) for key in GAP_METRICS}
                         if self.mstx is not None

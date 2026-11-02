@@ -411,6 +411,7 @@ def print_inference_report(backend, report, requests, *, profile_enabled=True):
     print(f"Request usage: {[r[1] for r in requests]}", flush=True)
     report["request_us"] = statistics.mean(r[0] for r in requests)
     report["request_stats_us"] = stats([r[0] for r in requests])
+    report["request_samples_us"] = [r[0] for r in requests]
     report["usage"] = [r[1] for r in requests]
     report["digests"] = [r[2] for r in requests]
     return report

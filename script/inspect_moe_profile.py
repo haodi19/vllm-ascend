@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
+from moe_outlier_stats import outlier_summary
 
 MAX_TRACE_FILES = 32
 MAX_PRINT_STREAMS = 32
@@ -89,9 +90,11 @@ def positive_gap_us(value):
 
 def _gap_stats(values, threshold):
     result = _stats(values)
+    result["outliers_us"] = outlier_summary(values)
     if threshold is not None:
         large = [value for value in values if value >= threshold]
         large_stats = _stats(large)
+        large_stats["outliers_us"] = outlier_summary(large)
         large_stats["total_us"] = sum(large)
         if not math.isfinite(large_stats["total_us"]):
             raise ValueError("大间隙累计时长溢出")

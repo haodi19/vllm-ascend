@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from inspect_moe_profile import positive_gap_us, scan_trace
 from inspect_mte_runtime_task import inspect_run
+from moe_outlier_stats import enrich_report
 from mte_join_cost import prepare_cost_source, print_cost_comparison
 from run_host_sync_stage1 import REPOSITORY_ROOT, npu_number, run_step
 from run_host_sync_stage2 import target_cmake_args
@@ -882,6 +883,7 @@ def run(args, root):
             case_policy,
             env,
         )
+        enrich_report(reports[label])
         log = (directory / f"inference_{case_policy}.log").read_text(encoding="utf-8", errors="replace")
         if (
             (worker_compare or handoff_compare)

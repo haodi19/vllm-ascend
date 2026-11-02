@@ -267,10 +267,36 @@ class MoeProfileAuditTests(unittest.TestCase):
         self.assertEqual(filtered["large_gap_threshold_us"], 100)
         self.assertEqual(filtered["large_gap_fraction"], 0.5)
         self.assertEqual(
-            filtered["large_gaps"],
+            {key: value for key, value in filtered["large_gaps"].items() if key != "outliers_us"},
             dict(count=2, total_us=300, mean_us=150, p50_us=150, p95_us=195, max_us=200),
         )
+        self.assertEqual(filtered["large_gaps"]["outliers_us"]["reason"], "small_n")
         self.assertNotIn("large_gaps", original)
+
+    def test_host_gap_outliers_keep_original_count(self):
+        data = [event for event in self.trace() if not event["name"].startswith("moe_offload/")]
+        start = 0
+        for call in range(18):
+            kind = "prefetch" if call % 2 == 0 else "reactive"
+            for stage, offset, duration in (("host_callback", 0, 20), ("update_weights", 2, 15)):
+                data.append(
+                    dict(
+                        name=f"moe_offload/{stage}|call={call + 1}|kind={kind}|layer=1",
+                        ph="X",
+                        pid=7,
+                        tid=9,
+                        ts=start + offset,
+                        dur=duration,
+                    )
+                )
+            gap = (2395 if call == 16 else 100 + call // 2) if call % 2 == 0 else 30
+            start += 20 + gap
+        groups = {row["direction"]: row for row in self.scan(data)["host_gaps"]}
+        row = groups["prefetch->reactive"]
+        self.assertEqual(row["count"], 9)
+        self.assertEqual(row["outliers_us"]["removed_count"], 1)
+        self.assertEqual(row["outliers_us"]["filtered"]["mean"], 103.5)
+        self.assertEqual(groups["reactive->prefetch"]["outliers_us"]["reason"], "zero_iqr")
 
     def test_large_host_gaps_remain_separate_by_direction(self):
         data = [event for event in self.trace() if not event["name"].startswith("moe_offload/")]
