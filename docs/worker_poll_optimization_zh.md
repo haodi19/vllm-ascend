@@ -723,6 +723,11 @@ baseline/allocated/combined（第二轮为相应 `_2` 组）。表格表头、�
 
 ### 回调、MTE 默认与 MTE 组合三组对照
 
+2026-11-02补充：本节此前实验表保留原始统计。对已返回完整逐请求序列的
+`moe_worker_profile_02/03/04`及四组对照，已按统一3×IQR规则重算请求分布，见
+[历史实验异常值复核](moe_mte_handoff_flow_zh.md#137-历史实验异常值复核范围与重算结果2026-11-02)。
+Host/MEMCPY间隔与分项没有完整样本，仍未剔除异常值，不能把请求时延的筛选结论套用到它们。
+
 入口为 `script/run_moe_callback_worker_compare.py`，按 callback → mte_default → mte_combined
 顺序运行三个独立服务，构建扩展一次。三组均使用 C++ LRC、普通加载流、原始权重拷贝，
 模型和推理配置读取同一个 `script/test_graph2.sh`。
