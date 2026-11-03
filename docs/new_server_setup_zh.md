@@ -66,3 +66,35 @@ python3 -B /tmp/inspect_moe_migration.py --container 实际容器名
 这一步用于决定如何补齐匹配的URMA依赖和必要设备映射。
 不要为解决liburma缺失重新挂载整个宿主机/usr/lib64，以免再次覆盖容器OpenSSL等系统库。
 如果实际源码或模型目录不同，可追加`--repo 目录 --model-root 目录`。
+
+## 4. 已确认两项缺库，先补库再判断设备状态
+
+宿主机已找到aarch64的`/usr/lib64/liburma.so.0`（实际文件为liburma.so.0.0.3）及
+`/usr/lib64/liburma_common.so.0`；容器的npu-smi动态依赖明确报告两者not found。
+宿主机自身的npu-smi在30秒查询预算内也未返回，必须把“容器缺库”和“宿主机设备查询超时”分开处理。
+两端设备节点列表基本一致，当前没有证据支持把超时归因为容器漏映射davinci0～7。
+Docker创建配置中的历史Devices列表不等于这些节点现在仍存在或设备健康。
+
+在宿主机保存并执行`script/repair_moe_urma.py`：
+
+```bash
+python3 -B /tmp/repair_moe_urma.py --container moeoffload_ljn --apply
+```
+
+脚本核对源库ELF架构后，只将这两个库复制到容器独立目录`/opt/moe-urma/<内容摘要>/`，
+先临时检查完整动态链接，成功后通过`/etc/ld.so.conf.d/90-moe-urma.conf`和ldconfig注册。
+随后重新检查SSL和持久链接，再分别限时查询宿主机、容器的npu-smi。
+不覆盖系统库目录，不更改设备映射，不重建或停止容器，不安装Python包，不执行模型计算。
+输出在控制台；实际会在容器内写入上述库、专用配置及动态库缓存。
+再次执行时复用内容相同的文件，遇到已有不同内容的专用配置会停止，不直接覆盖。
+
+`library_fix=PASS`只表示本次缺库修复及SSL检查成功。两端NPU查询仍有任一失败时返回2，
+不能将其当作设备已恢复；124/137为超时工具终止，不足以证明硬件损坏。
+若需要撤销本脚本的注册，在确认该专用配置仍为本脚本创建的内容后，容器内将其移为
+`90-moe-urma.conf.disabled`并运行ldconfig即可；不需要改动系统OpenSSL库。
+
+源码已确认在`/home/l00992607/vllm-ascend`，分支dev/moeoffload-worker-poll、提交38bc0cc1，
+不是错误分支；当前缺少的是本机编译产物和新版本依赖。
+模型配置已确认现有三个V4.1目录的架构均为DeepseekV41ForCausalLM，不能作为原V4模型替代路径。
+其中非w8a8目录的专家虽为fp4，但模型层数、专家数及architecture也与原实验不一致；
+继续复现需要原模型权重。若改用V4.1，应作为模型适配及新基线任务另行验证。
