@@ -34,3 +34,35 @@ python3 -B /tmp/inspect_new_moe_container.py --search-root /实际挂载目录
 不能伪造热点JSON或_build_info来绕过检查，也不能把旧服务器的网卡/IP和绝对路径直接沿用。
 
 完成上述确认后，再生成针对该容器的安装与启动脚本；当前环境快照不代表模型已经验收通过。
+
+## 3. 新容器首轮快照与需要先处理的差异（2026-11-03）
+
+新容器为aarch64，旧实验宿主CPU为x86_64。Python 3.11.10的SSL导入成功，
+CANN 9.1.0的头文件/AscendC CMake存在；torch-npu元数据版本为2.10.0.post4.dev20260715。
+但npu-smi由于缺少liburma.so.0退出，尚未确认NPU型号及可用性。
+设备列表只发现davinci_manager、hisi_hdc、ummu；是否缺少计算设备映射需要与宿主机对照，不能仅据此判定卡坏了。
+
+镜像自带vLLM 0.23和vllm-ascend 0.23，transformers为5.5.4，缺少fastokens、setuptools-rust及本项目两个Host扩展。
+这些与原实验软件配置不同。后续需安装固定的vLLM源码、本开发分支及对应依赖，
+并在aarch64容器重新构建扩展，不能复制旧x86_64的.so，也不能复用其他人的0.23分支算子包来充当匹配构建。
+
+已发现自己的目录`/home/l00992607/vllm-ascend`和原名热点JSON，但尚未确认该目录分支/提交。
+`/data/model`下发现的是DeepSeek-V4.1-Flash及w8a8变体，不能仅改路径就认为复现了旧V4-Flash负载。
+需要核对architecture、量化配置及模型来源；更换CPU架构后也要在新机上重新做回调/MTE配对，不能直接比较两台机器绝对时延。
+首次搜索还遍历到了`/data/docker/overlay2`中的镜像层，这些不是开发目录；后续脚本已排除Docker存储目录。
+
+将`script/inspect_moe_migration.py`复制到宿主机的`/tmp/inspect_moe_migration.py`，在宿主机执行：
+
+```bash
+docker ps --format '{{.Names}}'
+python3 -B /tmp/inspect_moe_migration.py --container 实际容器名
+```
+
+脚本读取宿主机npu-smi及其动态依赖，查找liburma，并读取指定容器的设备/挂载配置。
+随后通过docker exec标准输入在同一个容器内运行读取部分，一次返回宿主机与容器的对照。
+不会创建、停止或改动容器，不安装库，不导入Torch或运行模型，不读取权重内容，不写输出文件。
+不会打印docker inspect中的环境变量；只读取本人的指定源码目录和模型配置中的结构/量化字段。
+
+这一步用于决定如何补齐匹配的URMA依赖和必要设备映射。
+不要为解决liburma缺失重新挂载整个宿主机/usr/lib64，以免再次覆盖容器OpenSSL等系统库。
+如果实际源码或模型目录不同，可追加`--repo 目录 --model-root 目录`。
