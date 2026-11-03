@@ -2,6 +2,7 @@
 """宿主机执行：向指定ARM容器补齐两项URMA库，再验证链接和设备查询。"""
 
 import argparse
+import base64
 import hashlib
 import json
 import platform
@@ -30,6 +31,42 @@ for name, digest in manifest.items():
     else:
         copy.append(name)
 print(json.dumps(copy))
+"""
+CONTAINER_WRITE = r"""
+import base64, hashlib, os, sys, tempfile
+from pathlib import Path
+
+def receive(target, name, digest, encoded):
+    target = Path(target)
+    assert target.resolve() == target and target.is_dir(), "invalid destination directory"
+    assert name in ("liburma.so.0", "liburma_common.so.0"), "invalid library name"
+    data = base64.b64decode(encoded, validate=True)
+    assert hashlib.sha256(data).hexdigest() == digest, "received data checksum mismatch"
+    destination = target / name
+    assert not destination.is_symlink(), "existing library is a symlink"
+    if destination.exists():
+        assert hashlib.sha256(destination.read_bytes()).hexdigest() == digest, "existing library differs"
+        print("REUSED " + name, flush=True)
+        return
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target, prefix=".urma-receive-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        assert hashlib.sha256(temporary.read_bytes()).hexdigest() == digest, "written data checksum mismatch"
+        os.chmod(temporary, 0o644)
+        # Publish a complete file exclusively; never overwrite an existing file.
+        os.link(temporary, destination)
+        print("RECEIVED " + name + "; sha256=" + digest, flush=True)
+    finally:
+        if temporary is not None:
+            temporary.unlink()
+
+target, name, digest = sys.argv[1:4]
+assert target.startswith("/opt/moe-urma/"), "invalid managed destination"
+receive(target, name, digest, sys.stdin.buffer.read())
 """
 CONTAINER_VALIDATE = r"""
 import hashlib, json, os, re, shutil, subprocess, sys
@@ -128,7 +165,8 @@ def main(argv=None):
     libraries = {name: arm_library(Path("/usr/lib64") / name) for name in LIBRARIES}
     manifest = {name: data[1] for name, data in libraries.items()}
     fingerprint = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:16]
-    target = f"/opt/moe-urma/{fingerprint}"
+    # Use a fresh namespace rather than touching a possibly partial docker-cp file.
+    target = f"/opt/moe-urma/stdin-{fingerprint}"
     inspected = execute("读取目标容器", ["docker", "inspect", args.container], quiet=True)
     records = json.loads(inspected.stdout)
     if len(records) != 1 or not records[0].get("State", {}).get("Running"):
@@ -144,7 +182,26 @@ def main(argv=None):
     parameters = [target, json.dumps(manifest)]
     prepared = execute("创建独立库目录", [*prefix, *parameters], source=CONTAINER_PREPARE, quiet=True)
     for name in json.loads(prepared.stdout):
-        execute(f"复制{name}", ["docker", "cp", str(libraries[name][0]), f"{args.container}:{target}/{name}"])
+        data = libraries[name][0].read_bytes()
+        if hashlib.sha256(data).hexdigest() != manifest[name]:
+            raise ValueError(f"源库在检查后发生变化：{name}；没有传输")
+        execute(
+            f"通过exec标准输入传输{name}",
+            [
+                "docker",
+                "exec",
+                "-i",
+                args.container,
+                "python3",
+                "-B",
+                "-c",
+                CONTAINER_WRITE,
+                target,
+                name,
+                manifest[name],
+            ],
+            source=base64.b64encode(data).decode("ascii"),
+        )
     execute("先验证两库及完整动态依赖", [*prefix, *parameters], source=CONTAINER_VALIDATE)
     execute("注册容器动态库搜索路径", [*prefix, target, CONF], source=CONTAINER_REGISTER)
     execute("验证持久链接和SSL", prefix, source=CONTAINER_CHECK)

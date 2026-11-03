@@ -98,3 +98,12 @@ python3 -B /tmp/repair_moe_urma.py --container moeoffload_ljn --apply
 模型配置已确认现有三个V4.1目录的架构均为DeepseekV41ForCausalLM，不能作为原V4模型替代路径。
 其中非w8a8目录的专家虽为fp4，但模型层数、专家数及architecture也与原实验不一致；
 继续复现需要原模型权重。若改用V4.1，应作为模型适配及新基线任务另行验证。
+
+### 补库传输方式修正
+
+首次执行在docker cp阶段遇到`remove staging directory: device or resource busy`，
+尚未进入库注册和NPU检查，不能据此判断库不兼容或NPU故障，也不能保证失败时一个字节都未复制。
+修正后的脚本通过`docker exec -i`标准输入传输Base64编码的库内容，绕过docker cp临时挂载流程。
+容器端校验SHA-256、写入临时文件并校验落盘内容后，才发布完整库文件；不会覆盖已有不同内容文件。
+新目录使用`/opt/moe-urma/stdin-<内容摘要>/`，保留此前可能部分写入的旧目录，不清理Docker内部staging目录。
+更新宿主机脚本后执行相同命令即可；无需重建容器或重启Docker。
