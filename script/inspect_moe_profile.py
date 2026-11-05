@@ -106,6 +106,28 @@ def _gap_stats(values, threshold):
     return result
 
 
+def copy_gap_boundaries(intervals):
+    """Return (left index, right index, gap) for start/end-sorted copy intervals.
+
+    The left event owns the furthest covered end, not necessarily the previous
+    row. This preserves the actual gap boundary after nested/overlapping copies.
+    Indices refer to the caller's sorted intervals, for trace/UI verification.
+    """
+    if not intervals:
+        return [], 0
+    covered_index = 0
+    covered_end = intervals[0][1]
+    boundaries, overlaps = [], 0
+    for index, (start, end) in enumerate(intervals[1:], 1):
+        if start < covered_end:
+            overlaps += 1
+        else:
+            boundaries.append((covered_index, index, start - covered_end))
+        if end >= covered_end:
+            covered_index, covered_end = index, end
+    return boundaries, overlaps
+
+
 def scan_trace(path, *, require_mte=False, large_gap_us=None):
     """完整消费 JSON；核对基本轨道/嵌套，不证明所有数据或时钟关联正确。"""
     if large_gap_us is not None:
@@ -183,16 +205,8 @@ def scan_trace(path, *, require_mte=False, large_gap_us=None):
     memcpy_gaps = []
     for (pid, tid), intervals in sorted(copies_by_stream.items()):
         intervals.sort()
-        covered_end = intervals[0][1]
-        durations, overlaps = [], 0
-        for start, end in intervals[1:]:
-            # A nested/overlapping copy must not move the covered end backwards
-            # and fabricate an idle gap while an earlier copy is still running.
-            if start < covered_end:
-                overlaps += 1
-            else:
-                durations.append(start - covered_end)
-            covered_end = max(covered_end, end)
+        boundaries, overlaps = copy_gap_boundaries(intervals)
+        durations = [gap for _, _, gap in boundaries]
         memcpy_gaps.append(
             dict(
                 pid=pid,
@@ -200,6 +214,7 @@ def scan_trace(path, *, require_mte=False, large_gap_us=None):
                 name=thread_names.get((pid, tid), ""),
                 copy_count=len(intervals),
                 overlaps_excluded=overlaps,
+                attribution="unclassified_memcpy_stream",
                 scope=MEMCPY_GAP_SCOPE,
                 **_gap_stats(durations, large_gap_us),
             )

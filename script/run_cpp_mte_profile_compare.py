@@ -135,6 +135,7 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
     print("未开启融合规划、ACL 搬运或 CPU 重排。")
     print("采集窗口的 REQUEST 和分项计时含 profiler、MSTX 开销；无采集整体时延单独列为 REQUEST_NO_PROFILE。")
     print("间隔覆盖整个采集窗口：Host 仅同进程相邻回调；MEMCPY 仅同设备同流，包含批次内/批次间。")
+    print("MEMCPY逐流列出，未自动识别专家权重流；须与可视化的轨道名称和边界事件核对，不能按拷贝数量选流。")
     print("大间隔阈值只按长度筛选，不自动识别同层预取→按需；MEMCPY 间隔不等于整卡空闲。")
     print("新增FILTERED为各组同一3×IQR规则；n<8或IQR=0保留原值，raw同时保留。")
     print("未标FILTERED的原表和DELTA仍为raw；JSON中的outliers_us同时记录raw/filtered、界限和剔除数。")

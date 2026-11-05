@@ -237,6 +237,21 @@ class MoeProfileAuditTests(unittest.TestCase):
         self.assertEqual(gap["mean_us"], 5)
         self.assertEqual(gap["max_us"], 10)
 
+    def test_copy_gap_evidence_retains_actual_covering_event(self):
+        boundaries, overlaps = self.module.copy_gap_boundaries([(0, 100), (10, 20), (30, 40), (150, 160)])
+        self.assertEqual(boundaries, [(0, 3, 50)])
+        self.assertEqual(overlaps, 2)
+        self.assertEqual(self.module.copy_gap_boundaries([]), ([], 0))
+
+    def test_stream_display_name_is_not_inferred_from_tid_or_copy_count(self):
+        data = self.without_copies()
+        data.extend([self.memcpy(100, 27, 0, 5), self.memcpy(100, 27, 20, 25)])
+        data.append(dict(ph="M", name="thread_name", pid=100, tid=27, args=dict(name="Stream 56")))
+        gap = self.scan(data)["memcpy_gaps"][0]
+        self.assertEqual((gap["tid"], gap["name"]), ("27", "Stream 56"))
+        self.assertEqual(gap["mean_us"], 15)
+        self.assertEqual(gap["attribution"], "unclassified_memcpy_stream")
+
     def test_single_copy_reports_no_gap_sample_instead_of_zero_latency(self):
         gap = self.scan(self.trace())["memcpy_gaps"][0]
         self.assertEqual(gap["copy_count"], 1)
