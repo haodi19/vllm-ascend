@@ -34,6 +34,47 @@ class OffloadBubbleStatsTests(unittest.TestCase):
     def windows(self):
         return [self.callback(1, "prefetch", 1, 10, 40), self.callback(2, "reactive", 1, 60, 100)]
 
+    def test_explicit_bounds_exclude_nanosecond_seams_and_five_ms(self):
+        result = self.module.bounded_gap_stats([0, 0.02, 9.99, 10, 4999.9, 5000, 10000], 10, 5000)
+        self.assertEqual(result["candidates"], 7)
+        self.assertEqual(result["excluded_short"], 3)
+        self.assertEqual(result["excluded_long"], 2)
+        self.assertEqual(result["kept"]["n"], 2)
+        self.assertAlmostEqual(result["kept"]["mean"], 2504.95)
+
+    def test_bounds_do_not_apply_additional_iqr_pruning(self):
+        result = self.module.bounded_gap_stats([10, 11, 12, 13, 14, 15, 16, 17, 4000], 10, 5000)
+        self.assertEqual(result["kept"]["n"], 9)
+        self.assertEqual(result["kept"]["max"], 4000)
+
+    def test_activity_union_handles_overlap_and_short_copy_transpose_seams(self):
+        tasks = [
+            self.task(1, "copy", 0, 10),
+            self.task(2, "transpose", 10.02, 50),
+            self.task(3, "copy", 20, 30),
+            self.task(4, "copy", 70, 80),
+        ]
+        result = self.module.activity_window_gaps(tasks, lower_us=10, long_us=5000)
+        self.assertEqual(result["overlaps_merged"], 1)
+        self.assertEqual(result["excluded_short"], 1)
+        self.assertEqual(result["kept"]["n"], 1)
+        self.assertEqual(result["kept"]["mean"], 20)
+
+    def test_callback_envelope_keeps_between_callback_gap_without_clipping_edges(self):
+        tasks = [self.task(i, "copy", start, start + 5) for i, start in enumerate((0, 20, 50, 80, 120))]
+        full = self.module.activity_window_gaps(tasks, lower_us=10, long_us=5000)
+        scoped = self.module.activity_window_gaps(tasks, lower_us=10, long_us=5000, window=(40, 100))
+        self.assertEqual(full["kept"]["n"], 4)
+        self.assertEqual(scoped["kept"]["n"], 1)
+        self.assertEqual(scoped["kept"]["mean"], 25)
+        self.assertEqual(scoped["excluded_outside_window"], 1)
+        self.assertEqual(scoped["excluded_crossing_window"], 2)
+
+    def test_no_activity_does_not_invent_a_window_sized_gap(self):
+        result = self.module.activity_window_gaps([], lower_us=10, long_us=5000, window=(0, 100))
+        self.assertIsNone(result["kept"])
+        self.assertEqual(result["candidates"], 0)
+
     def test_prefill_and_post_callback_copies_do_not_enter_decode_gaps(self):
         tasks = [
             self.task(1, "copy", 0, 5),

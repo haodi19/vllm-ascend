@@ -4,7 +4,50 @@
 import bisect
 import collections
 
-from moe_outlier_stats import outlier_summary
+from inspect_moe_profile import copy_gap_boundaries
+from moe_outlier_stats import outlier_summary, stats
+
+
+def bounded_gap_stats(values, lower_us, long_us):
+    """Apply explicit duration bounds only; do not discard additional IQR tails."""
+    kept = [value for value in values if lower_us <= value < long_us]
+    return dict(
+        lower_inclusive_us=lower_us,
+        upper_exclusive_us=long_us,
+        candidates=len(values),
+        excluded_short=sum(value < lower_us for value in values),
+        excluded_long=sum(value >= long_us for value in values),
+        kept=stats(kept),
+    )
+
+
+def activity_window_gaps(tasks, *, lower_us, long_us, window=None):
+    """Gaps in the union of device activity, optionally within a Host envelope.
+
+    Compute real boundaries before window selection. Never clip a gap or invent
+    idle time at window edges. The envelope includes time between callbacks.
+    """
+    intervals = sorted((task["start"], task["end"]) for task in tasks)
+    boundaries, overlaps = copy_gap_boundaries(intervals)
+    values = []
+    outside = 0
+    crossing = 0
+    for left, right, gap in boundaries:
+        start, end = intervals[left][1], intervals[right][0]
+        if window is None or (window[0] <= start and end <= window[1]):
+            values.append(gap)
+        elif end <= window[0] or start >= window[1]:
+            outside += 1
+        else:
+            crossing += 1
+    return dict(
+        window_us=list(window) if window is not None else None,
+        activity_extent_us=[intervals[0][0], max(end for _, end in intervals)] if intervals else None,
+        overlaps_merged=overlaps,
+        excluded_outside_window=outside,
+        excluded_crossing_window=crossing,
+        **bounded_gap_stats(values, lower_us, long_us),
+    )
 
 
 def pair_direction(left, right):

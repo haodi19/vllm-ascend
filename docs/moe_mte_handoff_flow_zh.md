@@ -1261,18 +1261,25 @@ Prefill池的scale以连续张量重新分配，因此前段可以只有大量�
 针对批次空泡，新增只读复算模式采用以下口径：
 
 - 按指定设备轨道读取全部X型任务，将MEMCPY、Transpose及其他实际任务共同视作占用。
+- 合并重叠任务后计算相邻占用区间之间的空白，统一只保留`10μs ≤ gap < 5000μs`。
+  MEMCPY与Transpose之间几十ns的小缝及达到5ms的长间隔均不计入目标均值，分别报告排除数量。
+  对保留样本直接计算数量、均值、p50、p95和最大值，不再叠加IQR筛选。
+- 同时输出`TARGET_GAPS_US`的两个范围：`full_capture`覆盖选定流的整个采集窗口，包含Prefill；
+  `callback_window`仅保留首个`host_callback`开始至末个结束的连续范围内的完整空泡。
+  后者包含回调之间的空白，不是各个回调内部区间的并集；跨窗口边界的间隔不裁剪、不计入。
+  两者采用相同设备活动与时长规则。缺少或无法唯一选择Host回调进程时，仍输出全窗口结果，
+  回调范围标为不可用。全窗口不等于纯Prefill，回调范围也不保证每个间隔都是交接同步。
 - 利用同一导出时间轴上的`host_callback`范围和`kind/layer/call`标记关联加载批次；
   仅接受完整落在唯一回调范围中的设备任务。时间包含匹配不是flow因果证明，歧义和跨界另行报告。
 - 仅在相邻回调各有搬运、且中间没有其他同流任务时，计算“后一批首任务开始−前一批末任务结束”。
   不越过空载或未匹配回调拼接，不把Transpose当成空白。
 - `prefetch L → reactive L`与`reactive L → prefetch L+1`分别统计；
-  层号重置等跨轮候选独立列出，不按时间长短猜测方向。
-- 正常方向先保留全部间隔，再分别报告小于5000μs的普通尺度间隔和≥5000μs长间隔，
-  100～5000μs子集仅作辅助。批次边界已经排除批次内小缝，优化后短于100μs的真实空泡仍应计入。
-  5000μs是可配置的展示分界，不是“异常”判据；正常方向内的长间隔也保留，不能强行解释为跨轮。
+  通过`TARGET_DIRECTION_GAPS_US`提供可关联子集，同样只统计10～5000μs范围内的间隔。
+  层号重置等跨轮候选仅列数量，不按时间长短猜测方向。方向结果可能因匹配不足而不完整，
+  不影响前述双窗口的几何空泡统计。阈值是本次分析的范围约定，不证明排除项来自外部噪声。
 
 ```bash
-python -B script/verify_memcpy_gaps.py /home/l00992607/moe_results_data2/moe_four_way_01 --stream-name "Stream 56" --offload-bubbles --large-gap-us 100 --long-gap-us 5000
+python -B script/verify_memcpy_gaps.py /home/l00992607/moe_results_data2/moe_four_way_01 --stream-name "Stream 56" --offload-bubbles --min-gap-us 10 --long-gap-us 5000
 ```
 
 该模式同时输出回调窗口之前、之内和之后的拷贝数，以及编译推理范围和配对端点样例，

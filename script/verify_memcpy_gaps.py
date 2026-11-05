@@ -8,7 +8,7 @@ from pathlib import Path
 
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
 from inspect_moe_profile import MAX_TRACE_FILES, _gap_stats, _interval, copy_gap_boundaries, positive_gap_us
-from offload_bubble_stats import analyze_offload_batches
+from offload_bubble_stats import activity_window_gaps, analyze_offload_batches, bounded_gap_stats
 
 CASES = (
     ("callback_legacy", "python"),
@@ -347,13 +347,32 @@ def inspect_offload_trace(path, stream_name, threshold, long_threshold, pid=None
     for key in sorted(counts):
         emit("COPY_TRACK", dict(pid=key[0], tid=key[1], name=names.get(key, ""), copies=counts[key]))
     key = select_track(counts, names, stream_name, pid)
-    callbacks, host_pid = select_host_callbacks(callbacks, host_pid)
-    selected_compilers = [marker for marker in compilers if marker["pid"] == host_pid]
     print("READ 2/2：仅选中设备流的全部X任务，包含MEMCPY、Transpose及其他任务", flush=True)
     tasks = read_device_tasks(path, key, len(callbacks) + len(compilers))
     after = path.stat()
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise ValueError("两遍读取期间trace发生变化，未输出间隔统计")
+    emit(
+        "TARGET_GAPS_US",
+        dict(
+            scope="full_capture",
+            **activity_window_gaps(tasks, lower_us=threshold, long_us=long_threshold),
+        ),
+    )
+    try:
+        callbacks, host_pid = select_host_callbacks(callbacks, host_pid)
+    except ValueError as exc:
+        emit("CALLBACK_SCOPE_UNAVAILABLE", dict(reason=str(exc)))
+        return False
+    selected_compilers = [marker for marker in compilers if marker["pid"] == host_pid]
+    window = min(callback["start"] for callback in callbacks), max(callback["end"] for callback in callbacks)
+    emit(
+        "TARGET_GAPS_US",
+        dict(
+            scope="callback_window",
+            **activity_window_gaps(tasks, lower_us=threshold, long_us=long_threshold, window=window),
+        ),
+    )
     report = analyze_offload_batches(tasks, callbacks, lower_us=threshold, long_us=long_threshold)
     origin = min(task["start"] for task in tasks)
     emit(
@@ -413,31 +432,23 @@ def inspect_offload_trace(path, stream_name, threshold, long_threshold, pid=None
                 relative_ts_us=marker["start"] - origin,
             ),
         )
-    for direction, distributions in report["directions"].items():
-        for band in ("all", "regular_band", "large_band", "long_band"):
-            emit("OFFLOAD_GAPS_US", dict(direction=direction, band=band, **compact_outliers(distributions[band])))
+    for direction in report["directions"]:
         emit(
-            "COPY_ONLY_COMPARISON_US",
+            "TARGET_DIRECTION_GAPS_US",
             dict(
                 direction=direction,
-                copy_only=compact_outliers(distributions["copy_only"]),
-                excess_over_idle=compact_outliers(distributions["copy_only_excess"]),
+                **bounded_gap_stats(
+                    [pair["gap_us"] for pair in report["pairs"] if pair["direction"] == direction],
+                    threshold,
+                    long_threshold,
+                ),
             ),
         )
-        emit(
-            "OFFLOAD_SHORT_GAPS",
-            dict(
-                direction=direction,
-                zero=distributions["zero_gaps"],
-                below_large_threshold=distributions["below_large_threshold"],
-            ),
-        )
-    emit("ROUND_BOUNDARY_CANDIDATE_US", compact_outliers(report["round_gaps"]["all"]))
-    for pair in [pair for pair in report["pairs"] if pair["gap_us"] < long_threshold][:MAX_BOUNDARY_EXAMPLES]:
+    emit("ROUND_BOUNDARY_CANDIDATE_COUNT", len(report["round_pairs"]))
+    for pair in [pair for pair in report["pairs"] if threshold <= pair["gap_us"] < long_threshold][
+        :MAX_BOUNDARY_EXAMPLES
+    ]:
         emit("NORMAL_PAIR_EXAMPLE", offload_pair_example(pair, origin))
-    long_or_round = [pair for pair in report["pairs"] if pair["gap_us"] >= long_threshold] + report["round_pairs"]
-    for pair in sorted(long_or_round, key=lambda value: value["left_task"]["end"])[:MAX_BOUNDARY_EXAMPLES]:
-        emit("LONG_OR_ROUND_EXAMPLE", offload_pair_example(pair, origin))
     emit("OFFLOAD_STATUS", dict(partial=report["partial"], reasons=report["partial_reasons"]))
     print("仅按导出公共时间轴的唯一窗口包含关联，不是flow因果证明；窗口外拷贝不混入批次间隔。", flush=True)
     return not report["partial"]
@@ -448,13 +459,20 @@ def parse_args(argv=None):
     parser.add_argument("root", type=Path, help="四组实验根目录或单个trace_view.json文件")
     parser.add_argument("--stream-name", required=True, help="MindStudio中的完整显示名称，如Stream 56")
     parser.add_argument("--pid", help="单个trace内设备进程编号；用于同名轨道消歧")
-    parser.add_argument("--large-gap-us", type=positive_gap_us, default=100.0)
+    parser.add_argument(
+        "--min-gap-us",
+        "--large-gap-us",
+        dest="large_gap_us",
+        type=positive_gap_us,
+        default=10.0,
+        help="间隔下限（含边界），默认10μs；--large-gap-us为兼容别名",
+    )
     parser.add_argument(
         "--offload-bubbles", action="store_true", help="按相邻Host回调关联加载批次，统计全设备任务之间的空闲"
     )
     parser.add_argument("--host-pid", help="加载回调所在Host进程编号；多Host进程时必须指定")
     parser.add_argument(
-        "--long-gap-us", type=positive_gap_us, default=5000.0, help="独立列出长间隔；默认5000μs，不自动认定跨轮"
+        "--long-gap-us", type=positive_gap_us, default=5000.0, help="空泡统计排除大于等于此值的间隔，默认5000μs"
     )
     args = parser.parse_args(argv)
     if args.offload_bubbles and args.long_gap_us <= args.large_gap_us:
@@ -465,16 +483,16 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     print("只读现有trace；不导入Torch、不启动模型、不写文件。单位μs；按thread_name精确选流。", flush=True)
-    print("大间隔阈值不识别批次；3×IQR仅作统计筛选，n<8或IQR=0保留原值。", flush=True)
     if args.offload_bubbles:
         print("批次=唯一Host回调窗口内含MEMCPY的设备任务集合；含Transpose，空载回调不跳过。", flush=True)
         print(
-            f"按方向保留all；regular_band=[0,{args.long_gap_us:g})；"
-            f"辅助large_band=[{args.large_gap_us:g},{args.long_gap_us:g})；long_band≥{args.long_gap_us:g}μs。",
+            f"目标空泡仅保留 {args.large_gap_us:g}≤gap<{args.long_gap_us:g}μs；不再叠加IQR筛选。",
             flush=True,
         )
-        print("分层描述不删除长间隔、不认定外部噪声；层号重置仅列为跨轮候选。设备流空闲不等于整卡空闲。", flush=True)
+        print("同时统计全采集窗口（含Prefill）和首个回调开始至末个回调结束的连续范围。", flush=True)
+        print("极短/极长间隔仅输出排除数；不认定外部噪声。设备流空闲不等于整卡空闲。", flush=True)
     else:
+        print("旧拷贝复核模式：3×IQR仅作统计筛选，n<8或IQR=0保留原值；双窗口空泡请加--offload-bubbles。", flush=True)
         print("间隔=后一拷贝开始−此前覆盖区间最晚结束；重叠不计间隔，零间隔保留。", flush=True)
     root = args.root.resolve()
     groups = [("single_trace", [root])] if root.is_file() else []

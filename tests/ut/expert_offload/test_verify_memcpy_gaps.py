@@ -241,7 +241,7 @@ class VerifyMemcpyGapsTests(unittest.TestCase):
         self.assertIn("overlapping_callbacks", report["reasons"])
         self.assertNotIn("PASS：", output)
 
-    def test_offload_mode_preserves_short_gaps_in_main_regular_band(self):
+    def test_offload_mode_preserves_twenty_us_gap_with_ten_us_default(self):
         data = self.bubble_trace()
         data[5]["ts"] = 260
         data[6]["ts"] = 270
@@ -252,17 +252,41 @@ class VerifyMemcpyGapsTests(unittest.TestCase):
         status, output = self.invoke_bubbles(data)
         self.assertEqual(status, 0)
         distributions = [
-            row for row in self.rows(output, "OFFLOAD_GAPS_US") if row["direction"] == "prefetch->reactive"
+            row for row in self.rows(output, "TARGET_DIRECTION_GAPS_US") if row["direction"] == "prefetch->reactive"
         ]
-        by_band = {row["band"]: row for row in distributions}
-        self.assertEqual(by_band["regular_band"]["raw"]["mean"], 20)
-        self.assertIsNone(by_band["large_band"]["raw"])
+        self.assertEqual(distributions[0]["kept"]["mean"], 20)
+        self.assertEqual(distributions[0]["lower_inclusive_us"], 10)
 
     def test_offload_mode_rejects_invalid_band_thresholds(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.module.parse_args(
-                ["missing", "--stream-name", "Stream 56", "--offload-bubbles", "--long-gap-us", "100"]
+                ["missing", "--stream-name", "Stream 56", "--offload-bubbles", "--long-gap-us", "10"]
             )
+
+    def test_two_activity_scopes_include_prefill_only_in_full_scope(self):
+        status, output = self.invoke_bubbles(self.bubble_trace())
+        self.assertEqual(status, 0)
+        scopes = {row["scope"]: row for row in self.rows(output, "TARGET_GAPS_US")}
+        self.assertEqual(scopes["full_capture"]["kept"]["n"], 3)
+        self.assertEqual(scopes["callback_window"]["kept"]["n"], 1)
+        self.assertEqual(scopes["callback_window"]["kept"]["mean"], 160)
+        self.assertEqual(scopes["callback_window"]["window_us"], [200, 500])
+
+    def test_missing_callbacks_preserves_full_scope_and_marks_partial(self):
+        data = [event for event in self.bubble_trace() if not event["name"].startswith("moe_offload/host_callback")]
+        status, output = self.invoke_bubbles(data)
+        self.assertEqual(status, 1)
+        self.assertEqual(self.rows(output, "TARGET_GAPS_US")[0]["scope"], "full_capture")
+        self.assertEqual(len(self.rows(output, "TARGET_GAPS_US")), 1)
+        self.assertTrue(self.rows(output, "CALLBACK_SCOPE_UNAVAILABLE"))
+
+    def test_minimum_alias_changes_both_scopes_and_direction(self):
+        status, output = self.invoke_bubbles(self.bubble_trace(), "--min-gap-us", "170")
+        self.assertEqual(status, 0)
+        scopes = {row["scope"]: row for row in self.rows(output, "TARGET_GAPS_US")}
+        self.assertEqual(scopes["full_capture"]["kept"]["n"], 2)
+        self.assertIsNone(scopes["callback_window"]["kept"])
+        self.assertIsNone(self.rows(output, "TARGET_DIRECTION_GAPS_US")[0]["kept"])
 
     def test_offload_mode_does_not_echo_private_event_arguments(self):
         data = self.bubble_trace()
