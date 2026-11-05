@@ -14,7 +14,10 @@ from moe_outlier_stats import outlier_summary
 MAX_TRACE_FILES = 32
 MAX_PRINT_STREAMS = 32
 MAX_LOG_LINE_CHARS = 4096
-MEMCPY_GAP_SCOPE = "本设备进程/流的全部 MEMCPY_ASYNC 间隙，含批次内及批次间；非预取方向标注或设备全空闲"
+MEMCPY_GAP_SCOPE = (
+    "本设备进程/流的全部 MEMCPY_ASYNC 间隔，含批次内、批次间及中间Transpose等任务执行时间；"
+    "未分Prefill/Decode，不是加载流空闲或设备全空闲"
+)
 LARGE_GAP_SCOPE = "大间隙仅按时长 >= 阈值筛选，仍可能混合批次内、批次间及请求间隔；不代表层级或因果定位"
 
 

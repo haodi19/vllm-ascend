@@ -169,6 +169,122 @@ class VerifyMemcpyGapsTests(unittest.TestCase):
         self.assertEqual([item["gap_us"] for item in first], [100, 200, 300])
         self.assertEqual([item["gap_us"] for item in longest], [400])
 
+    @staticmethod
+    def callback(start, duration, call, kind, layer, pid=7):
+        return dict(
+            ph="X",
+            name=f"moe_offload/host_callback|call={call}|kind={kind}|layer={layer}",
+            pid=pid,
+            tid=8,
+            ts=start,
+            dur=duration,
+        )
+
+    def bubble_trace(self):
+        return [
+            self.copy(0, 10),
+            dict(ph="X", name="npu_fx_compiler_inference", pid=7, tid=8, ts=0, dur=100),
+            self.callback(200, 100, 1, "prefetch", 1),
+            self.copy(210, 10),
+            dict(ph="X", name="Transpose_int8", pid=100, tid=27, ts=220, dur=30),
+            self.callback(400, 100, 2, "reactive", 1),
+            self.copy(410, 10),
+            self.copy(600, 10),
+            *self.metadata(),
+        ]
+
+    def invoke_bubbles(self, data, *extra_args):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace_view.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = self.module.main([str(path), "--stream-name", "Stream 56", "--offload-bubbles", *extra_args])
+            return status, output.getvalue()
+
+    def test_offload_mode_excludes_window_outside_and_includes_transpose(self):
+        status, output = self.invoke_bubbles(self.bubble_trace())
+        self.assertEqual(status, 0)
+        phases = self.rows(output, "COPY_CALLBACK_WINDOWS")[0]
+        self.assertEqual(phases, dict(before_callbacks=1, inside_unique=2, after_callbacks=1))
+        example = self.rows(output, "NORMAL_PAIR_EXAMPLE")[0]
+        self.assertEqual(example["gap_us"], 160)
+        self.assertEqual(example["copy_only_gap_us"], 190)
+        self.assertEqual(example["last_device_task"]["kind"], "transpose")
+        compiler = self.rows(output, "COMPILER_RANGE")[0]
+        self.assertEqual(compiler["dur_ms"], 0.1)
+        self.assertIn("READ 2/2", output)
+        self.assertFalse(self.rows(output, "OFFLOAD_STATUS")[0]["partial"])
+
+    def test_offload_mode_multiple_host_processes_require_explicit_selection(self):
+        data = [*self.bubble_trace(), self.callback(1000, 100, 1, "prefetch", 1, pid=9)]
+        status, output = self.invoke_bubbles(data)
+        self.assertEqual(status, 1)
+        self.assertIn("--host-pid", output)
+        status, output = self.invoke_bubbles(data, "--host-pid", "7")
+        self.assertEqual(status, 0)
+        self.assertEqual(self.rows(output, "SELECTED_OFFLOAD_TRACK")[0]["host_pid"], "7")
+
+    def test_offload_mode_does_not_retain_unrelated_host_x_events(self):
+        host_events = [dict(ph="X", name="Event::synchronize", pid=7, tid=8, ts=index, dur=1) for index in range(100)]
+        with patch.object(self.module, "MAX_INTERVALS", 20):
+            status, output = self.invoke_bubbles([*host_events, *self.bubble_trace()])
+        self.assertEqual(status, 0)
+        self.assertEqual(self.rows(output, "SELECTED_OFFLOAD_TRACK")[0]["tasks"], 5)
+
+    def test_offload_mode_partial_is_reported_without_claiming_full_pass(self):
+        data = [*self.bubble_trace(), self.callback(205, 80, 3, "reactive", 1)]
+        status, output = self.invoke_bubbles(data)
+        self.assertEqual(status, 1)
+        report = self.rows(output, "OFFLOAD_STATUS")[0]
+        self.assertTrue(report["partial"])
+        self.assertIn("overlapping_callbacks", report["reasons"])
+        self.assertNotIn("PASS：", output)
+
+    def test_offload_mode_preserves_short_gaps_in_main_regular_band(self):
+        data = self.bubble_trace()
+        data[5]["ts"] = 260
+        data[6]["ts"] = 270
+        status, output = self.invoke_bubbles(data)
+        # Keep Host windows disjoint while giving a short physical stream gap.
+        self.assertEqual(status, 1)
+        data[2]["dur"] = 50
+        status, output = self.invoke_bubbles(data)
+        self.assertEqual(status, 0)
+        distributions = [
+            row for row in self.rows(output, "OFFLOAD_GAPS_US") if row["direction"] == "prefetch->reactive"
+        ]
+        by_band = {row["band"]: row for row in distributions}
+        self.assertEqual(by_band["regular_band"]["raw"]["mean"], 20)
+        self.assertIsNone(by_band["large_band"]["raw"])
+
+    def test_offload_mode_rejects_invalid_band_thresholds(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.module.parse_args(
+                ["missing", "--stream-name", "Stream 56", "--offload-bubbles", "--long-gap-us", "100"]
+            )
+
+    def test_offload_mode_does_not_echo_private_event_arguments(self):
+        data = self.bubble_trace()
+        for event in data:
+            if event["ph"] == "X":
+                event["args"] = dict(src="PRIVATE_POINTER_0x1234", secret="PRIVATE_TOKEN")
+        status, output = self.invoke_bubbles(data)
+        self.assertEqual(status, 0)
+        self.assertNotIn("PRIVATE", output)
+
+    def test_compiler_markers_on_other_synthetic_pid_remain_visible_without_linking(self):
+        data = self.bubble_trace()
+        data[1]["pid"] = 99
+        data.append(dict(ph="M", name="process_name", pid=99, args=dict(name="PyTorch")))
+        status, output = self.invoke_bubbles(data)
+        self.assertEqual(status, 0)
+        compiler = self.rows(output, "COMPILER_RANGE")[0]
+        self.assertEqual(compiler["pid"], "99")
+        self.assertEqual(compiler["process_name"], "PyTorch")
+        self.assertEqual(compiler["scope"], "trace_wide_unlinked")
+        self.assertEqual(self.rows(output, "COMPILER_MARKERS")[0]["max_duration_us"], 100)
+
 
 if __name__ == "__main__":
     unittest.main()
