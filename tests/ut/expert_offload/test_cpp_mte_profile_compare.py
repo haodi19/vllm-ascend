@@ -235,9 +235,11 @@ class CppMteProfileTests(unittest.TestCase):
                 failed = wrong_policy is True or wrong_policy == "legacy_debug"
                 self.assertEqual(code, 1 if failed else 0)
                 if wrong_policy == "tpot":
-                    tpot = (root / "tpot_summary.txt").read_text(encoding="utf-8")
+                    tpot = (root / "summary.txt").read_text(encoding="utf-8")
+                    self.assertFalse((root / "tpot_summary.txt").exists())
                     self.assertEqual(tpot.count('"scope": "no_profile"'), 4)
                     self.assertEqual(tpot.count('"scope": "with_profile"'), 4)
+                    self.assertEqual(tpot.count("MIRACLE_UNAVAILABLE"), 1)
                     self.assertIn("MIRACLE_UNAVAILABLE", tpot)
                     self.assertIn("requested_stream=Stream 56", tpot)
                     self.assertTrue((root / "bubble_summary.txt").is_file())

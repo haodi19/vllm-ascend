@@ -594,7 +594,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             print("普通流若请求超时则终止本轮，不跳过设备完成检查，不继续推理。")
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
         if args.measure_tpot:
-            print(f"流式TTFT/TPOT已开启；精简结果：{root / 'tpot_summary.txt'}")
+            print("流式TTFT/TPOT已开启；结果与miracle估算统一写入summary.txt。")
         if args.bubble_stream_name:
             print(f"自动统计加载流空泡：{args.bubble_stream_name}；精简结果：{root / 'bubble_summary.txt'}")
             print("原MEMCPY_GAP表是逐拷贝原始统计；目标空泡请看TARGET_GAPS_US及TARGET_DIRECTION_GAPS_US。")
@@ -645,11 +645,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
                 bubbles = loading_bubble_summary(reports, root, labels, args.bubble_stream_name)
                 print(bubbles)
             if args.measure_tpot:
-                output = io.StringIO()
-                with contextlib.redirect_stdout(output):
-                    print_tpot_comparison(reports, root, labels)
-                (root / "tpot_summary.txt").write_text(output.getvalue() + bubbles, encoding="utf-8")
-                print(output.getvalue())
+                print_tpot_comparison(reports, root, labels)
             return 0
         except Exception as exc:
             print(

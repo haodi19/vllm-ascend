@@ -1118,7 +1118,7 @@ MTP可能一次返回多个token，使用服务返回的实际token数，不把S
 四组脚本新增可选参数`--measure-tpot`，默认仍使用原有非流式方式。
 开启后每组预热5次，独立测量20次无profiler流式请求，再单独采集1次流式请求的profile；
 保存逐请求TTFT、TPOT、文本块数、实际token数与客户端时间边界。
-主报告仍为`summary.txt`，TPOT的精简报告为`tpot_summary.txt`。
+整体时延、Host间隔、加载流空泡、TPOT及miracle估算统一写入`summary.txt`，不另建TPOT摘要文件。
 无采集和带采集结果分别统计，保留原值与3×IQR筛选结果，不合并两个窗口。
 
 ```bash
@@ -1285,7 +1285,7 @@ Host间隔取同进程相邻`host_callback`标记之间的时间，按预取→�
 
 四组实验可通过`--bubble-stream-name "Stream 56"`在导出profile后自动执行本节统计，
 无需再运行离线脚本。参数按MindStudio中的完整显示名称选择设备流，不按数字tid或拷贝数量猜测。
-结果写入`summary.txt`和精简的`bubble_summary.txt`，同时开启TPOT时也合入`tpot_summary.txt`，
+结果写入`summary.txt`和精简的`bubble_summary.txt`，开启TPOT时各项指标仍统一查看`summary.txt`，
 其中保留Host间隔、两种统计窗口及可匹配的两个层间方向。
 指定轨道不存在、同名轨道不唯一或profile无效时明确标记不可用，不改选其他流；
 其他组和已取得的TPOT结果继续保留。各组原始profile仍保存在实验目录的`profile/`下。
