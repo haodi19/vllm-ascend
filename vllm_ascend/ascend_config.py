@@ -1008,6 +1008,9 @@ class ExpertOffloadConfig:
         # Opt-in localhost callback timer control port. 0 disables all hooks;
         # 1024..65535 enables diagnostics for a single-worker LRC comparison.
         "callback_timing_port": 0,
+        # Request-scoped expert IDs/copy descriptors; diagnostics, not timing.
+        # Requires the single-worker callback control port; disabled by default.
+        "expert_trace_enabled": False,
         # Diagnostic CPU ranges; requires callback timing and MSTX-capable torch_npu.
         "callback_mstx_enabled": False,
         # Opt-in single-card graph handoff. Default preserves ACL callbacks.
@@ -1238,6 +1241,10 @@ class ExpertOffloadConfig:
             raise ValueError("cache_stats_log_interval must >= 0")
         if not isinstance(self.config["moe_offload_debug"], bool):
             raise TypeError("moe_offload_debug must be a boolean")
+        if not isinstance(self.config["expert_trace_enabled"], bool):
+            raise TypeError("expert_trace_enabled must be a boolean")
+        if self.config["expert_trace_enabled"] and not self.config["callback_timing_port"]:
+            raise ValueError("expert_trace_enabled requires callback_timing_port")
         if not isinstance(self.config["expert_prefetch_enabled"], bool):
             raise TypeError("expert_prefetch_enabled must be a boolean")
         if not isinstance(self.config["expert_prefetch_num"], int):

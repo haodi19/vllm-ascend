@@ -154,6 +154,7 @@ def configured_source(
     diagnose_prefetch_wait_before_gate=False,
     mte_load_stream="ordinary",
     moe_offload_debug=None,
+    expert_trace=False,
 ):
     if mte_load_stream not in ("sync_launch", "ordinary"):
         raise ValueError("invalid MTE load stream")
@@ -172,6 +173,8 @@ def configured_source(
     index = words.index("--additional-config") + 1
     config = json.loads(words[index])
     offload = config["expert_offload_config"]
+    if expert_trace or "expert_trace_enabled" in offload:
+        offload["expert_trace_enabled"] = expert_trace
     if moe_offload_debug is not None:
         offload["moe_offload_debug"] = moe_offload_debug
     offload["host_sync_backend"] = backend
@@ -481,6 +484,7 @@ def parse_args(
         help="Diagnostic: keep early publication, defer strict prefetch wait to consumer join",
     )
     parser.add_argument("--skip-profile", action="store_true", help="Run finite requests without starting profiler")
+    parser.add_argument("--expert-trace", action="store_true", help="Request-scoped expert IDs/copies; diagnostic only")
     parser.add_argument(
         "--diagnose-prefetch-wait-before-gate",
         action="store_true",
@@ -576,6 +580,10 @@ def parse_args(
     args.three_way = three_way
     args.worker_compare = worker_compare
     args.handoff_compare = handoff_compare
+    if args.expert_trace and (
+        profile_compare or args.compare_join_cost or not args.skip_profile or args.backend == "both"
+    ):
+        parser.error("--expert-trace requires a single backend and --skip-profile; not a performance comparison")
     if getattr(args, "measure_tpot", False) and not handoff_compare:
         parser.error("--measure-tpot requires run_moe_callback_worker_compare.py")
     if getattr(args, "timing_requests", 0) < 0:
@@ -784,7 +792,7 @@ def run(args, root):
             return 1
     source = args.test_script.read_text(encoding="utf-8")
     cost_mode = getattr(args, "compare_join_cost", False)
-    if cost_mode or profile_compare:
+    if cost_mode or profile_compare or getattr(args, "expert_trace", False):
         source = prepare_cost_source(source)
     _, command, _, _ = launch_spec(source, cache_policy_backend, args.npu, args.port, args.timing_port)
     port = int(command[command.index("--port") + 1])
@@ -843,13 +851,14 @@ def run(args, root):
             requests=args.requests,
             timing_requests=getattr(args, "timing_requests", 0),
             measure_tpot=getattr(args, "measure_tpot", False),
+            expert_trace=getattr(args, "expert_trace", False),
             warmup_requests=args.warmup_requests,
             max_tokens=VERIFICATION_MAX_TOKENS if getattr(args, "verification_suite", False) else 5,
             startup_timeout=args.startup_timeout,
             request_timeout=args.request_timeout,
             profile_timeout=args.profile_timeout,
             strict_profile=False,
-            mstx=not cost_mode,
+            mstx=not cost_mode and not getattr(args, "expert_trace", False),
             skip_profile=args.skip_profile,
             compare_join_cost=cost_mode,
             profile_compare=profile_compare,
@@ -890,7 +899,10 @@ def run(args, root):
                 getattr(args, "no_graph_dump", False),
                 getattr(args, "diagnose_prefetch_wait_before_gate", False),
                 mte_load_stream=load_stream_mode,
-                moe_offload_debug=legacy_callback if handoff_compare else None,
+                expert_trace=getattr(args, "expert_trace", False),
+                moe_offload_debug=(
+                    False if getattr(args, "expert_trace", False) else legacy_callback if handoff_compare else None
+                ),
             ),
             case_policy,
             env,

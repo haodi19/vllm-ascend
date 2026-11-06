@@ -276,7 +276,7 @@ class CallbackTimings:
             mstx_errors=self.marker_errors,
         )
 
-    def serve(self, port):
+    def serve(self, port, expert_trace=None):
         collector = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -313,7 +313,12 @@ class CallbackTimings:
                     # Consume the control request body before closing HTTP/1.0;
                     # unread bytes can cause a TCP reset instead of a response.
                     self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                    if self.path == "/start":
+                    if self.path == "/expert_trace/start" and expert_trace is not None:
+                        expert_trace.start()
+                        self.respond(200, {"started": True})
+                    elif self.path == "/expert_trace/stop" and expert_trace is not None:
+                        self.respond(200, expert_trace.stop())
+                    elif self.path == "/start":
                         collector.start()
                         self.respond(200, {"started": True})
                     elif self.path == "/stop":
@@ -364,5 +369,18 @@ def install_callback_timing(manager, port):
     transport = manager._get_h2d_transport()
     transport.copy_batch = collector.wrap("copy_submit", transport.copy_batch)
     manager._update_weights = collector.wrap_update(manager._update_weights)
-    collector.serve(port)
+    expert_trace = None
+    if getattr(manager.offload_config, "expert_trace_enabled", False):
+        import torch
+        import torch_npu
+
+        from vllm_ascend.expert_offload.expert_trace import install_expert_trace
+
+        expert_trace = install_expert_trace(manager)
+        expert_trace.runtime_identity = dict(
+            device=torch_npu.npu.get_device_name(),
+            torch=torch.__version__,
+            torch_npu=torch_npu.__version__,
+        )
+    collector.serve(port, expert_trace)
     manager._callback_timing = collector

@@ -23,6 +23,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from moe_expert_trace_report import write_trace
 from moe_tpot import streaming_completion
 
 REPO = Path(__file__).resolve().parents[1]
@@ -569,7 +570,25 @@ def _inference(args, source, backend, env, log):
         try:
             request(opener, args.timing_port, "/start", {})
             with progress(f"{backend} measured inference: {args.requests} requests"):
-                requests = [completion(payload) for payload in payloads]
+                for request_index, payload in enumerate(payloads, 1):
+                    trace_enabled = getattr(args, "expert_trace", False)
+                    if trace_enabled:
+                        request(opener, args.timing_port, "/expert_trace/start", {}, timeout=40)
+                    try:
+                        sample = completion(payload)
+                        requests.append(sample)
+                    finally:
+                        if trace_enabled:
+                            trace = request(opener, args.timing_port, "/expert_trace/stop", {}, timeout=40)
+                            trace["request"] = dict(index=request_index, payload=payload)
+                            if len(requests) == request_index:
+                                trace["request"].update(usage=sample[1], digest=sample[2])
+                            else:
+                                trace["complete"] = False
+                                trace["request"]["failed"] = True
+                            write_trace(trace, args.output_dir / f"expert_trace_{request_index:03d}.txt")
+                            if not trace["complete"]:
+                                raise RuntimeError("Expert trace incomplete; inspect expert_trace file")
             if getattr(args, "measure_tpot", False):
                 (args.output_dir / "profile_stream_samples.json").write_text(
                     json.dumps(stream_samples["measured"]), encoding="utf-8"
