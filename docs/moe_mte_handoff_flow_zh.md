@@ -1391,3 +1391,15 @@ python -B script/run_moe_expert_trace.py --npu 0 --output-dir /home/l00992607/mo
 启动、捕获和预热不在轨迹中；服务日志仍保留诊断BEGIN/COPY/END，便于失败时定位最后位置。
 
 当前完成了CPU模拟回归；真实NPU路由与完整层遍历结果需由绿区执行后核对。
+
+原始轨迹较长时，可以只返回以下精简汇总，不必重跑模型：
+
+```bash
+python -B script/summarize_moe_expert_trace.py /home/l00992607/moe_results_data2/moe_expert_trace_01
+```
+
+脚本只读已有`expert_trace.txt`，不导入Torch、不使用NPU、不写文件。
+默认选择第一份请求记录；多个请求可用`--request 2`选择第二份，避免混算。
+输出配置与内存、各轮总量、逐层“命中/缺失/加载”紧凑表及最多四条专家ID样例。
+计数从EVENT重新汇总并核对原TOTAL，缺失结尾、解析错误或加载失败会标记不完整。
+省略的完整ID、槽位映射和拷贝描述符仍保留在原文件中。
