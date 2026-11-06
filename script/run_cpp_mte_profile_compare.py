@@ -8,6 +8,7 @@ import json
 import math
 import re
 import sys
+from pathlib import Path
 from uuid import uuid4
 
 from moe_outlier_stats import group_outliers, outlier_summary
@@ -22,7 +23,8 @@ from run_moe_host_sync import (
     run,
     worker_profile_cases,
 )
-from run_verified_cpp_tests import REPO, SummaryTee
+from run_verified_cpp_tests import REPO, SummaryTee, progress
+from verify_memcpy_gaps import inspect_offload_trace
 
 METRICS = (
     "total",
@@ -38,6 +40,64 @@ METRICS = (
 )
 MAX_GAP_ROWS = 24
 EMPTY_DIGEST = hashlib.sha256(b"").hexdigest()
+TARGET_BUBBLE_MIN_US = 10.0
+TARGET_BUBBLE_MAX_US = 5000.0
+
+
+def loading_bubble_summary(reports, root, labels, stream_name):
+    """Reuse the verified explicit-track analyzer; never infer the stream by copy count."""
+    lines = [
+        f"加载流空泡：精确选择thread_name={stream_name!r}，全部设备任务区间取并集（含MEMCPY、Transpose）。",
+        "仅统计10≤gap<5000μs，不再叠加IQR；full_capture含Prefill，callback_window为首末回调间连续范围。",
+        "方向仅统计能唯一关联层号的子集；Host间隔独立列出，不使用设备空泡的10～5000μs筛选。",
+    ]
+    retained = (
+        "TARGET_GAPS_US ",
+        "TARGET_DIRECTION_GAPS_US ",
+        "SELECTED_OFFLOAD_TRACK ",
+        "OFFLOAD_STATUS ",
+        "CALLBACK_SCOPE_UNAVAILABLE ",
+        "EXCLUDED_ADJACENT_PAIRS ",
+    )
+    with (root / "bubble_details.log").open("w", encoding="utf-8") as details:
+        for label in labels:
+            report = reports[label]
+            traces = report.get("profile_trace_data", [])
+            lines.append(f"CASE={label}; requested_stream={stream_name}; traces={len(traces)}")
+            if not traces:
+                lines.append("BUBBLES_UNAVAILABLE: 没有已检查的时间线；不代入其他组数据。")
+            for trace in traces:
+                lines.append(f"TRACE={trace['file']}")
+                if (
+                    report.get("profile_status") not in ("complete", "complete_with_warnings")
+                    or not trace.get("usable")
+                    or not trace.get("json_complete")
+                ):
+                    lines.append("BUBBLES_UNAVAILABLE: 时间线未通过完整性检查；不计算目标空泡。")
+                    continue
+                for row in trace.get("host_gaps", []):
+                    lines.append("HOST_CALLBACK_GAP " + json.dumps(display_numbers(row), ensure_ascii=False))
+                output = io.StringIO()
+                complete = False
+                error = None
+                capture = CostProgressFile(sys.stdout, output)
+                with progress(f"loading bubbles {label}: {stream_name}; 10<=gap<5000us"):
+                    try:
+                        with contextlib.redirect_stdout(capture):
+                            complete = inspect_offload_trace(
+                                Path(trace["file"]), stream_name, TARGET_BUBBLE_MIN_US, TARGET_BUBBLE_MAX_US
+                            )
+                    except (OSError, ValueError, TypeError) as exc:
+                        error = f"{type(exc).__name__}: {exc}"
+                details.write(f"CASE={label}\n{output.getvalue()}\n")
+                lines.extend(line for line in output.getvalue().splitlines() if line.startswith(retained))
+                if error:
+                    lines.append(f"BUBBLES_UNAVAILABLE: {error}; 不按tid或拷贝数量更换轨道。")
+                elif not complete:
+                    lines.append("BUBBLES_PARTIAL: 已输出的窗口统计保留；方向或回调关联不完整，见OFFLOAD_STATUS。")
+    text = "\n".join(lines) + "\n"
+    (root / "bubble_summary.txt").write_text(text, encoding="utf-8")
+    return text
 
 
 def display_numbers(value, key=""):
@@ -535,6 +595,9 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
         if args.measure_tpot:
             print(f"流式TTFT/TPOT已开启；精简结果：{root / 'tpot_summary.txt'}")
+        if args.bubble_stream_name:
+            print(f"自动统计加载流空泡：{args.bubble_stream_name}；精简结果：{root / 'bubble_summary.txt'}")
+            print("原MEMCPY_GAP表是逐拷贝原始统计；目标空泡请看TARGET_GAPS_US及TARGET_DIRECTION_GAPS_US。")
         if args.timing_requests:
             print(
                 f"整体时延另测每组{args.timing_requests}次请求，在profiler和回调计时开始之前执行；随后单独采profile。"
@@ -577,11 +640,15 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
                 print_atomic_trials(reports, args.atomic_trials)
             else:
                 print_comparison(reports, root, labels)
+            bubbles = ""
+            if args.bubble_stream_name:
+                bubbles = loading_bubble_summary(reports, root, labels, args.bubble_stream_name)
+                print(bubbles)
             if args.measure_tpot:
                 output = io.StringIO()
                 with contextlib.redirect_stdout(output):
                     print_tpot_comparison(reports, root, labels)
-                (root / "tpot_summary.txt").write_text(output.getvalue(), encoding="utf-8")
+                (root / "tpot_summary.txt").write_text(output.getvalue() + bubbles, encoding="utf-8")
                 print(output.getvalue())
             return 0
         except Exception as exc:

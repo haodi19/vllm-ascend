@@ -550,6 +550,10 @@ def parse_args(
     if profile_compare:
         parser.add_argument("--large-gap-us", type=positive_gap_us, default=100.0)
         parser.add_argument(
+            "--bubble-stream-name",
+            help="Exact MindStudio loading stream name; automatically summarize 10<=gap<5000us after export",
+        )
+        parser.add_argument(
             "--measure-tpot",
             action="store_true",
             help="Stream completions to measure TTFT/TPOT; historical non-streaming data cannot recover TTFT",

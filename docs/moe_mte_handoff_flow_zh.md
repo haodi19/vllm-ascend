@@ -1122,7 +1122,7 @@ MTP可能一次返回多个token，使用服务返回的实际token数，不把S
 无采集和带采集结果分别统计，保留原值与3×IQR筛选结果，不合并两个窗口。
 
 ```bash
-python -B script/run_moe_callback_worker_compare.py --include-legacy-callback --measure-tpot --npu 0 --timing-requests 20 --requests 1 --output-dir /home/l00992607/moe_results_data2/moe_tpot_01
+python -B script/run_moe_callback_worker_compare.py --include-legacy-callback --measure-tpot --bubble-stream-name "Stream 56" --npu 0 --warmup-requests 5 --timing-requests 20 --requests 1 --output-dir /home/l00992607/moe_results_data2/moe_tpot_01
 ```
 
 miracle使用MTE组合组同一次带profile请求：将首个输出之后、最后一个输出之前的相邻
@@ -1282,6 +1282,13 @@ Host间隔取同进程相邻`host_callback`标记之间的时间，按预取→�
 不能直接将约3秒到约4秒的差值解释为某一代码改动的退化。
 
 ### 14.7 时间线阶段与加载批次空泡口径
+
+四组实验可通过`--bubble-stream-name "Stream 56"`在导出profile后自动执行本节统计，
+无需再运行离线脚本。参数按MindStudio中的完整显示名称选择设备流，不按数字tid或拷贝数量猜测。
+结果写入`summary.txt`和精简的`bubble_summary.txt`，同时开启TPOT时也合入`tpot_summary.txt`，
+其中保留Host间隔、两种统计窗口及可匹配的两个层间方向。
+指定轨道不存在、同名轨道不唯一或profile无效时明确标记不可用，不改选其他流；
+其他组和已取得的TPOT结果继续保留。各组原始profile仍保存在实验目录的`profile/`下。
 
 本轮5-token输入超过卸载阈值`num_device_experts // topk = 24 // 6 = 4`，
 进入`update_weights`的Prefill分支：逐层调用`_prefill_load_layer`，

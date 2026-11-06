@@ -228,7 +228,7 @@ class CppMteProfileTests(unittest.TestCase):
                         "--output-dir",
                         str(root),
                         *(["--include-legacy-callback"] if isinstance(wrong_policy, str) else []),
-                        *(["--measure-tpot"] if wrong_policy == "tpot" else []),
+                        *(["--measure-tpot", "--bubble-stream-name", "Stream 56"] if wrong_policy == "tpot" else []),
                     ],
                     handoff_compare=True,
                 )
@@ -239,6 +239,8 @@ class CppMteProfileTests(unittest.TestCase):
                     self.assertEqual(tpot.count('"scope": "no_profile"'), 4)
                     self.assertEqual(tpot.count('"scope": "with_profile"'), 4)
                     self.assertIn("MIRACLE_UNAVAILABLE", tpot)
+                    self.assertIn("requested_stream=Stream 56", tpot)
+                    self.assertTrue((root / "bubble_summary.txt").is_file())
                 if not failed:
                     summary = (root / "summary.txt").read_text(encoding="utf-8")
                     self.assertIn("NO_PROFILE_COMBINED_VS_DEFAULT", summary)
@@ -556,6 +558,90 @@ class CppMteProfileTests(unittest.TestCase):
         self.assertTrue(args.measure_tpot and args.include_legacy_callback)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.args("--measure-tpot")
+
+    def test_integrated_bubbles_select_display_name_and_both_scopes_and_directions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "trace.json"
+            rows = [
+                dict(ph="M", name="process_name", pid=100, args=dict(name="Ascend Hardware")),
+                dict(ph="M", name="thread_name", pid=100, tid=27, args=dict(name="Stream 56")),
+                dict(ph="M", name="thread_name", pid=100, tid=56, args=dict(name="Stream 27")),
+                dict(ph="X", name="MEMCPY_ASYNC", pid=100, tid=56, ts=0, dur=99999),
+                dict(ph="X", name="Transpose_int8", pid=100, tid=27, ts=220.05, dur=29.95),
+            ]
+            rows.extend(
+                dict(ph="X", name="MEMCPY_ASYNC", pid=100, tid=27, ts=start, dur=10)
+                for start in (0, 210, 410, 610, 7000)
+            )
+            rows.extend(
+                dict(
+                    ph="X",
+                    name=f"moe_offload/host_callback|call={call}|kind={kind}|layer={layer}",
+                    pid=7,
+                    tid=8,
+                    ts=start,
+                    dur=100,
+                )
+                for start, call, kind, layer in (
+                    (200, 1, "prefetch", 1),
+                    (400, 2, "reactive", 1),
+                    (600, 3, "prefetch", 2),
+                )
+            )
+            path.write_text(json.dumps(rows), encoding="utf-8")
+            report = dict(
+                profile_status="complete",
+                profile_trace_data=[
+                    dict(
+                        file=str(path),
+                        usable=True,
+                        json_complete=True,
+                        host_gaps=[dict(direction="prefetch->reactive")],
+                    )
+                ],
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                output = self.compare.loading_bubble_summary(
+                    dict(mte_combined=report), root, ["mte_combined"], "Stream 56"
+                )
+            scopes = [
+                json.loads(line.split(" ", 1)[1]) for line in output.splitlines() if line.startswith("TARGET_GAPS_US ")
+            ]
+            self.assertEqual([row["scope"] for row in scopes], ["full_capture", "callback_window"])
+            self.assertEqual(scopes[0]["kept"]["n"], 3)
+            self.assertEqual(scopes[0]["excluded_long"], 1)
+            self.assertEqual(scopes[1]["kept"]["mean"], 175)
+            self.assertEqual(output.count("TARGET_DIRECTION_GAPS_US "), 2)
+            selected = next(
+                json.loads(line.split(" ", 1)[1])
+                for line in output.splitlines()
+                if line.startswith("SELECTED_OFFLOAD_TRACK ")
+            )
+            self.assertEqual((selected["name"], selected["tid"]), ("Stream 56", "27"))
+            self.assertIn("HOST_CALLBACK_GAP", output)
+            self.assertNotIn("BUBBLES_UNAVAILABLE", output)
+            self.assertEqual((root / "bubble_summary.txt").read_text(encoding="utf-8"), output)
+
+    def test_integrated_bubbles_fail_closed_without_affecting_other_groups(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = dict(file="trace.json", usable=True, json_complete=True)
+            reports = {
+                name: dict(profile_status="complete", profile_trace_data=[trace]) for name in ("callback", "mte")
+            }
+            output = io.StringIO()
+            with (
+                patch.object(
+                    self.compare, "inspect_offload_trace", side_effect=[ValueError("missing Stream 56"), True]
+                ) as inspect,
+                contextlib.redirect_stdout(output),
+            ):
+                result = self.compare.loading_bubble_summary(reports, root, tuple(reports), "Stream 56")
+            self.assertEqual(inspect.call_count, 2)
+            self.assertEqual(inspect.call_args.args[1:], ("Stream 56", 10.0, 5000.0))
+            self.assertIn("BUBBLES_UNAVAILABLE", result)
+            self.assertIn("CASE=mte", result)
 
     def check_inference_sequence(self, timing_count, *, timers_active=False, measure_tpot=False):
         args = SimpleNamespace(
