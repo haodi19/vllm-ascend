@@ -1351,6 +1351,9 @@ python -B script/verify_memcpy_gaps.py /home/l00992607/moe_results_data2/moe_fou
 
 ### 14.8 逐请求专家加载与缓存驻留诊断
 
+面向单卡 Decode 与存储架构对照的配置、性能、TPOT 和已验证的逐层加载记录，
+汇总于 [DeepSeek-V4 单卡 MoE 卸载测试基线](moe_decode_baseline_zh.md)。
+
 为补齐单卡Decode基线中的专家访问轨迹，增加`script/run_moe_expert_trace.py`。
 它沿用`script/test_graph2.sh`的模型、MTP、组图及缓存参数，选择当前MTE普通加载流、
 C++ LRC、`allocated/atomic/yield`和消费者处严格等待；关闭旧debug打印及其他定位干预。
