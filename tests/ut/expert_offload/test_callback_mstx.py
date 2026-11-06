@@ -5,16 +5,18 @@ import contextlib
 import io
 import json
 import runpy
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 REPO = Path(__file__).resolve().parents[3]
 TIMING = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))
-RUNNER = runpy.run_path(str(REPO / "script/run_verified_cpp_tests.py"))
+with patch.object(sys, "path", [str(REPO / "script"), *sys.path]):
+    RUNNER = runpy.run_path(str(REPO / "script/run_verified_cpp_tests.py"))
 
 
 class FakeMstx:

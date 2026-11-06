@@ -1110,6 +1110,30 @@ MTE组合相比早期配置减少180.683ms，相比当前回调减少44.977ms（
 MTE组合相比MTE默认仅减少1.898ms（0.048%），且P95和标准差更高，尚不能证明组合改动有稳定的整体增益。
 本轮每种配置只启动一个服务，20个请求用于观察服务内波动，不能替代多轮交错服务对照。
 
+前两轮四组实验采用非流式请求，未保存首token到达时间，以上整体时延不能补算真实TPOT。
+TPOT的流式测量口径为“最后一个输出文本块到达时间减去首个非空输出文本块到达时间”，
+再除以`completion_tokens - 1`；5个输出token对应4个后续token间隔。
+MTP可能一次返回多个token，使用服务返回的实际token数，不把SSE文本块数当作token数。
+
+四组脚本新增可选参数`--measure-tpot`，默认仍使用原有非流式方式。
+开启后每组预热5次，独立测量20次无profiler流式请求，再单独采集1次流式请求的profile；
+保存逐请求TTFT、TPOT、文本块数、实际token数与客户端时间边界。
+主报告仍为`summary.txt`，TPOT的精简报告为`tpot_summary.txt`。
+无采集和带采集结果分别统计，保留原值与3×IQR筛选结果，不合并两个窗口。
+
+```bash
+python -B script/run_moe_callback_worker_compare.py --include-legacy-callback --measure-tpot --npu 0 --timing-requests 20 --requests 1 --output-dir /home/l00992607/moe_results_data2/moe_tpot_01
+```
+
+miracle使用MTE组合组同一次带profile请求：将首个输出之后、最后一个输出之前的相邻
+`host_callback`间隔取并集后扣除，再除以`completion_tokens - 1`。
+这里按“全部Host间隔归零”假设计算，不应用设备空泡的10～5000μs阈值，也不做IQR剔除；
+不扣除Host函数执行时间，不计入首个输出前的间隔，不把重叠区间重复相加。
+该估算假设导出的Host时间戳与本机客户端时钟对齐，且所有选定间隔均在关键路径上、
+可以完整删除、其余计算不变。因此它不是实际第五组测试，也不是已证明可达到的性能下界。
+只与同次带profile的TPOT比较，不能从20次无profiler均值中扣除带profile的间隔。
+profile不完整、时间窗口不匹配或缺少必要数据时标记为不可估算，四组实测TPOT仍保留。
+
 ### 14.3 LRC、调试日志与权重加载分项
 
 下表为采集窗口中逐回调指标的3×IQR筛选后均值，单位为μs。

@@ -84,6 +84,7 @@ class CppMteProfileTests(unittest.TestCase):
                         "7",
                         "--cache-policy-backend",
                         "cpp",
+                        "--measure-tpot",
                         *(["--include-legacy-callback"] if failure == "legacy" else []),
                     ],
                     profile_compare=True,
@@ -95,6 +96,7 @@ class CppMteProfileTests(unittest.TestCase):
                     run_args, source, policy, env, *, failure=failure, calls=calls, root=root, settings=settings
                 ):
                     label = run_args.output_dir.name
+                    self.assertTrue(run_args.measure_tpot)
                     calls.append(label)
                     if failure == "timeout" and label == "mte_default":
                         raise TimeoutError("request timeout")
@@ -170,7 +172,7 @@ class CppMteProfileTests(unittest.TestCase):
                     self.assertTrue((root / "callback/profile_report.json").is_file())
 
     def test_handoff_entry_summary_labels_and_policy_validation(self):
-        for wrong_policy in (False, True, "legacy", "legacy_debug"):
+        for wrong_policy in (False, True, "legacy", "legacy_debug", "tpot"):
 
             def fake_run(args, root, *, wrong_policy=wrong_policy):
                 reports = {}
@@ -197,6 +199,19 @@ class CppMteProfileTests(unittest.TestCase):
                     reports["mte_combined"]["worker_policy"]["scan"] = "all"
                 if wrong_policy == "legacy_debug":
                     reports["callback_legacy"]["moe_offload_debug"] = False
+                if wrong_policy == "tpot":
+                    self.assertTrue(args.measure_tpot)
+                    for report in reports.values():
+                        sample = dict(
+                            ttft_us=100,
+                            output_latency_us=900,
+                            decode_us=800,
+                            http_wall_us=1000,
+                            tpot_us=200,
+                            content_chunks=3,
+                        )
+                        report["stream_samples"] = [sample]
+                        report["request_window"]["stream_samples"] = [sample, sample]
                 return reports
 
             with (
@@ -213,11 +228,17 @@ class CppMteProfileTests(unittest.TestCase):
                         "--output-dir",
                         str(root),
                         *(["--include-legacy-callback"] if isinstance(wrong_policy, str) else []),
+                        *(["--measure-tpot"] if wrong_policy == "tpot" else []),
                     ],
                     handoff_compare=True,
                 )
                 failed = wrong_policy is True or wrong_policy == "legacy_debug"
                 self.assertEqual(code, 1 if failed else 0)
+                if wrong_policy == "tpot":
+                    tpot = (root / "tpot_summary.txt").read_text(encoding="utf-8")
+                    self.assertEqual(tpot.count('"scope": "no_profile"'), 4)
+                    self.assertEqual(tpot.count('"scope": "with_profile"'), 4)
+                    self.assertIn("MIRACLE_UNAVAILABLE", tpot)
                 if not failed:
                     summary = (root / "summary.txt").read_text(encoding="utf-8")
                     self.assertIn("NO_PROFILE_COMBINED_VS_DEFAULT", summary)
@@ -521,8 +542,24 @@ class CppMteProfileTests(unittest.TestCase):
     def test_repeated_window_rejects_active_timers_before_starting_profiler(self):
         self.check_inference_sequence(4, timers_active=True)
 
-    def check_inference_sequence(self, timing_count, *, timers_active=False):
+    def test_streaming_samples_are_separate_and_survive_profile_export_failure(self):
+        self.check_inference_sequence(4, measure_tpot=True)
+
+    def test_tpot_cli_is_opt_in_and_requires_handoff_comparison(self):
+        self.assertFalse(self.args().measure_tpot)
+        with patch.object(sys, "platform", "linux"):
+            args = self.runner.parse_args(
+                ["--npu", "0", "--cache-policy-backend", "cpp", "--measure-tpot", "--include-legacy-callback"],
+                profile_compare=True,
+                handoff_compare=True,
+            )
+        self.assertTrue(args.measure_tpot and args.include_legacy_callback)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.args("--measure-tpot")
+
+    def check_inference_sequence(self, timing_count, *, timers_active=False, measure_tpot=False):
         args = SimpleNamespace(
+            measure_tpot=measure_tpot,
             timing_requests=timing_count,
             output_dir=Path(self.enterContext(tempfile.TemporaryDirectory())),
             npu=7,
@@ -557,8 +594,14 @@ class CppMteProfileTests(unittest.TestCase):
         process = Mock(pid=123, returncode=None)
         process.poll.return_value = None
         log = io.StringIO()
+
+        def stream(opener, port, payload, timeout):
+            response = request(opener, port, "/v1/completions", payload, timeout)
+            return dict(http_wall_us=1000, usage=response["usage"], digest=hashlib.sha256(b"text").hexdigest())
+
         with (
             patch.object(self.infer, "request", side_effect=request),
+            patch.object(self.infer, "streaming_completion", side_effect=stream) as streaming,
             patch.object(self.infer, "assert_port_free"),
             patch.object(self.infer, "stop_owned_service") as stop,
             patch.object(self.infer, "wait_service_ports_free"),
@@ -591,6 +634,14 @@ class CppMteProfileTests(unittest.TestCase):
             self.assertEqual(window["count"], timing_count)
             self.assertEqual(len(window["samples_us"]), timing_count)
             self.assertEqual(window["digests"], result["digests"] * timing_count)
+        if measure_tpot:
+            self.assertEqual(streaming.call_count, 3 + timing_count + 1)
+            self.assertEqual(len(result["request_window"]["stream_samples"]), timing_count)
+            self.assertEqual(len(result["stream_samples"]), 1)
+            saved = json.loads((args.output_dir / "profile_stream_samples.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved, result["stream_samples"])
+        else:
+            streaming.assert_not_called()
         finish.assert_called_once()
         stop.assert_called_once_with(process)
         self.assertIn('"event": "cleanup_begin"', log.getvalue())

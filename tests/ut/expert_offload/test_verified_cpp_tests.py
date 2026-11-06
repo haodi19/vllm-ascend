@@ -164,7 +164,8 @@ class TestCallbackTimings(unittest.TestCase):
 class TestVerifiedRunner(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.module = runpy.run_path(str(REPO / "script/run_verified_cpp_tests.py"))
+        with patch.object(sys, "path", [str(REPO / "script"), *sys.path]):
+            cls.module = runpy.run_path(str(REPO / "script/run_verified_cpp_tests.py"))
         cls.source = (REPO / "script/test_graph2.sh").read_text(encoding="utf-8")
 
     def test_startup_entry_keeps_all_validated_serve_options(self):

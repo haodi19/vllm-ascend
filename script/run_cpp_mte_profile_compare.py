@@ -3,6 +3,7 @@
 
 import contextlib
 import hashlib
+import io
 import json
 import math
 import re
@@ -10,6 +11,7 @@ import sys
 from uuid import uuid4
 
 from moe_outlier_stats import group_outliers, outlier_summary
+from moe_tpot import print_tpot_comparison
 from mte_join_cost import LOAD_STATS
 from run_moe_host_sync import (
     WORKER_PROFILE_CASES,
@@ -531,6 +533,8 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             print("两组均为MTE晚等待＋cpp LRC；只改变加载流：sync_launch → ordinary。")
             print("普通流若请求超时则终止本轮，不跳过设备完成检查，不继续推理。")
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
+        if args.measure_tpot:
+            print(f"流式TTFT/TPOT已开启；精简结果：{root / 'tpot_summary.txt'}")
         if args.timing_requests:
             print(
                 f"整体时延另测每组{args.timing_requests}次请求，在profiler和回调计时开始之前执行；随后单独采profile。"
@@ -573,6 +577,12 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
                 print_atomic_trials(reports, args.atomic_trials)
             else:
                 print_comparison(reports, root, labels)
+            if args.measure_tpot:
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    print_tpot_comparison(reports, root, labels)
+                (root / "tpot_summary.txt").write_text(output.getvalue(), encoding="utf-8")
+                print(output.getvalue())
             return 0
         except Exception as exc:
             print(

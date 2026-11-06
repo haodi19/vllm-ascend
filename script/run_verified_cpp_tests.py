@@ -23,6 +23,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from moe_tpot import streaming_completion
+
 REPO = Path(__file__).resolve().parents[1]
 MIN_PROFILE_FREE_GIB = 20
 GIB = 1024**3
@@ -485,7 +487,14 @@ def _inference(args, source, backend, env, log):
         )
         print("REQUEST_PLAN " + json.dumps(request_specs), flush=True)
 
+        stream_samples = {"no_profiler": [], "measured": []}
+
         def completion(payload, phase="measured"):
+            if getattr(args, "measure_tpot", False):
+                sample = streaming_completion(opener, args.port, payload, timeout=args.request_timeout)
+                if phase in stream_samples:
+                    stream_samples[phase].append(sample)
+                return sample["http_wall_us"], sample["usage"], sample["digest"]
             begin = time.perf_counter_ns()
             result = request(opener, args.port, "/v1/completions", payload, timeout=args.request_timeout)
             elapsed = (time.perf_counter_ns() - begin) / 1000
@@ -529,6 +538,8 @@ def _inference(args, source, backend, env, log):
                 digests=[sample[2] for sample in samples],
                 usage=[sample[1] for sample in samples],
             )
+            if getattr(args, "measure_tpot", False):
+                request_window["stream_samples"] = stream_samples["no_profiler"]
             # Persist before profiling: export failures must not lose request measurements.
             (args.output_dir / "request_window.json").write_text(json.dumps(request_window), encoding="utf-8")
         untimed = None
@@ -559,6 +570,10 @@ def _inference(args, source, backend, env, log):
             request(opener, args.timing_port, "/start", {})
             with progress(f"{backend} measured inference: {args.requests} requests"):
                 requests = [completion(payload) for payload in payloads]
+            if getattr(args, "measure_tpot", False):
+                (args.output_dir / "profile_stream_samples.json").write_text(
+                    json.dumps(stream_samples["measured"]), encoding="utf-8"
+                )
         finally:
             try:
                 report = request(opener, args.timing_port, "/stop", {}, timeout=40)
@@ -571,6 +586,8 @@ def _inference(args, source, backend, env, log):
                 profile_status = finish_profile(opener, args, profile_dir) if profile_enabled else "skipped"
         report["profile_status"] = profile_status
         report["request_specs"] = request_specs
+        if getattr(args, "measure_tpot", False):
+            report["stream_samples"] = stream_samples["measured"]
         if request_window is not None:
             report["request_window"] = request_window
         if untimed is not None:

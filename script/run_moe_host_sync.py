@@ -550,6 +550,11 @@ def parse_args(
     if profile_compare:
         parser.add_argument("--large-gap-us", type=positive_gap_us, default=100.0)
         parser.add_argument(
+            "--measure-tpot",
+            action="store_true",
+            help="Stream completions to measure TTFT/TPOT; historical non-streaming data cannot recover TTFT",
+        )
+        parser.add_argument(
             "--timing-requests",
             type=int,
             default=20 if handoff_compare else 0,
@@ -567,6 +572,8 @@ def parse_args(
     args.three_way = three_way
     args.worker_compare = worker_compare
     args.handoff_compare = handoff_compare
+    if getattr(args, "measure_tpot", False) and not handoff_compare:
+        parser.error("--measure-tpot requires run_moe_callback_worker_compare.py")
     if getattr(args, "timing_requests", 0) < 0:
         parser.error("--timing-requests must be nonnegative")
     if handoff_compare and not args.timing_requests:
@@ -831,6 +838,7 @@ def run(args, root):
             timing_port=args.timing_port,
             requests=args.requests,
             timing_requests=getattr(args, "timing_requests", 0),
+            measure_tpot=getattr(args, "measure_tpot", False),
             warmup_requests=args.warmup_requests,
             max_tokens=VERIFICATION_MAX_TOKENS if getattr(args, "verification_suite", False) else 5,
             startup_timeout=args.startup_timeout,
