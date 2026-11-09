@@ -432,7 +432,13 @@ def inference(args, source, backend, env):
 def completion_payloads(args, model):
     prompts = VERIFICATION_PROMPTS if getattr(args, "verification_suite", False) else ("The future of AI is",)
     return [
-        dict(model=model, prompt=prompts[index % len(prompts)], max_tokens=args.max_tokens, temperature=0)
+        dict(
+            model=model,
+            prompt=prompts[index % len(prompts)],
+            max_tokens=args.max_tokens,
+            temperature=0,
+            **({"ignore_eos": True} if getattr(args, "ignore_eos", False) else {}),
+        )
         for index in range(args.requests)
     ]
 
@@ -477,13 +483,15 @@ def _inference(args, source, backend, env, log):
                 prompt_sha256=hashlib.sha256(payload["prompt"].encode()).hexdigest(),
                 max_tokens=payload["max_tokens"],
                 temperature=payload["temperature"],
+                **({"ignore_eos": True} if payload.get("ignore_eos") else {}),
             )
             for payload in payloads
         ]
         prompt_mode = "verification suite" if getattr(args, "verification_suite", False) else "identical prompt"
         print(
             f"Service ready. Warmup={args.warmup_requests}; measured requests={args.requests}; "
-            f"max_tokens={args.max_tokens}; temperature=0; {prompt_mode}; sequential requests.",
+            f"max_tokens={args.max_tokens}; temperature=0; ignore_eos={getattr(args, 'ignore_eos', False)}; "
+            f"{prompt_mode}; sequential requests.",
             flush=True,
         )
         print("REQUEST_PLAN " + json.dumps(request_specs), flush=True)

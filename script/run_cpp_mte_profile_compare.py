@@ -604,7 +604,8 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             )
         print(
             f"配置：LRC按各组配置；MTE 严格 wait 延后到消费门控后；预热={args.warmup_requests}，"
-            f"采集请求={args.requests}，max_tokens=5，大间隔阈值={args.large_gap_us:g} us。",
+            f"采集请求={args.requests}，max_tokens={args.max_tokens}，ignore_eos={args.ignore_eos}，"
+            f"大间隔阈值={args.large_gap_us:g} us。",
             flush=True,
         )
         print(

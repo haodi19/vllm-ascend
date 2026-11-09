@@ -1125,6 +1125,16 @@ MTP可能一次返回多个token，使用服务返回的实际token数，不把S
 python -B script/run_moe_callback_worker_compare.py --include-legacy-callback --measure-tpot --bubble-stream-name "Stream 56" --npu 0 --warmup-requests 5 --timing-requests 20 --requests 1 --output-dir /home/l00992607/moe_results_data2/moe_tpot_01
 ```
 
+长输出对照可增加 `--max-tokens 128 --ignore-eos`。前者设置输出上限，后者忽略 EOS，
+避免提前结束；预热、无采集计时和 profile 请求均使用相同设置，实际输出数量仍记录在 usage 中。
+默认仍为最多 5 个输出 token，且不忽略 EOS。长输出结果应与同轮四组比较，不直接与旧的短输出均值相减。
+
+```bash
+python -B script/run_moe_callback_worker_compare.py --include-legacy-callback --measure-tpot --bubble-stream-name "Stream 56" --npu 0 --max-tokens 128 --ignore-eos --warmup-requests 5 --timing-requests 20 --requests 1 --output-dir /home/l00992607/moe_results_data2/moe_four_way_tokens128_01
+```
+
+该命令保留四组 profile，端到端、TPOT、Host 间隔和加载流空泡统计仍汇总到 `summary.txt`。
+
 miracle使用MTE组合组同一次带profile请求：将首个输出之后、最后一个输出之前的相邻
 `host_callback`间隔取并集后扣除，再除以`completion_tokens - 1`。
 这里按“全部Host间隔归零”假设计算，不应用设备空泡的10～5000μs阈值，也不做IQR剔除；

@@ -75,7 +75,7 @@ class CppMteProfileTests(unittest.TestCase):
         self.assertFalse(legacy.diagnose_prefetch_wait_at_join)
 
     def test_handoff_three_groups_runtime_configuration_and_failure_guards(self):
-        for failure in (None, "policy", "window", "timeout", "legacy"):
+        for failure in (None, "policy", "window", "timeout", "legacy", "long"):
             with tempfile.TemporaryDirectory() as directory, patch.object(sys, "platform", "linux"):
                 root, calls, settings = Path(directory), [], []
                 args = self.runner.parse_args(
@@ -85,7 +85,8 @@ class CppMteProfileTests(unittest.TestCase):
                         "--cache-policy-backend",
                         "cpp",
                         "--measure-tpot",
-                        *(["--include-legacy-callback"] if failure == "legacy" else []),
+                        *(["--include-legacy-callback"] if failure in ("legacy", "long") else []),
+                        *(["--max-tokens", "128", "--ignore-eos"] if failure == "long" else []),
                     ],
                     profile_compare=True,
                     handoff_compare=True,
@@ -102,15 +103,19 @@ class CppMteProfileTests(unittest.TestCase):
                         raise TimeoutError("request timeout")
                     legacy = label == "callback_legacy"
                     self.assertEqual(
-                        (run_args.timing_requests, run_args.max_tokens, policy), (20, 5, "python" if legacy else "cpp")
+                        (run_args.timing_requests, run_args.max_tokens, policy),
+                        (20, 128 if failure == "long" else 5, "python" if legacy else "cpp"),
                     )
+                    self.assertEqual(run_args.ignore_eos, failure == "long")
                     self.assertFalse(run_args.skip_profile)
                     self.assertEqual(run_args.profile_run_dir, root / "profile" / label)
                     _, command, _, _ = self.runner.launch_spec(source, policy, 7, None, 18155)
                     config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
                     settings.append(config)
                     expected = next(
-                        case for case in self.runner.handoff_profile_cases(failure == "legacy") if case[0] == label
+                        case
+                        for case in self.runner.handoff_profile_cases(failure in ("legacy", "long"))
+                        if case[0] == label
                     )
                     _, backend, scan, probe, idle = expected
                     self.assertEqual(config["host_sync_backend"], backend)
@@ -146,7 +151,7 @@ class CppMteProfileTests(unittest.TestCase):
                     patch.object(self.runner, "inference", side_effect=fake_inference),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    if failure and failure != "legacy":
+                    if failure and failure not in ("legacy", "long"):
                         with self.assertRaises((RuntimeError, TimeoutError)):
                             self.runner.run(args, root)
                         self.assertEqual(
@@ -159,7 +164,7 @@ class CppMteProfileTests(unittest.TestCase):
                         reports = self.runner.run(args, root)
                         self.assertEqual(
                             list(reports),
-                            (["callback_legacy"] if failure == "legacy" else [])
+                            (["callback_legacy"] if failure in ("legacy", "long") else [])
                             + ["callback", "mte_default", "mte_combined"],
                         )
                         self.assertIsNone(reports["callback"]["worker_policy"])
@@ -549,6 +554,16 @@ class CppMteProfileTests(unittest.TestCase):
     def test_streaming_samples_are_separate_and_survive_profile_export_failure(self):
         self.check_inference_sequence(4, measure_tpot=True)
 
+    def test_long_output_reaches_warmup_timing_profile_and_report(self):
+        self.check_inference_sequence(4, measure_tpot=True, max_tokens=128, ignore_eos=True)
+
+    def test_output_limit_validation_and_original_defaults(self):
+        self.assertEqual(self.args().max_tokens, 5)
+        self.assertFalse(self.args().ignore_eos)
+        for value in ("0", "-1"):
+            with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.args("--max-tokens", value)
+
     def test_tpot_cli_is_opt_in_and_requires_handoff_comparison(self):
         self.assertFalse(self.args().measure_tpot)
         with patch.object(sys, "platform", "linux"):
@@ -645,7 +660,9 @@ class CppMteProfileTests(unittest.TestCase):
             self.assertIn("BUBBLES_UNAVAILABLE", result)
             self.assertIn("CASE=mte", result)
 
-    def check_inference_sequence(self, timing_count, *, timers_active=False, measure_tpot=False):
+    def check_inference_sequence(
+        self, timing_count, *, timers_active=False, measure_tpot=False, max_tokens=5, ignore_eos=False
+    ):
         args = SimpleNamespace(
             measure_tpot=measure_tpot,
             timing_requests=timing_count,
@@ -660,7 +677,8 @@ class CppMteProfileTests(unittest.TestCase):
             profile_run_dir=Path("profiles/test"),
             warmup_requests=3,
             requests=1,
-            max_tokens=5,
+            max_tokens=max_tokens,
+            ignore_eos=ignore_eos,
             skip_profile=False,
             mstx=True,
             profile_compare=True,
@@ -674,7 +692,11 @@ class CppMteProfileTests(unittest.TestCase):
             if path == "/status":
                 return dict(backend="cpp", load_backend="python", active=timers_active, mstx_enabled=True)
             if path == "/v1/completions":
-                return dict(choices=[dict(text="text")], usage=dict(completion_tokens=5, total_tokens=10))
+                self.assertEqual(payload["max_tokens"], max_tokens)
+                self.assertEqual(payload.get("ignore_eos", False), ignore_eos)
+                return dict(
+                    choices=[dict(text="text")], usage=dict(completion_tokens=max_tokens, total_tokens=5 + max_tokens)
+                )
             if path == "/stop":
                 return dict(count=2, errors=0, dropped=0, groups=[], mstx_enabled=True)
             return {}
@@ -715,6 +737,8 @@ class CppMteProfileTests(unittest.TestCase):
         )
         self.assertEqual(result["profile_status"], "incomplete")
         self.assertEqual(len(result["digests"]), 1)
+        self.assertEqual(result["request_specs"][0]["max_tokens"], max_tokens)
+        self.assertEqual(result["request_specs"][0].get("ignore_eos", False), ignore_eos)
         self.assertNotIn("untimed", result)
         if timing_count:
             window = json.loads((args.output_dir / "request_window.json").read_text(encoding="utf-8"))

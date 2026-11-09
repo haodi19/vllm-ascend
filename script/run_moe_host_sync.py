@@ -33,6 +33,7 @@ from run_verified_cpp_tests import (
 )
 
 MAX_ENGINE_ERROR_LINE_CHARS = 800
+DEFAULT_MAX_TOKENS = 5
 
 # Each candidate changes exactly one worker option; the final baseline exposes drift.
 WORKER_PROFILE_CASES = (
@@ -112,7 +113,8 @@ def run_cost_comparison(args, root, console):
     print("关闭 Runtime DEBUG、图 dump、逐项加载诊断、启动观测、MSTX 与 profiler。", flush=True)
     print(
         f"每组 {args.warmup_requests} 次预热 → {args.requests} 次内部计时关闭请求 → "
-        f"{args.requests} 次分项计时请求；max_tokens=5。仅两个服务依次运行。",
+        f"{args.requests} 次分项计时请求；max_tokens={args.max_tokens}，ignore_eos={args.ignore_eos}。"
+        "仅两个服务依次运行。",
         flush=True,
     )
     print(f"详细日志：{root / 'cost_details.log'}；本轮不采集 profile。", flush=True)
@@ -536,6 +538,8 @@ def parse_args(
     )
     parser.add_argument("--test-script", type=Path, default=REPOSITORY_ROOT / "script/test_graph2.sh")
     parser.add_argument("--requests", type=int)
+    parser.add_argument("--max-tokens", type=int, help="Output token limit; default 5 (verification suite: 32)")
+    parser.add_argument("--ignore-eos", action="store_true", help="Continue generation to the output token limit")
     parser.add_argument("--diagnose-graph-dump", action="store_true")
     parser.add_argument(
         "--no-graph-dump",
@@ -580,6 +584,12 @@ def parse_args(
     args.three_way = three_way
     args.worker_compare = worker_compare
     args.handoff_compare = handoff_compare
+    if args.max_tokens is None:
+        args.max_tokens = VERIFICATION_MAX_TOKENS if args.verification_suite else DEFAULT_MAX_TOKENS
+    if args.max_tokens < 1:
+        parser.error("--max-tokens must be positive")
+    if args.verification_suite and (args.max_tokens != VERIFICATION_MAX_TOKENS or args.ignore_eos):
+        parser.error("verification suite requires its original 32-token limit and EOS behavior")
     if args.expert_trace and (
         profile_compare or args.compare_join_cost or not args.skip_profile or args.backend == "both"
     ):
@@ -853,7 +863,12 @@ def run(args, root):
             measure_tpot=getattr(args, "measure_tpot", False),
             expert_trace=getattr(args, "expert_trace", False),
             warmup_requests=args.warmup_requests,
-            max_tokens=VERIFICATION_MAX_TOKENS if getattr(args, "verification_suite", False) else 5,
+            max_tokens=getattr(
+                args,
+                "max_tokens",
+                VERIFICATION_MAX_TOKENS if getattr(args, "verification_suite", False) else DEFAULT_MAX_TOKENS,
+            ),
+            ignore_eos=getattr(args, "ignore_eos", False),
             startup_timeout=args.startup_timeout,
             request_timeout=args.request_timeout,
             profile_timeout=args.profile_timeout,
