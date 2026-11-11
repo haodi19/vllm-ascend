@@ -247,7 +247,8 @@ class CppMteProfileTests(unittest.TestCase):
                     self.assertEqual(tpot.count("MIRACLE_UNAVAILABLE"), 1)
                     self.assertIn("MIRACLE_UNAVAILABLE", tpot)
                     self.assertIn("requested_stream=Stream 56", tpot)
-                    self.assertTrue((root / "bubble_summary.txt").is_file())
+                    self.assertFalse((root / "bubble_summary.txt").exists())
+                    self.assertIn("只需返回summary.txt", tpot)
                 if not failed:
                     summary = (root / "summary.txt").read_text(encoding="utf-8")
                     self.assertIn("NO_PROFILE_COMBINED_VS_DEFAULT", summary)
@@ -608,6 +609,7 @@ class CppMteProfileTests(unittest.TestCase):
             )
             path.write_text(json.dumps(rows), encoding="utf-8")
             report = dict(
+                count=170,
                 profile_status="complete",
                 profile_trace_data=[
                     dict(
@@ -638,7 +640,24 @@ class CppMteProfileTests(unittest.TestCase):
             self.assertEqual((selected["name"], selected["tid"]), ("Stream 56", "27"))
             self.assertIn("HOST_CALLBACK_GAP", output)
             self.assertNotIn("BUBBLES_UNAVAILABLE", output)
-            self.assertEqual((root / "bubble_summary.txt").read_text(encoding="utf-8"), output)
+            self.assertFalse((root / "bubble_summary.txt").exists())
+            self.assertTrue((root / "bubble_details.log").is_file())
+            coverage = next(
+                json.loads(line.split(" ", 1)[1])
+                for line in output.splitlines()
+                if line.startswith("CALLBACK_TRACE_COVERAGE ")
+            )
+            self.assertEqual(
+                coverage, dict(expected_report_callbacks=170, observed_trace_callbacks=3, status="mismatch")
+            )
+            self.assertIn("BUBBLES_PARTIAL: trace回调数与分项计数不一致", output)
+            report["count"] = 3
+            with contextlib.redirect_stdout(io.StringIO()):
+                matched = self.compare.loading_bubble_summary(
+                    dict(mte_combined=report), root, ["mte_combined"], "Stream 56"
+                )
+            self.assertIn('"status": "match"', matched)
+            self.assertNotIn("trace回调数与分项计数不一致", matched)
 
     def test_integrated_bubbles_fail_closed_without_affecting_other_groups(self):
         with tempfile.TemporaryDirectory() as directory:

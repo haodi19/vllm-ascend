@@ -90,13 +90,30 @@ def loading_bubble_summary(reports, root, labels, stream_name):
                     except (OSError, ValueError, TypeError) as exc:
                         error = f"{type(exc).__name__}: {exc}"
                 details.write(f"CASE={label}\n{output.getvalue()}\n")
-                lines.extend(line for line in output.getvalue().splitlines() if line.startswith(retained))
+                retained_lines = [line for line in output.getvalue().splitlines() if line.startswith(retained)]
+                lines.extend(retained_lines)
+                for line in retained_lines:
+                    if not line.startswith("SELECTED_OFFLOAD_TRACK "):
+                        continue
+                    observed = json.loads(line.split(" ", 1)[1]).get("callbacks")
+                    expected = report.get("count")
+                    comparable = len(traces) == 1 and type(expected) is int and type(observed) is int
+                    coverage = dict(
+                        expected_report_callbacks=expected,
+                        observed_trace_callbacks=observed,
+                        status=("match" if observed == expected else "mismatch") if comparable else "unverified",
+                    )
+                    lines.append("CALLBACK_TRACE_COVERAGE " + json.dumps(coverage, ensure_ascii=False))
+                    if comparable and observed != expected:
+                        lines.append(
+                            "BUBBLES_PARTIAL: trace回调数与分项计数不一致；Host间隔、callback_window及方向统计"
+                            "仅覆盖已识别子集，不能用于完整请求收益比较；full_capture统计独立保留。"
+                        )
                 if error:
                     lines.append(f"BUBBLES_UNAVAILABLE: {error}; 不按tid或拷贝数量更换轨道。")
                 elif not complete:
                     lines.append("BUBBLES_PARTIAL: 已输出的窗口统计保留；方向或回调关联不完整，见OFFLOAD_STATUS。")
     text = "\n".join(lines) + "\n"
-    (root / "bubble_summary.txt").write_text(text, encoding="utf-8")
     return text
 
 
@@ -596,7 +613,8 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         if args.measure_tpot:
             print("流式TTFT/TPOT已开启；结果与miracle估算统一写入summary.txt。")
         if args.bubble_stream_name:
-            print(f"自动统计加载流空泡：{args.bubble_stream_name}；精简结果：{root / 'bubble_summary.txt'}")
+            print(f"自动统计加载流空泡：{args.bubble_stream_name}；精简结果及覆盖检查统一写入summary.txt。")
+            print("只需返回summary.txt；bubble_details.log保留逐事件核查记录，不另生成bubble_summary.txt。")
             print("原MEMCPY_GAP表是逐拷贝原始统计；目标空泡请看TARGET_GAPS_US及TARGET_DIRECTION_GAPS_US。")
         if args.timing_requests:
             print(
