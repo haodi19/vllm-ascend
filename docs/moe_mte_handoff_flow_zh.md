@@ -1486,8 +1486,9 @@ Host仍以原时间顺序中的相邻回调为准，两端`load_prepare>0`；不
 后续原trace复算已取得严格设备结果：token128早期回调可完整映射，
 当前回调及两组MTE仅约17%～24%的合格Host对可映射，主要排除原因为设备任务跨回调边界。
 这些方向均值属于各自可关联子集，不是四组公共配对集合，不能直接证明组合版的稳定收益。
-token5、token128的端到端、TTFT/TPOT、加载分项、Host及设备空泡完整数据，
+token5、token128的端到端、TPOT、Host及设备空泡对比，
 统一记录在[本轮PR四组实验记录](moe_decode_pr_20261112_zh.md)。
+该记录的设备空泡采用排除与任意空载回调重叠的整段空泡，并保留原始值；不采用覆盖不足的严格方向子集作为主要对比。
 
 ```bash
 python -u -B script/diagnose_moe_empty_load_gaps.py /data/w00919836/moeoffload/bench_results/night_four_way_20261112_215723_23693 --stream-name "Stream 56"
