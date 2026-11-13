@@ -1460,6 +1460,17 @@ Stream 56空闲2571.250μs，包含第15～17层预取和按需、第18层预取
 token128有加载回调对剩余的预取→按需差异应单独沿设备就绪、worker接收、GIL和回调入口分析，
 不能继续用连续空载统一解释，也不应删除真实空载样本来制造整体收益。
 
+针对排除连续空载片段后的对照，诊断脚本增加`BUBBLE_COHORTS_US`，
+同时保留`full_capture`和`callback_window`两种范围及原始10～5000μs阈值。
+`original`为原几何空泡；`exclude_multi_empty`仅去除内部含至少两个完整空载回调、
+且内部完整回调全部空载的整段空泡，分别列出保留及排除的数量、均值、分位数和总时长。
+`exclude_touching_any_empty`是另外的敏感性对照，排除与任意已核验空载回调有时间重叠的空泡，
+包括只有一个空载回调的情况。它不是前一口径的替代，也不证明剩余样本全为同步开销。
+两种排除都不截短空泡、不跨过回调拼接新间隔、不再加IQR筛选；分项完整性失败时不输出排除结果。
+Host对应保留已有的`OUTSIDE_MULTI_CALLBACK_GAP`以及`with_prepare->with_prepare`两种子集。
+前者仅去除多回调空泡内部的相邻关系，后者排除任一端空载的回调对，二者不能混称同一种筛选。
+这些是条件化对照，原始整体统计和端到端结果仍需保留；用于区分负载差异，不将正常命中路径认定为坏样本。
+
 ```bash
 python -u -B script/diagnose_moe_empty_load_gaps.py /data/w00919836/moeoffload/bench_results/night_four_way_20261112_215723_23693 --stream-name "Stream 56"
 ```

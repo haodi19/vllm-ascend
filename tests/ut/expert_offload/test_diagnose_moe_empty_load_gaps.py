@@ -11,7 +11,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "script"))
 
-from diagnose_moe_empty_load_gaps import Coverage, analyze, compare_pairs, discover, main, render
+from diagnose_moe_empty_load_gaps import (
+    Coverage,
+    analyze,
+    compare_pairs,
+    discover,
+    excluded_bubble_stats,
+    find_episodes,
+    main,
+    render,
+)
 
 
 def interval(name, start, end, pid="host", tid="worker"):
@@ -66,6 +75,45 @@ def fixture():
 
 
 class EmptyLoadGapTests(unittest.TestCase):
+    def test_bubble_exclusion_preserves_other_gaps_and_accounting(self):
+        tasks = [
+            dict(start=a, end=b, event_index=i)
+            for i, (a, b) in enumerate([(0, 10), (110, 120), (2120, 2130), (2140, 2150), (8150, 8160)])
+        ]
+        callbacks = [
+            dict(start=a, end=b, load_class=c, visit=1)
+            for a, b, c in [
+                (-10, 0, "with_prepare"),
+                (150, 170, "zero_prepare"),
+                (250, 270, "zero_prepare"),
+                (8200, 8210, "with_prepare"),
+            ]
+        ]
+        rows = excluded_bubble_stats(tasks, callbacks, find_episodes(tasks, callbacks))
+        for row in rows:
+            self.assertEqual(row["original"]["n"], 3)  # 6000us is outside the original band.
+            self.assertEqual(row["exclude_multi_empty"]["n"], 2)
+            self.assertEqual(row["exclude_multi_empty"]["mean"], 55)
+            self.assertEqual(row["removed_multi_empty"]["total"], 2000)
+            self.assertEqual(
+                row["original"]["total"], row["exclude_multi_empty"]["total"] + row["removed_multi_empty"]["total"]
+            )
+
+    def test_single_empty_is_a_separate_cohort_and_crossing_gap_is_not_clipped(self):
+        tasks = [dict(start=0, end=10, event_index=1), dict(start=1010, end=1020, event_index=2)]
+        callbacks = [dict(start=100, end=200, load_class="zero_prepare", visit=1)]
+        full, window = excluded_bubble_stats(tasks, callbacks, find_episodes(tasks, callbacks))
+        self.assertEqual(full["exclude_multi_empty"]["n"], 1)
+        self.assertIsNone(full["exclude_touching_any_empty"])
+        self.assertEqual(full["removed_touching_any_empty"]["total"], 1000)
+        self.assertIsNone(window["original"])
+
+    def test_failed_marker_integrity_disables_bubble_exclusion(self):
+        trace, report = fixture()
+        report["mstx_errors"] = 1
+        result = self.run_analysis(trace, report)
+        self.assertIsNone(result["bubble_cohorts"])
+
     def run_analysis(self, events, report):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "trace_view.json"

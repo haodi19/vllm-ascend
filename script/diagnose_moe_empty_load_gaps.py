@@ -10,7 +10,7 @@ from pathlib import Path
 
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
 from inspect_moe_profile import _interval, _task_kind, copy_gap_boundaries
-from moe_outlier_stats import outlier_summary
+from moe_outlier_stats import outlier_summary, stats
 from offload_bubble_stats import pair_direction
 from verify_memcpy_gaps import CASES, read_offload_header, select_host_callbacks, select_track
 
@@ -228,6 +228,43 @@ def host_pairs(callbacks, coverage, episodes):
     return pairs
 
 
+def excluded_bubble_stats(tasks, callbacks, episodes):
+    """Remove entire real gaps, never concatenate across callbacks or trim endpoints.
+
+    The first exclusion matches the reported multi-empty-callback phenomenon.
+    The second is a separate sensitivity cohort touching any confirmed empty
+    callback, not a claim that the remaining gaps measure pure synchronization.
+    """
+    ordered = sorted((task["start"], task["end"]) for task in tasks)
+    boundaries, _ = copy_gap_boundaries(ordered)
+    multi_empty = {(e["start"], e["end"]) for e in episodes if set(e["classes"]) == {"zero_prepare"}}
+    empty = Coverage((cb["start"], cb["end"]) for cb in callbacks if cb["load_class"] == "zero_prepare")
+    window = min(cb["start"] for cb in callbacks), max(cb["end"] for cb in callbacks)
+    rows = []
+    for scope in ("full_capture", "callback_window"):
+        original, no_multi, no_empty, removed_multi, removed_empty = [], [], [], [], []
+        for left, right, duration in boundaries:
+            start, end = ordered[left][1], ordered[right][0]
+            if not MIN_GAP_US <= duration < LONG_GAP_US:
+                continue
+            if scope == "callback_window" and not window[0] <= start <= end <= window[1]:
+                continue
+            original.append(duration)
+            (removed_multi if (start, end) in multi_empty else no_multi).append(duration)
+            (removed_empty if empty.overlap(start, end) > 0 else no_empty).append(duration)
+        rows.append(
+            dict(
+                scope=scope,
+                original=stats(original),
+                exclude_multi_empty=stats(no_multi),
+                removed_multi_empty=stats(removed_multi),
+                exclude_touching_any_empty=stats(no_empty),
+                removed_touching_any_empty=stats(removed_empty),
+            )
+        )
+    return rows
+
+
 def analyze(path, stream_name, report=None, progress=print):
     before = path.stat()
     progress(f"READ 1/2: {path}")
@@ -255,6 +292,7 @@ def analyze(path, stream_name, report=None, progress=print):
         pairs=pairs,
         episodes=episodes,
         compute=compute,
+        bubble_cohorts=None if integrity else excluded_bubble_stats(tasks, callbacks, episodes),
     )
 
 
@@ -296,6 +334,23 @@ def render(result):
         for inside in (True, False):
             part = [p["gap_us"] for p in selected if p["in_multi_callback_gap"] == inside]
             yield f"{direction} {'INSIDE' if inside else 'OUTSIDE'}_MULTI_CALLBACK_GAP | {stats_text(part)}"
+    yield "BUBBLE_COHORTS_US 10<=gap<5000，整段排除、不拼接、不另作IQR；full_capture含Prefill"
+    if result["bubble_cohorts"] is None:
+        yield "BUBBLE_COHORTS unavailable: 分项完整性未通过，不依据缺失标记排除空泡"
+    else:
+        for row in result["bubble_cohorts"]:
+            for name in (
+                "original",
+                "exclude_multi_empty",
+                "removed_multi_empty",
+                "exclude_touching_any_empty",
+                "removed_touching_any_empty",
+            ):
+                summary = row[name]
+                values = (
+                    {k: round(v, 3) if isinstance(v, float) else v for k, v in summary.items()} if summary else None
+                )
+                yield f"BUBBLE {row['scope']} {name}: {json.dumps(values)}"
     regular = [e for e in episodes if e["in_bubble_band"]]
     same_visit = [e for e in regular if e["same_layer_visit"]]
     yield (
