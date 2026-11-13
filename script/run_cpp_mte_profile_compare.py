@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
+from moe_experiment_tables import VALID_INTERVAL_STATUSES, write_tables
 from moe_outlier_stats import group_outliers, outlier_summary
 from moe_tpot import print_tpot_comparison
 from mte_join_cost import LOAD_STATS
@@ -69,7 +70,7 @@ def loading_bubble_summary(reports, root, labels, stream_name):
             for trace in traces:
                 lines.append(f"TRACE={trace['file']}")
                 if (
-                    report.get("profile_status") not in ("complete", "complete_with_warnings")
+                    report.get("profile_status") not in VALID_INTERVAL_STATUSES
                     or not trace.get("usable")
                     or not trace.get("json_complete")
                 ):
@@ -185,7 +186,7 @@ def print_profile(backend, report, root):
             print(f"  {field} count={len(items)}: {str(items[0])[:300]}")
     traces = report.get("profile_trace_data", [])
     usable = [trace for trace in traces if trace.get("json_complete") is True and trace.get("usable") is True]
-    if report.get("profile_status") not in ("complete", "complete_with_warnings") or not usable:
+    if report.get("profile_status") not in VALID_INTERVAL_STATUSES or not usable:
         print(f"GAPS {backend}: 无可验证的完整时间线；保留已取得的请求与 CPU 分项计时。")
         for check in report.get("profile_checks", [])[:2]:
             print(f"  TRACE_CHECK usable={check.get('usable')}; issues={check.get('issues', [])}")
@@ -610,6 +611,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             print("两组均为MTE晚等待＋cpp LRC；只改变加载流：sync_launch → ordinary。")
             print("普通流若请求超时则终止本轮，不跳过设备完成检查，不继续推理。")
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
+        print(f"表格文档：{root / 'experiment_tables.md'}；同样附在summary.txt末尾。", flush=True)
         if args.measure_tpot:
             print("流式TTFT/TPOT已开启；结果与miracle估算统一写入summary.txt。")
         if args.bubble_stream_name:
@@ -630,6 +632,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             f"详细日志：{root / 'run_details.log'}；停止采集最多等 {args.profile_timeout:g}s，导出失败继续后续组。",
             flush=True,
         )
+        reports, bubbles = {}, ""
         try:
             with (root / "run_details.log").open("w", encoding="utf-8") as details:
                 progress = CostProgressFile(sys.stdout.console, details)
@@ -665,6 +668,23 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
                 print(bubbles)
             if args.measure_tpot:
                 print_tpot_comparison(reports, root, labels)
+            print(
+                write_tables(
+                    root,
+                    reports,
+                    labels,
+                    bubbles=bubbles,
+                    settings={
+                        "物理NPU": args.npu,
+                        "max_tokens": args.max_tokens,
+                        "ignore_eos": args.ignore_eos,
+                        "预热请求": args.warmup_requests,
+                        "无采集计时请求": args.timing_requests,
+                        "采集请求": args.requests,
+                        "加载流名称": args.bubble_stream_name,
+                    },
+                )
+            )
             return 0
         except Exception as exc:
             print(
@@ -674,6 +694,13 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             print_partial_reports(root, labels)
             if stream_compare or worker_compare or handoff_compare:
                 print_failure_logs(root, labels)
+            partial = reports if isinstance(reports, dict) else {}
+            for label in labels:
+                path = root / label / "profile_report.json"
+                if label not in partial and path.is_file():
+                    with contextlib.suppress(OSError, ValueError):
+                        partial[label] = json.loads(path.read_text(encoding="utf-8"))
+            print(write_tables(root, partial, labels, bubbles=bubbles, failure=f"{type(exc).__name__}: {exc}"))
             return 1
 
 

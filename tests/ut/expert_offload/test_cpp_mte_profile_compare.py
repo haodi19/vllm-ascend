@@ -64,6 +64,54 @@ class CppMteProfileTests(unittest.TestCase):
             ],
         )
 
+    def test_timeout_trace_recovery_checks_coverage_and_accepts_string_timestamps(self):
+        events = [
+            dict(name="process_name", ph="M", pid=100, args={"name": "Ascend Hardware"}),
+            dict(name="thread_name", ph="M", pid=100, tid=56, args={"name": "Stream 56"}),
+            dict(name="MEMCPY_ASYNC", ph="X", pid=100, tid=56, ts="15.25", dur=2),
+            dict(name="Transpose", ph="X", pid=100, tid=56, ts="18.25", dur=2),
+        ]
+        for call, kind, start in ((1, "prefetch", 10), (2, "reactive", 50)):
+            for name, offset, duration in (("host_callback", 0, 20), ("update_weights", 1, 18)):
+                events.append(
+                    dict(
+                        name=f"moe_offload/{name}|call={call}|kind={kind}",
+                        ph="X",
+                        pid=7,
+                        tid=9,
+                        ts=str(start + offset),
+                        dur=duration,
+                    )
+                )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = root / "ASCEND_PROFILER_OUTPUT/trace_view.json"
+            trace.parent.mkdir()
+            trace.write_text(json.dumps(events), encoding="utf-8")
+            report = self.runner.assess_profile_report(self.report("incomplete"), "", root, retain_trace_data=True)
+            self.assertEqual(report["profile_export_status"], "incomplete")
+            self.assertEqual(report["profile_status"], "recovered_intervals")
+            self.assertEqual(report["profile_trace_data"][0]["host_gaps"][0]["mean_us"], 20)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(self.compare.print_profile("callback", report, root))
+                bubbles = self.compare.loading_bubble_summary({"callback": report}, root, ["callback"], "Stream 56")
+            self.assertIn("TARGET_GAPS_US", bubbles)
+            self.assertNotIn("BUBBLES_UNAVAILABLE", bubbles)
+            wrong = self.report("incomplete")
+            wrong["count"] = 3
+            self.runner.assess_profile_report(wrong, "", root, retain_trace_data=True)
+            self.assertEqual(wrong["profile_status"], "incomplete")
+            self.assertFalse(wrong["profile_trace_data"][0]["usable"])
+            missing_mte = self.runner.assess_profile_report(
+                self.report("incomplete"), "", root, require_mte=True, retain_trace_data=True
+            )
+            self.assertEqual(missing_mte["profile_status"], "incomplete")
+            self.assertFalse(missing_mte["profile_trace_data"][0]["usable"])
+            trace.write_text(json.dumps(events)[:-1], encoding="utf-8")
+            broken = self.runner.assess_profile_report(self.report("incomplete"), "", root, retain_trace_data=True)
+            self.assertEqual(broken["profile_status"], "invalid")
+            self.assertEqual(broken["profile_trace_data"], [])
+
     def test_profile_defaults_and_legacy_python_defaults(self):
         args, legacy = self.args(), self.args(profile=False)
         self.assertEqual((args.cache_policy_backend, args.requests, args.warmup_requests), ("cpp", 1, 3))

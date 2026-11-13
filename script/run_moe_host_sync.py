@@ -282,6 +282,7 @@ def assess_profile_report(
 ):
     """Request success and an exported filename do not validate profiler output."""
     errors, warnings, checks, trace_data = [], [], [], []
+    export_status = report.setdefault("profile_export_status", report.get("profile_status"))
     for line in service_log.splitlines():
         if "profiler.py" in line and "run failed" in line:
             errors.append(line.strip()[:500])
@@ -290,15 +291,35 @@ def assess_profile_report(
             # thread. It does not itself establish an invalid Ascend timeline.
             # Retain the diagnostic, then inspect the exported trace separately.
             warnings.append(line.strip()[:500])
-    if profile_dir is not None and report.get("profile_status") == "complete":
+    if profile_dir is not None and export_status in ("complete", "incomplete"):
         traces = sorted(profile_dir.rglob("ASCEND_PROFILER_OUTPUT/trace_view.json"))
-        if not traces:
+        if not traces and export_status == "complete":
             errors.append("No exported trace_view.json despite completed export")
         for path in traces:
             try:
+                before = path.stat()
                 options = {} if large_gap_us is None else {"large_gap_us": large_gap_us}
                 with progress(f"stream profile intervals: {path}") if retain_trace_data else contextlib.nullcontext():
                     check = scan_trace(path, require_mte=require_mte, **options)
+                after = path.stat()
+                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+                    raise ValueError("trace changed during validation")
+                # An unfinished stop/export lifecycle can still leave a complete
+                # timeline. Recover only with full callback accounting, never
+                # merely because a JSON filename exists.
+                if export_status == "incomplete":
+                    expected = report.get("count")
+                    nesting = check.get("nesting", {})
+                    if not (
+                        len(traces) == 1
+                        and type(expected) is int
+                        and expected > 0
+                        and check.get("host_callbacks") == expected
+                        and check.get("updates") == expected
+                        and nesting.get("matched") == expected
+                    ):
+                        check["issues"].append("Incomplete export: callback coverage not verified against report")
+                        check["usable"] = False
                 if retain_trace_data:
                     trace_data.append(dict(file=str(path), **check))
                 checks.append(
@@ -313,6 +334,9 @@ def assess_profile_report(
                 errors.append(f"{path.name}: {exc}")
     if errors:
         report["profile_status"] = "invalid"
+    elif export_status == "incomplete" and checks and all(check["usable"] for check in checks):
+        report["profile_status"] = "recovered_intervals"
+        warnings.append("Stop/export lifecycle incomplete; saved trace intervals independently validated")
     elif report.get("profile_status") == "complete":
         if (checks and not all(check["usable"] for check in checks)) or report.get("mstx_trace_occurrences") == 0:
             report["profile_status"] = "unverified"

@@ -358,11 +358,14 @@ def wait_profile(directory, timeout):
 def finish_profile(opener, args, profile_dir):
     """Bound stop/export waiting independently of already collected timings."""
     deadline = time.monotonic() + args.profile_timeout
+    stage = "stop_profile request"
     try:
         request(opener, args.port, "/stop_profile", {}, timeout=args.profile_timeout)
+        stage = "export completion marker"
         wait_profile(profile_dir, max(0, deadline - time.monotonic()))
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"PROFILE INCOMPLETE: {type(exc).__name__}: {exc}", flush=True)
+        print(f"PROFILE INCOMPLETE STAGE: {stage}; saved traces require independent validation", flush=True)
         print(f"Existing profile files retained: {profile_dir}", flush=True)
         if getattr(args, "strict_profile", False):
             raise
