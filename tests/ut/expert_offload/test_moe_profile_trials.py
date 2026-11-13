@@ -167,6 +167,40 @@ class ProfileTrialTests(unittest.TestCase):
         ):
             self.module.main(["--output-dir", "unused", "--npu", "1", "--requests", "4"])
 
+    def test_token_sweep_separates_eos_and_outputs_and_stops_on_failure(self):
+        for fail in (False, True):
+            calls = []
+
+            def fake_main(argv, *, calls=calls, fail=fail):
+                calls.append(argv)
+                path = Path(argv[argv.index("--output-dir") + 1])
+                path.mkdir()
+                (path / "summary.txt").write_text(path.name + " results", encoding="utf-8")
+                return int(fail)
+
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                with (
+                    patch.object(self.module, "main", side_effect=fake_main),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    code = self.module.run_token_lengths(root, 4, ["--npu", "1"])
+                self.assertEqual(code, int(fail))
+                self.assertEqual(len(calls), 1 if fail else 2)
+                self.assertNotIn("--ignore-eos", calls[0])
+                self.assertEqual(calls[0][calls[0].index("--max-tokens") + 1], "5")
+                text = (root / "summary.txt").read_text(encoding="utf-8")
+                self.assertIn("tokens5 results", text)
+                if not fail:
+                    self.assertIn("--ignore-eos", calls[1])
+                    self.assertEqual(calls[1][calls[1].index("--max-tokens") + 1], "128")
+                    self.assertIn("tokens128 results", text)
+
+    def test_sweep_rejects_conflicting_length_flags(self):
+        for flags in (["--max-tokens=128"], ["--max-tokens", "5"], ["--ignore-eos"]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                self.module.main(["--both-token-lengths", "--npu", "1", *flags])
+
     def test_cross_trial_output_change_excluded_and_missing_gap_coverage_visible(self):
         first, second = self.entry(), self.entry(trial=2, value=300)
         for report in second["reports"].values():

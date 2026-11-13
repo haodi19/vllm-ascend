@@ -302,11 +302,64 @@ def save_summary(root, entries, expected, settings):
     (root / "experiment_tables.md").write_text(text, encoding="utf-8")
 
 
+def run_token_lengths(root, trials, remaining):
+    """Keep token-length experiments separate, with one combined copyable report."""
+    completed = []
+    for tokens in (5, 128):
+        directory = root / f"tokens{tokens}"
+        code = 1
+        try:
+            code = main(
+                [
+                    *remaining,
+                    "--trials",
+                    str(trials),
+                    "--output-dir",
+                    str(directory),
+                    "--max-tokens",
+                    str(tokens),
+                    *(["--ignore-eos"] if tokens == 128 else []),
+                ]
+            )
+        finally:
+            completed.append((tokens, code))
+            sections = [
+                "# 5-token与128-token重复实验",
+                "",
+                "两种长度串行执行，各自四组配置；不跨token长度合并统计。",
+                "",
+            ]
+            for length, exit_code in completed:
+                path = root / f"tokens{length}" / "summary.txt"
+                sections += [
+                    f"## max_tokens={length}; exit={exit_code}",
+                    "",
+                    path.read_text(encoding="utf-8") if path.is_file() else "未生成结果。",
+                    "",
+                ]
+            text = "\n".join(sections)
+            (root / "summary.txt").write_text(text, encoding="utf-8")
+            (root / "experiment_tables.md").write_text(text, encoding="utf-8")
+            print(f"TOKEN_SWEEP tokens={tokens} exit={code}; SUMMARY={root / 'summary.txt'}", flush=True)
+        if code:
+            return code
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, add_help=False)
     parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS, choices=range(2, 9))
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--both-token-lengths",
+        action="store_true",
+        help="Run 5 tokens then 128 tokens (ignore_eos only for 128), each with its own trials",
+    )
     own, remaining = parser.parse_known_args(sys.argv[1:] if argv is None else argv)
+    if own.both_token_lengths and any(
+        arg == "--ignore-eos" or arg.split("=", 1)[0] == "--max-tokens" for arg in remaining
+    ):
+        parser.error("--both-token-lengths assigns --max-tokens and --ignore-eos automatically")
     if "--help" in remaining or "-h" in remaining:
         parser.print_help()
     common = [
@@ -327,6 +380,8 @@ def main(argv=None):
         parser.error("requires --requests 1, profiles and bubble stream; rotations are assigned automatically")
     root = own.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
+    if own.both_token_lengths:
+        return run_token_lengths(root, own.trials, remaining)
     settings = dict(
         npu=args.npu,
         max_tokens=args.max_tokens,

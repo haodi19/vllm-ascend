@@ -154,6 +154,10 @@ python -u -B script/run_moe_profile_trials.py \
 ```
 
 输出目录必须是新目录。5-token对照使用另一个目录，将`--max-tokens`改成5并删除`--ignore-eos`。
+如需一次跑完两种长度，将命令中的`--max-tokens 128 --ignore-eos`替换为`--both-token-lengths`。
+两套长度分别执行四轮，共32次服务启动，串行运行；5-token不忽略EOS，128-token启用ignore_eos。
+各套结果位于tokens5、tokens128，每套结束后合并到最外层summary.txt及experiment_tables.md，
+不跨长度合并均值。中途失败保留已完成部分并停止后续实验。
 只需查看最外层summary.txt；experiment_tables.md内容相同，便于浏览。每轮结束刷新一次汇总，
 逐轮原始报告和profile保留在trial_01等目录。运行失败停止后续轮次并保存已有结果，不自动重试删除差样本。
 
@@ -165,3 +169,14 @@ callback_window两个范围的均值、累计空泡、样本数和阈值排除�
 不把几千条回调当成几千次独立实验，也不因某轮较慢而删除该轮。
 同时保留端到端、TTFT与TPOT；均值和累计空泡分别比较，避免样本数变化掩盖累计时延。
 固定循环顺序不是随机化试验，四轮同向也不自动证明统计显著性或排除服务器状态影响。
+
+Host间隔来自profiler导出的MSTX完整X事件：moe_offload/host_callback标签标识进程、call、kind、layer等。
+按同一进程的开始时间排序，只比较紧邻的回调，间隔为后一条开始减前一条结束；
+只保留prefetch→reactive、reactive→prefetch两个类型顺序，重叠负间隔排除并计数，零间隔保留。
+当前主表没有按层号或解码轮边界筛选，不能一律将reactive→prefetch解释成下一层；
+第一条之前、最后一条之后及没有回调标记的Prefill区段不单独计入，但相邻回调间的全部时间会计入。
+raw不设置10μs下限或5ms上限；filtered对每份profile、每个方向独立应用
+[Q1−3×IQR, Q3+3×IQR]闭区间，样本少于8或IQR=0时不剔除。
+原始报告的large_gaps（默认≥100μs）是附加子集，不是Host主表的筛选条件。
+Host标记包围Python回调函数体，不直接测量纯GIL等待、轮询或系统调用开销，
+回调间隔也不等于NPU空闲；分项耗时与Host间隔不可混用。
