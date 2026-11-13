@@ -1482,7 +1482,12 @@ Host仍以原时间顺序中的相邻回调为准，两端`load_prepare>0`；不
 摘要末尾并列原始Host、两端均加载Host、原几何空泡及严格方向空泡的表格。
 严格设备方向结果属于可关联子集，不等于按空载时间范围排除的几何空泡，也不包含Prefill独立加载。
 已有Host结果表明token128组合版预取→按需的6.934μs均值上升仍存在，
-因此排除空载后不能声称组合优化在所有方向稳定获益；严格设备结果待原trace离线复算，不用前一口径代填。
+因此排除空载后不能声称组合优化在所有方向稳定获益。
+后续原trace复算已取得严格设备结果：token128早期回调可完整映射，
+当前回调及两组MTE仅约17%～24%的合格Host对可映射，主要排除原因为设备任务跨回调边界。
+这些方向均值属于各自可关联子集，不是四组公共配对集合，不能直接证明组合版的稳定收益。
+token5、token128的端到端、TTFT/TPOT、加载分项、Host及设备空泡完整数据，
+统一记录在[本轮PR四组实验记录](moe_decode_pr_20261112_zh.md)。
 
 ```bash
 python -u -B script/diagnose_moe_empty_load_gaps.py /data/w00919836/moeoffload/bench_results/night_four_way_20261112_215723_23693 --stream-name "Stream 56"
