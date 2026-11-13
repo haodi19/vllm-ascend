@@ -51,9 +51,11 @@ HANDOFF_PROFILE_CASES = (
 )
 
 
-def handoff_profile_cases(include_legacy=False):
+def handoff_profile_cases(include_legacy=False, rotation=0):
     legacy = (("callback_legacy", "callback", "all", "locked", "yield"),) if include_legacy else ()
-    return legacy + HANDOFF_PROFILE_CASES
+    cases = legacy + HANDOFF_PROFILE_CASES
+    offset = rotation % len(cases)
+    return cases[offset:] + cases[:offset]
 
 
 def worker_profile_cases(atomic_trials=0, combination_trials=0):
@@ -471,6 +473,13 @@ def parse_args(
     parser = argparse.ArgumentParser(description=__doc__)
     if handoff_compare:
         parser.add_argument(
+            "--case-rotation",
+            type=int,
+            choices=range(4),
+            default=0,
+            help="Rotate service order; report columns retain their original order",
+        )
+        parser.add_argument(
             "--include-legacy-callback",
             action="store_true",
             help="Prepend callback with Python LRC and moe_offload_debug enabled on current code",
@@ -861,7 +870,9 @@ def run(args, root):
     if worker_compare:
         cases = tuple((label, "mte", "ordinary") for label in worker_policies)
     if handoff_compare:
-        handoff_cases = handoff_profile_cases(getattr(args, "include_legacy_callback", False))
+        handoff_cases = handoff_profile_cases(
+            getattr(args, "include_legacy_callback", False), getattr(args, "case_rotation", 0)
+        )
         cases = tuple((label, backend, "ordinary") for label, backend, *_ in handoff_cases)
         worker_policies = {label: (scan, probe, idle) for label, _, scan, probe, idle in handoff_cases}
     for label, backend, load_stream_mode in cases:

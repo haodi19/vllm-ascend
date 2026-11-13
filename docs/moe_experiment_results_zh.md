@@ -134,3 +134,34 @@ Host方向统计本身完整；设备整体空泡不依赖逐回调窗口关联�
 通过后标记recovered_intervals，并保留profile_export_status=incomplete，不伪称整个profiler流程成功。
 没有文件、截断JSON、回调数量不匹配或MTE算子缺失不会被恢复为有效结果。
 临时检查脚本曾拒绝字符串时间戳，是另一个已经修正的错误；主分析器原本支持该格式。
+
+## 四组重复采集方法
+
+`script/run_moe_profile_trials.py`复用原四组实验入口，默认四轮、每配置四份独立profile，共启动16个服务。
+每轮将执行顺序循环移位，四种配置各占一次第一、第二、第三、第四位置。
+各服务先预热5次，再测20次无采集请求，最后单独采集一次请求；每轮按原流程构建和检查。
+重新启动服务避免上一轮profiler停止异常影响下一份采集；停止采集超时默认增加至600秒，
+仍保留已有时间线的独立验证，不把超时恢复标记为正常导出完成。
+
+在容器中已加载项目env.sh、进入项目目录后执行：
+
+```bash
+python -u -B script/run_moe_profile_trials.py \
+  --npu 1 --trials 4 --max-tokens 128 --ignore-eos \
+  --warmup-requests 5 --timing-requests 20 --requests 1 \
+  --request-timeout 600 --bubble-stream-name 'Stream 56' \
+  --output-dir /data/w00919836/moeoffload/bench_results/profile_trials_128_01
+```
+
+输出目录必须是新目录。5-token对照使用另一个目录，将`--max-tokens`改成5并删除`--ignore-eos`。
+只需查看最外层summary.txt；experiment_tables.md内容相同，便于浏览。每轮结束刷新一次汇总，
+逐轮原始报告和profile保留在trial_01等目录。运行失败停止后续轮次并保存已有结果，不自动重试删除差样本。
+
+汇总分别列出Host两个方向的raw/filtered均值、P50、P95与剔除数，以及加载流full_capture、
+callback_window两个范围的均值、累计空泡、样本数和阈值排除数。
+设备任务占用包含MEMCPY和Transpose，仅保留10≤gap<5000μs，不对设备空泡再次IQR。
+设备方向关联子集单列，标记partial，不能代替完整方向收益。
+跨轮以每份profile均值等权汇总，显示逐次值、最小/最大、样本标准差；同轮配对显示逐轮变化及降低次数。
+不把几千条回调当成几千次独立实验，也不因某轮较慢而删除该轮。
+同时保留端到端、TTFT与TPOT；均值和累计空泡分别比较，避免样本数变化掩盖累计时延。
+固定循环顺序不是随机化试验，四轮同向也不自动证明统计显著性或排除服务器状态影响。

@@ -123,7 +123,7 @@ class CppMteProfileTests(unittest.TestCase):
         self.assertFalse(legacy.diagnose_prefetch_wait_at_join)
 
     def test_handoff_three_groups_runtime_configuration_and_failure_guards(self):
-        for failure in (None, "policy", "window", "timeout", "legacy", "long"):
+        for failure in (None, "policy", "window", "timeout", "legacy", "long", "rotated"):
             with tempfile.TemporaryDirectory() as directory, patch.object(sys, "platform", "linux"):
                 root, calls, settings = Path(directory), [], []
                 args = self.runner.parse_args(
@@ -133,7 +133,8 @@ class CppMteProfileTests(unittest.TestCase):
                         "--cache-policy-backend",
                         "cpp",
                         "--measure-tpot",
-                        *(["--include-legacy-callback"] if failure in ("legacy", "long") else []),
+                        *(["--include-legacy-callback"] if failure in ("legacy", "long", "rotated") else []),
+                        *(["--case-rotation", "1"] if failure == "rotated" else []),
                         *(["--max-tokens", "128", "--ignore-eos"] if failure == "long" else []),
                     ],
                     profile_compare=True,
@@ -162,7 +163,7 @@ class CppMteProfileTests(unittest.TestCase):
                     settings.append(config)
                     expected = next(
                         case
-                        for case in self.runner.handoff_profile_cases(failure in ("legacy", "long"))
+                        for case in self.runner.handoff_profile_cases(failure in ("legacy", "long", "rotated"))
                         if case[0] == label
                     )
                     _, backend, scan, probe, idle = expected
@@ -199,7 +200,7 @@ class CppMteProfileTests(unittest.TestCase):
                     patch.object(self.runner, "inference", side_effect=fake_inference),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    if failure and failure not in ("legacy", "long"):
+                    if failure and failure not in ("legacy", "long", "rotated"):
                         with self.assertRaises((RuntimeError, TimeoutError)):
                             self.runner.run(args, root)
                         self.assertEqual(
@@ -212,11 +213,16 @@ class CppMteProfileTests(unittest.TestCase):
                         reports = self.runner.run(args, root)
                         self.assertEqual(
                             list(reports),
-                            (["callback_legacy"] if failure in ("legacy", "long") else [])
-                            + ["callback", "mte_default", "mte_combined"],
+                            [
+                                case[0]
+                                for case in self.runner.handoff_profile_cases(
+                                    failure in ("legacy", "long", "rotated"), int(failure == "rotated")
+                                )
+                            ],
                         )
                         self.assertIsNone(reports["callback"]["worker_policy"])
-                        self.assertEqual(sum(settings[-2][key] != settings[-1][key] for key in settings[-2]), 2)
+                        if failure != "rotated":
+                            self.assertEqual(sum(settings[-2][key] != settings[-1][key] for key in settings[-2]), 2)
                         if failure == "legacy":
                             changed = {key for key in settings[0] if settings[0][key] != settings[1][key]}
                             self.assertEqual(changed, {"cache_policy_backend", "moe_offload_debug"})

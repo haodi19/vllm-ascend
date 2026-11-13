@@ -586,7 +586,10 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         contextlib.redirect_stdout(SummaryTee(sys.stdout, summary)),
     ):
         if handoff_compare:
-            print("顺序运行：" + " → ".join(labels) + "；全部普通加载流。")
+            execution_labels = [
+                case[0] for case in handoff_profile_cases(args.include_legacy_callback, args.case_rotation)
+            ]
+            print("顺序运行：" + " → ".join(execution_labels) + "；全部普通加载流。")
             if args.include_legacy_callback:
                 print("callback_legacy=Python LRC＋moe_offload_debug=true；其余三组=C++ LRC＋debug=false。")
                 print("这是当前代码上的早期配置对照，包含LRC与debug两项差异，不作单因素归因。")
