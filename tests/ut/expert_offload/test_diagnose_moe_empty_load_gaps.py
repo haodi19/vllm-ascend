@@ -75,6 +75,43 @@ def fixture():
 
 
 class EmptyLoadGapTests(unittest.TestCase):
+    def loaded_fixture(self):
+        trace, report = fixture()
+        trace = [e for e in trace if "call=1|" not in e["name"] and "call=3|" not in e["name"]]
+        trace += callback(1, 100, "prefetch", 1, loads=1) + callback(3, 500, "reactive", 1, loads=1)
+        for start in (118, 518):
+            trace += [
+                interval("MEMCPY_ASYNC", start, start + 1, "device", "987"),
+                interval("Transpose", start + 1, start + 2, "device", "987"),
+            ]
+        report["groups"][0]["loads"]["mean"] = 0.5
+        report["groups"][1]["loads"]["mean"] = 1
+        return trace, report
+
+    def test_strict_device_gap_uses_loaded_neighbors_and_transpose_end(self):
+        trace, report = self.loaded_fixture()
+        result = self.run_analysis(trace, report)
+        row = result["strict_bubbles"]["rows"][0]
+        self.assertEqual(row["eligible_host_pairs"], 1)
+        self.assertEqual(row["device_gap_us"]["mean"], 398)
+        self.assertEqual(row["host_gap_same_pairs_us"]["mean"], 360)
+        self.assertIsNone(result["strict_bubbles"]["rows"][1]["device_gap_us"])
+
+    def test_strict_device_gap_rejects_unmatched_work_between_batches(self):
+        trace, report = self.loaded_fixture()
+        trace.append(interval("Transpose", 300, 310, "device", "987"))
+        result = self.run_analysis(trace, report)
+        row = result["strict_bubbles"]["rows"][0]
+        self.assertEqual(row["excluded_unmapped"], 1)
+        self.assertIsNone(row["device_gap_us"])
+
+    def test_strict_device_gap_rejects_cross_boundary_tasks(self):
+        trace, report = self.loaded_fixture()
+        trace.append(interval("MEMCPY_ASYNC", 530, 545, "device", "987"))
+        result = self.run_analysis(trace, report)
+        self.assertTrue(result["strict_bubbles"]["association_partial"])
+        self.assertIsNone(result["strict_bubbles"]["rows"][0]["device_gap_us"])
+
     def test_bubble_exclusion_preserves_other_gaps_and_accounting(self):
         tasks = [
             dict(start=a, end=b, event_index=i)
@@ -247,6 +284,8 @@ class EmptyLoadGapTests(unittest.TestCase):
             self.assertEqual(output.count("MARKER_INTEGRITY PASS"), 4)
             self.assertEqual(output.count("MATCHED_COMPARE excluded_pairs=0"), 3)
             self.assertIn("SUMMARY traces=4 incomplete=0", output)
+            self.assertIn("| 组 | 方向 | 原始Host | 两端均加载Host |", output)
+            self.assertIn("| 组 | 原callback_window几何空泡 |", output)
 
 
 if __name__ == "__main__":

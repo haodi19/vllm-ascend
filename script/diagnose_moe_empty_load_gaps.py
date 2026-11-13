@@ -11,7 +11,7 @@ from pathlib import Path
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
 from inspect_moe_profile import _interval, _task_kind, copy_gap_boundaries
 from moe_outlier_stats import outlier_summary, stats
-from offload_bubble_stats import pair_direction
+from offload_bubble_stats import analyze_offload_batches, pair_direction
 from verify_memcpy_gaps import CASES, read_offload_header, select_host_callbacks, select_track
 
 STAGES = frozenset(("update_weights", "load_submit", "synchronize", "copy_submit", "load_prepare", "scale_refresh"))
@@ -265,6 +265,45 @@ def excluded_bubble_stats(tasks, callbacks, episodes):
     return rows
 
 
+def strict_loaded_bubbles(tasks, callbacks):
+    """Require adjacent loaded callbacks AND unambiguous device batch boundaries."""
+    typed_tasks = []
+    for task in tasks:
+        name = task["name"].upper()
+        kind = "copy" if "MEMCPY_ASYNC" in name else "transpose" if "TRANSPOSE" in name else "other_device_task"
+        typed_tasks.append(dict(task, kind=kind))
+    associated = analyze_offload_batches(typed_tasks, callbacks, lower_us=MIN_GAP_US, long_us=LONG_GAP_US)
+    rows = []
+    for direction in ("prefetch->reactive", "reactive->prefetch"):
+        eligible = [
+            (a, b)
+            for a, b in zip(callbacks, callbacks[1:])
+            if pair_direction(a, b) == direction and a["load_class"] == b["load_class"] == "with_prepare"
+        ]
+        mapped = [
+            p
+            for p in associated["pairs"]
+            if p["direction"] == direction
+            and p["left_callback"]["load_class"] == p["right_callback"]["load_class"] == "with_prepare"
+        ]
+        retained = [p for p in mapped if MIN_GAP_US <= p["gap_us"] < LONG_GAP_US]
+        rows.append(
+            dict(
+                direction=direction,
+                eligible_host_pairs=len(eligible),
+                mapped_pairs=len(mapped),
+                excluded_unmapped=len(eligible) - len(mapped),
+                excluded_short=sum(p["gap_us"] < MIN_GAP_US for p in mapped),
+                excluded_long=sum(p["gap_us"] >= LONG_GAP_US for p in mapped),
+                device_gap_us=stats([p["gap_us"] for p in retained]),
+                host_gap_same_pairs_us=stats(
+                    [p["right_callback"]["start"] - p["left_callback"]["end"] for p in retained]
+                ),
+            )
+        )
+    return dict(rows=rows, association_partial=associated["partial"], reasons=associated["partial_reasons"])
+
+
 def analyze(path, stream_name, report=None, progress=print):
     before = path.stat()
     progress(f"READ 1/2: {path}")
@@ -293,6 +332,7 @@ def analyze(path, stream_name, report=None, progress=print):
         episodes=episodes,
         compute=compute,
         bubble_cohorts=None if integrity else excluded_bubble_stats(tasks, callbacks, episodes),
+        strict_bubbles=None if integrity else strict_loaded_bubbles(tasks, callbacks),
     )
 
 
@@ -351,6 +391,15 @@ def render(result):
                     {k: round(v, 3) if isinstance(v, float) else v for k, v in summary.items()} if summary else None
                 )
                 yield f"BUBBLE {row['scope']} {name}: {json.dumps(values)}"
+    yield "STRICT_LOADED_BUBBLES：相邻Host两端均加载且设备批次可唯一关联；含Transpose占用，不跨空载拼接"
+    strict = result["strict_bubbles"]
+    if strict is None:
+        yield "STRICT_LOADED_BUBBLES unavailable: 标记完整性未通过"
+    else:
+        yield f"STRICT_MAPPING partial={strict['association_partial']} reasons={strict['reasons']}"
+        for row in strict["rows"]:
+            yield "STRICT_LOADED_ROW " + json.dumps(row, ensure_ascii=False)
+        yield "映射不足时仅为可关联子集，不把缺失样本算0；host_gap_same_pairs_us只使用同一批保留的设备间隔"
     regular = [e for e in episodes if e["in_bubble_band"]]
     same_visit = [e for e in regular if e["same_layer_visit"]]
     yield (
@@ -440,6 +489,34 @@ def compare_pairs(baseline, candidate):
         )
 
 
+def comparison_tables(comparisons):
+    def cell(summary):
+        return "—" if summary is None else f"{summary['mean']:.3f} / {summary['n']}"
+
+    yield "\nHost间隔：均值μs / 样本数；不做IQR；只保留原始相邻关系"
+    yield "| 组 | 方向 | 原始Host | 两端均加载Host |"
+    yield "| --- | --- | ---: | ---: |"
+    for label, records in comparisons.items():
+        if len(records) != 1 or records[0]["integrity_issues"]:
+            continue
+        for direction in ("prefetch->reactive", "reactive->prefetch"):
+            pairs = [p for p in records[0]["pairs"] if p["direction"] == direction]
+            original = stats([p["gap_us"] for p in pairs])
+            loaded = stats([p["gap_us"] for p in pairs if p["class_pair"] == "with_prepare->with_prepare"])
+            yield f"| {label} | {direction} | {cell(original)} | {cell(loaded)} |"
+    yield "\n设备空泡：均值μs / 样本数；原几何空泡与严格方向子集不一一对应；严格结果仅为可关联子集"
+    yield "| 组 | 原callback_window几何空泡 | 严格预取→按需 | 严格按需→预取 | 映射不完整 |"
+    yield "| --- | ---: | ---: | ---: | --- |"
+    for label, records in comparisons.items():
+        if len(records) != 1 or records[0]["integrity_issues"]:
+            continue
+        record = records[0]
+        original = next(row["original"] for row in record["bubble_cohorts"] if row["scope"] == "callback_window")
+        strict = record["strict_bubbles"]
+        a, b = [cell(row["device_gap_us"]) for row in strict["rows"]]
+        yield f"| {label} | {cell(original)} | {a} | {b} | {strict['association_partial']} |"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", type=Path, help="四组根目录、同时含tokens5/tokens128的父目录，或单个trace")
@@ -479,6 +556,8 @@ def main(argv=None):
                     dict(
                         pairs=result["pairs"],
                         integrity_issues=result["integrity_issues"],
+                        strict_bubbles=result["strict_bubbles"],
+                        bubble_cohorts=result["bubble_cohorts"],
                         identity={name: (report or {}).get(name) for name in ("request_specs", "digests", "usage")},
                     )
                 )
@@ -495,6 +574,8 @@ def main(argv=None):
                     emit(f"\nCOMPARE {label} vs {baseline_label}")
                     for line in compare_pairs(comparisons[baseline_label][0], candidates[0]):
                         emit(line)
+        for line in comparison_tables(comparisons):
+            emit(line)
         emit(f"SUMMARY traces={len(records)} incomplete={failures}; file={output}")
     return int(bool(failures))
 
