@@ -1,5 +1,54 @@
 # 在 MindStudio 中查看专家卸载回调
 
+## Host 与设备等待的时序核查
+
+2026-11-17 的待核查现象：PR 采集中，用户观察到 Stream 25 的短 wait 完全落在
+预取 `synchronize` 的 MSTX 区间内；Stream 27 的长 wait 在预取 `synchronize`
+尚未结束时开始，并在按需 `synchronize` 内结束。此处保留观察描述，尚未取得原始
+trace 的逐任务核查结果，不将流号直接指定为预取或按需。
+
+当前纯 MTE 严格等待路径要求同一次任务满足以下顺序：
+
+```text
+_synchronize_h2d 返回 → MSTX synchronize 结束 → Python Host 函数返回
+→ C++ worker 发布本 slot / generation 的 done → 设备严格 wait 正常退出
+```
+
+消费者处等待还要求：预取严格 wait 退出、映射写回与交接事件完成后，主流才发布
+同层按需请求。因此，如果完成配对后仍观察到上述关系，就不能将其解释为正常
+的异步重叠。源码核查没有发现正常路径提前发布 done，也没有发现显式有界退出；
+这不代替对服务器实际构建及设备运行的验证。
+
+`CallbackTimings.wrap` 在同步函数返回的 `finally` 中结束 MSTX；
+`host_sync.cpp` 在 Python 回调返回并释放 GIL 后才写入完成序号；
+`host_sync_wait_strict_launch` 使用无限轮询，检查当前 slot 的准确完成代次。
+MSTX 的 `backend=cpp/python` 表示 LRC 实现，不能据此辨认 callback/MTE 交接后端。
+
+只读核查工具 `script/diagnose_mte_wait_timeline.py` 读取已有 `trace_view.json`，
+不导入 Torch、不初始化 NPU、不重跑模型，也不修改原始时间戳或实验报告。
+它先用 `Ascend Hardware` 元数据识别设备轨道，分别枚举每条轨道的 publish/wait，
+再检查 Host 标记的线程、上下文和嵌套关系。不会按 Stream 25/27 的编号、wait
+长短或横向重叠直接认定任务身份。
+
+只有完整序列数量相等时，才检验同序号配对候选；该候选不是 slot/generation
+身份映射的证明。给设备时间统一加上偏移 δ，正常顺序至少需要：
+
+```text
+publish_start_device + δ ≤ host_callback_start
+host_callback_end ≤ wait_end_device + δ
+```
+
+对所有候选任务取约束交集，可判断一个共同时间平移是否能解释观测。
+非零可行区间仅支持“系统性时间偏移”假设，不是独立时钟校准，不能据此平移数据后
+重新宣称验证通过。publish 结束时间不作请求可见性的下界，因为 CPU 可能在
+publish 算子退出之前就读到请求。
+
+若不存在共同可行区间，继续区分任务配对错误、非恒定时间偏差、设备任务区间含义及
+实际协议异常；已有采集不能辨别时，再补最小运行诊断，保持严格完成检查。
+Host 内部嵌套完整性通过，只证明 Host 标记自洽，不证明 Host/设备时钟已对齐。
+固定跨域偏移不会改变同一时间域内的区间长度，但可能改变 Host 窗口裁剪、空载回调
+与设备空泡的重叠判定；这些跨域派生口径需在时间对齐核查后重新确认。
+
 MSTX 是昇腾提供的自定义时间标记接口。这里使用
 `torch_npu.npu.mstx.range_start(message)` 和 `range_end(range_id)`，不传入 stream，
 在 CPU 回调线程上记录开始和结束时刻。标记随同一份 torch_npu profile 导出，
