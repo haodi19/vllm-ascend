@@ -25,6 +25,42 @@ TENSOR_ELEMENTS = 256
 MARKER_PREFIX = "moe_clock_calibration|sample="
 
 
+def affine_clock_bounds(measurements):
+    """Bound D = scale * H + offset using submission/completion intervals.
+
+    Each row is (host_submit, host_sync, device_start, device_end), in us.
+    Solve every lower-offset <= upper-offset constraint. Unlike fitting midpoint
+    timestamps, this retains Host submission and synchronization uncertainty.
+    """
+    if len(measurements) < 2:
+        raise ValueError("need at least two clock measurements")
+    for submit, sync, start, end in measurements:
+        if any(not value.is_finite() for value in (submit, sync, start, end)) or submit > sync or start > end:
+            raise ValueError("invalid affine clock measurement")
+    lower, upper, impossible = Decimal(0), None, False
+    for _, sync, _, end in measurements:
+        for submit, _, start, _ in measurements:
+            numerator, denominator = end - start, sync - submit
+            if denominator > 0:
+                lower = max(lower, numerator / denominator)
+            elif denominator < 0:
+                bound = numerator / denominator
+                upper = bound if upper is None else min(upper, bound)
+            elif numerator > 0:
+                impossible = True
+    possible = not impossible and upper is not None and upper > 0 and lower <= upper
+    return {
+        "n": len(measurements),
+        "positive_affine_possible": possible,
+        "rate_error_bounds_us_per_second": [
+            str((lower - 1) * 10**6),
+            None if upper is None else str((upper - 1) * 10**6),
+        ],
+        "basis": "all interval constraints; D=scale*H+offset; negative rate means device time advances slower than RAW",
+        "scope": "conditional on one affine clock across capture; no original timestamps changed",
+    }
+
+
 def bracket_stats(bounds, samples):
     """Bounds on exported time minus a directly bracketed RAW timestamp, in us."""
     if len(bounds) != len(samples) or len(bounds) < 2:
@@ -95,12 +131,21 @@ def analyze_trace(root, samples):
     if len(device) == len(samples) and len(identities) == 1:
         # Exactly one known Add per synchronous replay: sequence mapping, never nearest-time matching.
         device.sort(key=lambda e: Decimal(str(e["ts"])))
-        bounds = []
+        bounds, measurements = [], []
+        origin = samples[0]["submit_before_ns"]
         for event, row in zip(device, samples):
             start = Decimal(str(event["ts"])) * 1000 - host_offset_ns
             end = start + Decimal(str(event["dur"])) * 1000
             # Device execution must follow submission and finish before synchronize returns.
             bounds.append(((end - row["sync_after_ns"]) / 1000, (start - row["submit_before_ns"]) / 1000))
+            measurements.append(
+                (
+                    Decimal(row["submit_before_ns"] - origin) / 1000,
+                    Decimal(row["sync_after_ns"] - origin) / 1000,
+                    (start - origin) / 1000,
+                    (end - origin) / 1000,
+                )
+            )
         result["device_offset_necessary_bounds_us"] = {
             "first": [str(x) for x in bounds[0]],
             "last": [str(x) for x in bounds[-1]],
@@ -110,13 +155,23 @@ def analyze_trace(root, samples):
             "inverted_bounds": sum(lo > hi for lo, hi in bounds),
             "basis": "exported minus measured RAW using the Host wall offset; one Add per synchronous replay",
         }
+        result["device_affine_clock"] = affine_clock_bounds(measurements)
     else:
         result["device_mapping"] = "unproven; kernel count/name/stream did not identify exactly one Add per sample"
     # Event elapsed time gives an additional relative device clock, independently of JSON timestamps.
     if all("event_elapsed_us" in row for row in samples):
         first = samples[0]
-        elapsed_bounds = []
+        elapsed_bounds, measurements = [], []
         for row in samples:
+            elapsed = Decimal(str(row["event_elapsed_us"]))
+            measurements.append(
+                (
+                    Decimal(row["submit_before_ns"] - first["submit_before_ns"]) / 1000,
+                    Decimal(row["sync_after_ns"] - first["submit_before_ns"]) / 1000,
+                    elapsed,
+                    elapsed,
+                )
+            )
             elapsed_bounds.append(
                 (
                     (
@@ -134,6 +189,7 @@ def analyze_trace(root, samples):
             "last": [str(x) for x in elapsed_bounds[-1]],
             "violations": sum(not lo <= 0 <= hi for lo, hi in elapsed_bounds),
         }
+        result["event_affine_clock"] = affine_clock_bounds(measurements)
     return result
 
 
@@ -208,6 +264,7 @@ def run_child(args):
     if errors:
         raise errors[0]
     profiler = torch_npu.profiler.profile(
+        schedule=torch_npu.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
         activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
         record_shapes=False,
         profile_memory=False,
@@ -218,16 +275,30 @@ def run_child(args):
         ),
     )
     profiler.start()
+    # Finish profiler preparation before releasing the already warmed-up worker.
+    profiler.step()
     go.set()
     thread.join(STARTUP_TIMEOUT_SECONDS + args.samples * args.interval)
     if thread.is_alive():
         raise TimeoutError("worker computation timed out")
     # Preserve independent measurements even when export fails.
     (args.output_dir / "host_brackets.json").write_text(json.dumps(records), encoding="utf-8")
+    # Complete the single active step and export before stopping in NONE state.
+    profiler.step()
     profiler.stop()
     if errors:
         raise errors[0]
     print(f"WORKLOAD_PASS mode={args.child_mode}; device={torch.npu.get_device_name(0)}; samples={len(records)}")
+
+
+def saved_case_result(case, expected_samples=None):
+    roots = discover_roots([case / "profile"])
+    if len(roots) != 1:
+        raise ValueError("expected exactly one exported capture")
+    samples = json.loads((case / "host_brackets.json").read_text(encoding="utf-8"))
+    if expected_samples is not None and len(samples) != expected_samples:
+        raise ValueError(f"Host samples={len(samples)}; expected={expected_samples}")
+    return roots[0], analyze_trace(roots[0], samples)
 
 
 def run_parent(args):
@@ -246,6 +317,16 @@ def run_parent(args):
         )
         emit("偏移范围符号=导出坐标减RAW坐标（扣除Host固定纪元偏移）；不对原trace做校正。")
         emit("outside_bracket按零容差报告；亚微秒残差需结合导出量化判断，不自动认定时钟故障。")
+        emit("全样本仿射约束：负速率表示设备时间相对RAW变慢；这是速率范围，不是已验证的修正值。")
+        if args.reference_run:
+            emit(f"REFERENCE_RUN={args.reference_run}; 只读取前次校准记录，不修改旧文件。")
+            for mode in ("eager", "graph"):
+                try:
+                    _, result = saved_case_result(args.reference_run / mode)
+                except Exception as error:
+                    emit(f"REFERENCE_FAILED mode={mode}; {type(error).__name__}: {error}")
+                    return 1
+                emit("REFERENCE_CALIBRATION " + json.dumps({"mode": mode, **result}, ensure_ascii=False))
         for mode in ("eager", "graph"):
             case = args.output_dir / mode
             case.mkdir()
@@ -294,18 +375,12 @@ def run_parent(args):
                 emit("停止后续组；本轮不形成有效对照。")
                 return 1
             try:
-                roots = discover_roots([case / "profile"])
-                if len(roots) != 1:
-                    raise ValueError("expected exactly one exported capture")
-                samples = json.loads((case / "host_brackets.json").read_text(encoding="utf-8"))
-                if len(samples) != args.samples:
-                    raise ValueError(f"Host samples={len(samples)}; expected={args.samples}")
-                result = analyze_trace(roots[0], samples)
+                root, result = saved_case_result(case, args.samples)
             except Exception as error:
                 emit(f"ANALYSIS_FAILED mode={mode}; {type(error).__name__}: {error}; 原记录保留。")
                 return 1
             emit("CALIBRATION " + json.dumps({"mode": mode, **result}, ensure_ascii=False))
-            emit(f"TRACE={roots[0] / 'ASCEND_PROFILER_OUTPUT/trace_view.json'}")
+            emit(f"TRACE={root / 'ASCEND_PROFILER_OUTPUT/trace_view.json'}")
         emit("完成；这是当前环境的独立校准，不自动证明旧采集的根因或MoE协议正确。")
     return 0
 
@@ -314,6 +389,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--npu", type=int, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--reference-run", type=Path, help="also analyze an existing calibration run into the new summary"
+    )
     parser.add_argument("--samples", type=int, default=SAMPLES)
     parser.add_argument("--interval", type=float, default=INTERVAL_SECONDS)
     parser.add_argument("--child-mode", choices=("eager", "graph"), help=argparse.SUPPRESS)

@@ -111,6 +111,41 @@ class ClockCalibrationTests(unittest.TestCase):
         self.write_trace(device_rate=29)
         result = calibration.analyze_trace(self.root, self.rows)
         self.assertFalse(result["device_offset_necessary_bounds_us"]["constant_offset_possible"])
+        affine = result["device_affine_clock"]
+        self.assertTrue(affine["positive_affine_possible"])
+        low, high = map(Decimal, affine["rate_error_bounds_us_per_second"])
+        self.assertLess(low, Decimal(29))
+        self.assertGreater(high, Decimal(29))
+        self.assertGreater(low, 0)
+
+    def test_affine_model_recovers_rate_without_assuming_midpoint_timestamps(self):
+        rate = Decimal("0.999971")
+        offset = Decimal("-123.456")
+        measurements = []
+        for index in range(4):
+            host = Decimal(index * 10**6)
+            device = host * rate + offset
+            measurements.append((host, host, device, device))
+        result = calibration.affine_clock_bounds(measurements)
+        self.assertTrue(result["positive_affine_possible"])
+        self.assertEqual(list(map(Decimal, result["rate_error_bounds_us_per_second"])), [-29, -29])
+
+    def test_nonlinear_clock_cannot_be_explained_by_one_rate(self):
+        measurements = [tuple(map(Decimal, row)) for row in ((0, 0, 0, 0), (1, 1, 1, 1), (2, 2, 3, 3))]
+        self.assertFalse(calibration.affine_clock_bounds(measurements)["positive_affine_possible"])
+
+    def test_elapsed_event_detects_rate_error_independently_of_trace(self):
+        self.write_trace()
+        for row in self.rows:
+            row["event_elapsed_us"] *= 0.9999
+        result = calibration.analyze_trace(self.root, self.rows)
+        self.assertTrue(result["device_offset_necessary_bounds_us"]["constant_offset_possible"])
+        event = result["event_affine_clock"]
+        self.assertTrue(event["positive_affine_possible"])
+        low, high = map(Decimal, event["rate_error_bounds_us_per_second"])
+        self.assertLess(low, -100)
+        self.assertGreater(high, -100)
+        self.assertLess(high, 0)
 
     def test_ambiguous_device_mapping_retains_host_check_only(self):
         self.write_trace(device_copies=2)
@@ -135,7 +170,7 @@ class ClockCalibrationTests(unittest.TestCase):
             calibration.analyze_trace(self.root, self.rows)
 
     def test_missing_export_keeps_error_in_summary(self):
-        args = SimpleNamespace(output_dir=self.base / "new_run", npu=1, samples=3, interval=0.2)
+        args = SimpleNamespace(output_dir=self.base / "new_run", npu=1, samples=3, interval=0.2, reference_run=None)
         process = mock.Mock(returncode=0)
         process.poll.return_value = 0
         with (
@@ -145,6 +180,13 @@ class ClockCalibrationTests(unittest.TestCase):
             self.assertEqual(calibration.run_parent(args), 1)
         self.assertIn("ANALYSIS_FAILED mode=eager", (args.output_dir / "summary.txt").read_text(encoding="utf-8"))
         self.assertFalse((args.output_dir / "graph").exists())
+
+    def test_reference_failure_is_reported_before_starting_device(self):
+        args = SimpleNamespace(output_dir=self.base / "new_run", npu=1, samples=3, reference_run=self.base / "absent")
+        with mock.patch.object(calibration.subprocess, "Popen") as popen, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(calibration.run_parent(args), 1)
+        popen.assert_not_called()
+        self.assertIn("REFERENCE_FAILED mode=eager", (args.output_dir / "summary.txt").read_text(encoding="utf-8"))
 
     def test_existing_output_is_not_overwritten(self):
         args = SimpleNamespace(output_dir=self.root)
