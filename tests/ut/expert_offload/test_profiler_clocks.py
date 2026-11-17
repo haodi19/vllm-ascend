@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -124,8 +125,16 @@ class ClockMetadataTests(unittest.TestCase):
         fields = clocks.clock_fields(clocks.parse_metadata(expected[1]))
         self.assertEqual({row["key"]: row["value"] for row in fields}["Host.cntvct_diff"], "-3")
         fields = clocks.clock_fields(clocks.parse_metadata(expected[0]))
-        self.assertEqual(fields[0]["type"], "unparsed_unit_string")
+        self.assertEqual(fields[0]["type"], "frequency_literal")
         self.assertEqual(fields[0]["value"], "2400 MHz")
+
+    def test_cpu_frequency_unknown_value_is_preserved_not_hidden(self):
+        fields = clocks.clock_fields({"CPU": [{"Frequency": "N/A"}, {"Frequency": "not supported"}]})
+        self.assertEqual([row["value"] for row in fields], ["N/A", "not supported"])
+        self.assertTrue(all(row["type"] == "frequency_literal" for row in fields))
+        fields = clocks.clock_fields({"CPU": [{"Frequency": "x" * 200}]})
+        self.assertEqual(len(fields[0]["value"]), clocks.MAX_LITERAL_CHARS)
+        self.assertTrue(fields[0]["truncated"])
 
     def test_clock_units_preserved_and_unknown_strings_redacted(self):
         fields = clocks.clock_fields(
@@ -251,6 +260,79 @@ class ClockMetadataTests(unittest.TestCase):
             clocks.inspect_cann_source([self.root])
         self.assertIn("shown=2; truncated=True", output.getvalue())
         self.assertNotIn("return a", output.getvalue())
+
+    def test_source_includes_default_frequency_constant_without_execution(self):
+        blocks = clocks.source_method_lines("class Clock:\n    HOST_DEFAULT_FREQ = NumberConstant.NANO_SECOND\n", ())
+        self.assertIn("HOST_DEFAULT_FREQ", blocks["<clock_constants>"][0][0][1])
+
+    def test_export_comparison_identity_ns_and_scaled_counter(self):
+        rows = [
+            (f"{clocks.CALLBACK_PREFIX}call={index}", 1000000000 + index * 3000000000, 1000010000 + index * 3000000000)
+            for index in range(3)
+        ]
+        exported = [
+            (name, 1794493000000000 + index * 3000000, 1794493000000010 + index * 3000000)
+            for index, (name, _, _) in enumerate(rows)
+        ]
+        result = clocks.compare_mstx_export(rows, exported)
+        self.assertEqual(result["matched_unique"], 3)
+        self.assertEqual(result["raw_units_per_trace_us"], "1000")
+        self.assertEqual(result["if_raw_ns_export_span_change_us"], "0")
+        self.assertEqual(result["endpoint_affine_residual_range_us"], ["0", "0"])
+        scaled = [(name, start * 3, end * 3) for name, start, end in rows]
+        self.assertEqual(clocks.compare_mstx_export(scaled, exported)["raw_units_per_trace_us"], "3000")
+
+    def test_export_comparison_rejects_duplicate_names_and_invalid_timestamp(self):
+        rows = [("same", 0, 1), ("same", 2, 3), ("other", 4, 5)]
+        result = clocks.compare_mstx_export(rows, [("same", 8, 9), ("other", 10, 11)])
+        self.assertEqual(result["matched_unique"], 1)
+        self.assertEqual(result["db_duplicate_names"], 1)
+        self.assertNotIn("raw_units_per_trace_us", result)
+        for start, end in (("NaN", 1), (4, 3), ("bad", 1)):
+            with self.assertRaises(ValueError):
+                clocks.unique_markers([("name", start, end)])
+
+    def test_existing_sqlite_to_trace_audit_is_read_only_and_full_name_matched(self):
+        path = self.root / "PROF_a/host/sqlite/msproftx.db"
+        path.parent.mkdir(parents=True)
+        connection = sqlite3.connect(path)
+        rows = [
+            (f"{clocks.CALLBACK_PREFIX}call={index}", 1000000000 + index * 3000000000, 1000010000 + index * 3000000000)
+            for index in range(3)
+        ]
+        connection.execute("CREATE TABLE MsprofTxEx(message TEXT, start_time INTEGER, end_time INTEGER)")
+        connection.executemany("INSERT INTO MsprofTxEx VALUES (?,?,?)", rows)
+        connection.commit()
+        connection.close()
+        self.write(
+            "ASCEND_PROFILER_OUTPUT/trace_view.json",
+            json.dumps(
+                [
+                    {"name": name, "ph": "X", "ts": 1794493000000000 + index * 3000000, "dur": 10}
+                    for index, (name, _, _) in enumerate(rows)
+                ]
+            ),
+        )
+        before = path.read_bytes()
+        before_files = sorted(p.relative_to(self.root) for p in self.root.rglob("*"))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            clocks.inspect_mstx_export(self.root)
+        self.assertIn('"matched_unique": 3', output.getvalue())
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(before_files, sorted(p.relative_to(self.root) for p in self.root.rglob("*")))
+        with mock.patch.object(clocks, "MAX_MSTX_ROWS", 1), self.assertRaisesRegex(ValueError, "row limit"):
+            clocks.read_mstx_tables(path)
+        Path(str(path) + "-wal").write_bytes(b"live WAL")
+        with self.assertRaisesRegex(ValueError, "active WAL"):
+            clocks.read_mstx_tables(path)
+
+    def test_no_mstx_database_does_not_read_large_trace(self):
+        output = io.StringIO()
+        with mock.patch.object(clocks, "events") as reader, contextlib.redirect_stdout(output):
+            clocks.inspect_mstx_export(self.root)
+        reader.assert_not_called()
+        self.assertIn("existing msproftx.db not found", output.getvalue())
 
     def test_sample_duration_validation(self):
         self.assertEqual(clocks.sample_seconds("5"), 5)

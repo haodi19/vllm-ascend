@@ -9,8 +9,12 @@ import json
 import math
 import os
 import re
+import sqlite3
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+from analyze_callback_gaps import events
 
 MAX_ROOTS = 16
 MAX_ENTRIES = 10000
@@ -19,8 +23,15 @@ MAX_FILES = 64
 MAX_FILE_BYTES = 1024 * 1024
 MAX_FIELDS = 100
 MAX_SOURCE_LINES = 48
-MAX_CANN_SOURCE_LINES = 220
+MAX_CANN_SOURCE_LINES = 280
 MAX_METHOD_LINES = 40
+MAX_LITERAL_CHARS = 160
+MAX_MSTX_ROWS = 20000
+DB_QUERY_TIMEOUT_SECONDS = 20
+EXPORT_PROGRESS_SECONDS = 30
+CALLBACK_PREFIX = "moe_offload/host_callback|"
+MSTX_TABLES = ("MsprofTx", "MsprofTxEx")
+SOURCE_CONSTANTS = frozenset(("HOST_DEFAULT_FREQ", "NANO_SECOND", "MICRO_SECOND", "FREQ_TO_MHz", "NS_TO_US", "USTONS"))
 SAMPLE_INTERVAL_SECONDS = 0.5
 PROFILER_INFO = re.compile(r"profiler_info(?:_\d+)?\.json$")
 CANN_METADATA = re.compile(
@@ -89,7 +100,9 @@ CANN_SOURCE_METHODS = (
             "get_host_duration",
             "time_from_syscnt",
             "_load_dev_start_time",
+            "_load_dev_start_path_line_by_line",
             "_load_host_start_time",
+            "_check_monotonic_and_cnt",
             "get_freq",
             "_load_local_time_offset",
             "trans_into_local_time",
@@ -97,6 +110,7 @@ CANN_SOURCE_METHODS = (
     ),
     ("analysis/viewer/msproftx_viewer.py", ("format_tx_timeline_data", "format_tx_ex_timeline_data")),
     ("analysis/profiling_bean/basic_info/host_start.py", ("__init__", "host_mon")),
+    ("analysis/common_func/ms_constant/number_constant.py", ()),
 )
 
 
@@ -221,7 +235,17 @@ def clock_fields(data):
                     found.append({"key": child_path, "value": child, "type": type(child).__name__})
                 elif name in CLOCK_KEYS and isinstance(child, str):
                     match = NUMBER_WITH_UNIT.fullmatch(child.strip())
-                    if match and match[2].lower() in UNITS:
+                    if re.fullmatch(r"CPU\[\d+\]\.Frequency", child_path, re.I):
+                        # This exact diagnostic field must distinguish N/A from an unusual frequency format.
+                        found.append(
+                            {
+                                "key": child_path,
+                                "value": child[:MAX_LITERAL_CHARS],
+                                "type": "frequency_literal",
+                                "truncated": len(child) > MAX_LITERAL_CHARS,
+                            }
+                        )
+                    elif match and match[2].lower() in UNITS:
                         found.append({"key": child_path, "value": child, "type": "unparsed_unit_string"})
                     else:
                         found.append({"key": child_path, "type": "unparsed_string", "value_omitted": True})
@@ -309,6 +333,12 @@ def source_method_lines(text, names):
     lines, result = text.splitlines(), {}
     tree = ast.parse(text)
     for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in SOURCE_CONSTANTS for target in node.targets
+        ):
+            result.setdefault("<clock_constants>", []).append(
+                [(index, lines[index - 1]) for index in range(node.lineno, node.end_lineno + 1)]
+            )
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
             excluded = set()
             for statement in node.body:
@@ -336,7 +366,7 @@ def inspect_cann_source(roots):
             print(f"CANN_SOURCE_UNREADABLE={path}")
             continue
         print(f"CANN_SOURCE_FILE={path}")
-        for method in methods:
+        for method in (("<clock_constants>",) if "<clock_constants>" in blocks else ()) + methods:
             if method not in blocks:
                 print(f"CANN_METHOD_MISSING={method}")
             for block in blocks.get(method, []):
@@ -352,6 +382,132 @@ def inspect_cann_source(roots):
         if relative not in seen:
             print(f"CANN_SOURCE_MISSING={relative}")
     print("CANN_SOURCE_SCOPE=fixed paths and selected method bodies only; never imported or executed")
+
+
+def mstx_db_paths(root):
+    """Only inspect known, already parsed CANN SQLite locations."""
+    return sorted(
+        set(root.glob("PROF_*/host/sqlite/msproftx.db")) | set(root.glob("PROF_*/device_*/sqlite/msproftx.db"))
+    )
+
+
+def read_mstx_tables(path):
+    # A live WAL could require shared-memory writes or make an immutable read stale.
+    for suffix in ("-wal", "-journal"):
+        journal = Path(str(path) + suffix)
+        if journal.exists() and journal.stat().st_size:
+            raise ValueError("active WAL/journal; use a completed export")
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True, timeout=1)
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA temp_store=MEMORY")
+        deadline = time.monotonic() + DB_QUERY_TIMEOUT_SECONDS
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+        tables = {}
+        for table in MSTX_TABLES:
+            columns = {row[1] for row in connection.execute(f'PRAGMA table_info("{table}")')}
+            if not {"message", "start_time", "end_time"}.issubset(columns):
+                continue
+            rows = connection.execute(
+                f'SELECT message, start_time, end_time FROM "{table}" WHERE message LIKE ? LIMIT ?',
+                (CALLBACK_PREFIX + "%", MAX_MSTX_ROWS + 1),
+            ).fetchall()
+            if len(rows) > MAX_MSTX_ROWS:
+                raise ValueError("MSTX row limit exceeded; no partial fit")
+            tables[table] = [row for row in rows if isinstance(row[0], str) and row[0].startswith(CALLBACK_PREFIX)]
+        return tables
+    finally:
+        connection.close()
+
+
+def unique_markers(rows):
+    unique, repeated = {}, set()
+    for message, start, end in rows:
+        if message in unique:
+            repeated.add(message)
+        try:
+            values = (Decimal(str(start)), Decimal(str(end)))
+        except InvalidOperation as error:
+            raise ValueError("non-numeric marker timestamp") from error
+        if not all(value.is_finite() for value in values) or values[1] < values[0]:
+            raise ValueError("invalid marker timestamp or duration")
+        unique[message] = values
+    return {key: value for key, value in unique.items() if key not in repeated}, len(repeated)
+
+
+def compare_mstx_export(db_rows, trace_rows):
+    raw, raw_duplicates = unique_markers(db_rows)
+    exported, trace_duplicates = unique_markers(trace_rows)
+    matches = sorted((exported[name][0], name) for name in raw.keys() & exported.keys())
+    result = {
+        "matched_unique": len(matches),
+        "db_duplicate_names": raw_duplicates,
+        "trace_duplicate_names": trace_duplicates,
+        "db_unmatched": len(raw.keys() - exported.keys()),
+    }
+    if len(matches) < 2:
+        return result
+    first, last = matches[0][1], matches[-1][1]
+    raw_delta = raw[last][0] - raw[first][0]
+    trace_delta = exported[last][0] - exported[first][0]
+    if raw_delta <= 0 or trace_delta <= 0:
+        result["invalid_order"] = True
+        return result
+    # Units of the database are deliberately not assumed to be hardware counter ticks.
+    ratio = raw_delta / trace_delta
+    result["raw_units_per_trace_us"] = str(ratio)
+    result["trace_span_us"] = str(trace_delta)
+    result["if_raw_ns_export_span_change_us"] = str(trace_delta - raw_delta / 1000)
+    residuals = [exported[name][0] - exported[first][0] - (raw[name][0] - raw[first][0]) / ratio for _, name in matches]
+    result["endpoint_affine_residual_range_us"] = [str(min(residuals)), str(max(residuals))]
+    result["samples"] = [
+        {
+            "name": name,
+            "db_start": str(raw[name][0]),
+            "db_end": str(raw[name][1]),
+            "trace_start_us": str(exported[name][0]),
+            "trace_end_us": str(exported[name][1]),
+        }
+        for name in dict.fromkeys(matches[index][1] for index in (0, len(matches) // 2, len(matches) - 1))
+    ]
+    return result
+
+
+def inspect_mstx_export(root):
+    paths = mstx_db_paths(root)
+    if not paths:
+        print("MSTX_EXPORT=unavailable; existing msproftx.db not found; no parser launched")
+        return
+    trace_path = root / "ASCEND_PROFILER_OUTPUT" / "trace_view.json"
+    if not trace_path.is_file():
+        print("MSTX_EXPORT=unavailable; trace_view.json not found")
+        return
+    print(f"MSTX_EXPORT_READ={trace_path}; streaming existing JSON; may take time", flush=True)
+    trace_rows = []
+    last_progress = time.monotonic()
+    for index, event in enumerate(events(trace_path), 1):
+        if index % MAX_ENTRIES == 0 and time.monotonic() - last_progress >= EXPORT_PROGRESS_SECONDS:
+            print(f"MSTX_EXPORT_PROGRESS events={index}; callbacks={len(trace_rows)}", flush=True)
+            last_progress = time.monotonic()
+        if event.get("ph") == "X" and str(event.get("name", "")).startswith(CALLBACK_PREFIX):
+            start = Decimal(str(event["ts"]))
+            trace_rows.append((event["name"], start, start + Decimal(str(event["dur"]))))
+            if len(trace_rows) > MAX_MSTX_ROWS:
+                raise ValueError("trace callback limit exceeded; no partial fit")
+    for path in paths:
+        try:
+            tables = read_mstx_tables(path)
+            print(f"MSTX_DB={path.relative_to(root)}; supported_tables={list(tables)}")
+            for table, rows in tables.items():
+                result = compare_mstx_export(rows, trace_rows)
+                print("MSTX_EXPORT_MATCH " + json.dumps({"table": table, **result}, ensure_ascii=False))
+        except (sqlite3.Error, ValueError, OSError) as error:
+            print(f"MSTX_DB_UNREADABLE={path.relative_to(root)}; error_type={type(error).__name__}")
+    print(
+        "MSTX_EXPORT_SCOPE=unique full marker names only; database units not assumed; "
+        "endpoint fit is a conversion check, not an independent physical-clock calibration; "
+        "JSON float rounding can affect sub-microsecond residuals"
+    )
 
 
 def sample_host_clocks(seconds):
@@ -412,6 +568,11 @@ def main():
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--sample-host-clocks-seconds", type=sample_seconds, default=0)
     parser.add_argument(
+        "--audit-mstx-export",
+        action="store_true",
+        help="also read existing msproftx.db and trace_view.json; no offline exporter is launched",
+    )
+    parser.add_argument(
         "--cann-root", action="append", type=Path, help="CANN installation root; repeat for multiple roots"
     )
     args = parser.parse_args()
@@ -420,12 +581,18 @@ def main():
         "no Torch/model/NPU/parser processes, no file writes."
     )
     print("METADATA_VALUES=original values; no inferred units/frequencies or timestamp correction")
-    print("SCRIPT_REVISION=profiler_clocks_v2; unit-bearing strings remain unparsed; unknown strings are redacted")
+    print("SCRIPT_REVISION=profiler_clocks_v3; CPU Frequency literals preserved; units not inferred")
+    if args.audit_mstx_export:
+        print(
+            "EXPORT_AUDIT=read existing SQLite/JSON only; match unique complete callback names; no timestamp correction"
+        )
     try:
         roots = discover_roots(args.inputs)
         print(f"PROFILE_ROOT_COUNT={len(roots)}")
         for root in roots:
             inspect_root(root)
+            if args.audit_mstx_export:
+                inspect_mstx_export(root)
         inspect_installed_source()
         inspect_cann_source(args.cann_root or CANN_ROOTS)
         if args.sample_host_clocks_seconds:
