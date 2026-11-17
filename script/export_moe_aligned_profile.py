@@ -2,6 +2,7 @@
 """Export an importable profile copy, preserving DB lanes when a DB is present."""
 
 import argparse
+import collections
 import contextlib
 import json
 import re
@@ -20,6 +21,7 @@ DB_NAME = re.compile(r"ascend_pytorch_profiler(?:_\d+)?\.db$")
 NS_PER_US = Decimal(1000)
 MATCH_TOLERANCE_NS = Decimal(1000)
 MIN_HOST_ANCHORS = 8
+MAX_DIAGNOSTIC_LANES = 8
 
 
 def trace_anchors(trace, mapping):
@@ -46,6 +48,64 @@ def trace_anchors(trace, mapping):
 def columns(db, table):
     # Only fixed schema identifiers are used in SQL, never user-supplied SQL text.
     return {row[1] for row in db.execute(f'PRAGMA table_info("{table}")')}
+
+
+def match_add_stream(db, kernels, mapping, epoch):
+    """Match a complete DB lane against the already identified JSON probes.
+
+    Model streams may run the same Add kernel as the calibration stream. A JSON
+    tid is not assumed to be a DB streamId: require a unique full timestamp match,
+    using the epoch determined from Host markers, without fitting another offset.
+    """
+    name = mapping["calibration_stream"][2]
+    lanes = collections.defaultdict(list)
+    for start, end, device, stream in db.execute(
+        "SELECT t.startNs,t.endNs,t.deviceId,t.streamId FROM TASK t "
+        "JOIN COMPUTE_TASK_INFO c ON c.globalTaskId=t.globalTaskId "
+        "JOIN STRING_IDS s ON s.id=c.name WHERE s.value=? ORDER BY t.startNs,t.endNs",
+        (name,),
+    ):
+        lanes[(device, stream)].append((start, end))
+    matches, candidates = [], []
+    for (device, stream), pairs in lanes.items():
+        candidate = {"device": device, "stream": stream, "count": len(pairs)}
+        if len(pairs) == len(kernels):
+            if any(start is None or end is None or start < 0 or end < start for start, end in pairs):
+                candidate["invalid_intervals"] = True
+            else:
+                residual = max(
+                    abs(Decimal(value) + epoch - stamp)
+                    for pair, expected in zip(pairs, kernels)
+                    for value, stamp in zip(pair, expected)
+                )
+                candidate["max_anchor_error_ns"] = str(residual)
+                if stream is not None and residual <= MATCH_TOLERANCE_NS:
+                    matches.append(candidate)
+        candidates.append(candidate)
+    if len(matches) != 1:
+        # Include useful evidence in the normal export command, so a failed
+        # identification does not require a separate read-only diagnostic script.
+        candidates.sort(key=lambda item: (abs(item["count"] - len(kernels)), str(item["stream"])))
+        details = {
+            "json_identity": mapping["calibration_stream"],
+            "expected_count": len(kernels),
+            "same_name_streams": len(lanes),
+            "timestamp_matched_streams": len(matches),
+            "candidates": candidates[:MAX_DIAGNOSTIC_LANES],
+        }
+        if not lanes:
+            details["available_add_names"] = db.execute(
+                "SELECT s.value,COUNT(*) FROM TASK t "
+                "JOIN COMPUTE_TASK_INFO c ON c.globalTaskId=t.globalTaskId "
+                "JOIN STRING_IDS s ON s.id=c.name WHERE LOWER(s.value) LIKE '%add%' "
+                "GROUP BY s.value ORDER BY COUNT(*) DESC,s.value LIMIT ?",
+                (MAX_DIAGNOSTIC_LANES,),
+            ).fetchall()
+        raise ValueError(
+            "DB dedicated Add stream has no unique full match; counts or device timestamps differ: "
+            + json.dumps(details, ensure_ascii=False)
+        )
+    return dict(matches[0], same_name_streams=len(lanes))
 
 
 def match_database(db, markers, kernels, mapping):
@@ -77,20 +137,15 @@ def match_database(db, markers, kernels, mapping):
     device_ids = db.execute("SELECT DISTINCT deviceId FROM TASK").fetchall()
     if len(device_ids) != 1 or device_ids[0][0] is None:
         raise ValueError("only a single identified device DB is supported")
-    adds = db.execute(
-        "SELECT t.startNs,t.endNs,t.streamId FROM TASK t "
-        "JOIN COMPUTE_TASK_INFO c ON c.globalTaskId=t.globalTaskId "
-        "JOIN STRING_IDS s ON s.id=c.name WHERE s.value=? ORDER BY t.startNs,t.endNs",
-        (mapping["calibration_stream"][2],),
-    ).fetchall()
-    if len(adds) != len(kernels) or len({row[2] for row in adds}) != 1:
-        raise ValueError("DB dedicated Add stream is missing or ambiguous")
-    residual = max(
-        abs(Decimal(value) + epoch - stamp) for row, pair in zip(adds, kernels) for value, stamp in zip(row[:2], pair)
-    )
-    if residual > MATCH_TOLERANCE_NS:
-        raise ValueError("DB device timestamps differ from raw JSON; refuse guessed units/epoch")
-    return epoch, {"host_anchors": len(rows), "device_anchors": len(adds), "max_anchor_error_ns": str(residual)}
+    selected = match_add_stream(db, kernels, mapping, epoch)
+    return epoch, {
+        "host_anchors": len(rows),
+        "device_anchors": selected["count"],
+        "max_anchor_error_ns": selected["max_anchor_error_ns"],
+        "device_id": selected["device"],
+        "calibration_stream_id": selected["stream"],
+        "same_name_streams": selected["same_name_streams"],
+    }
 
 
 def convert_device_ns(value, mapping, db_epoch_ns):

@@ -59,6 +59,75 @@ class AlignedDirectoryTests(unittest.TestCase):
         with contextlib.closing(sqlite3.connect(path)) as db:
             return db.execute(f'SELECT * FROM "{table}"').fetchall()
 
+    def add_rows(self, db):
+        return db.execute(
+            "SELECT t.* FROM TASK t JOIN COMPUTE_TASK_INFO c ON c.globalTaskId=t.globalTaskId "
+            "JOIN STRING_IDS s ON s.id=c.name WHERE s.value=? ORDER BY t.startNs,t.endNs",
+            (self.mapping["calibration_stream"][2],),
+        ).fetchall()
+
+    def test_model_adds_on_other_streams_do_not_hide_calibration_lane(self):
+        self.database()
+        with sqlite3.connect(self.db_path) as db:
+            probes = self.add_rows(db)
+            # DB stream numbers need not be the JSON lane numbers. Another model
+            # lane can even have exactly the probe count, but different timestamps.
+            db.execute("UPDATE TASK SET streamId=81 WHERE streamId=9")
+            for stream, subset in ((82, probes), (83, probes[:5])):
+                for row in subset:
+                    db.execute(
+                        "INSERT INTO TASK VALUES(?,?,?,?,?,?,?,?)",
+                        (row[0] + 1000000, row[1] + 1000000, row[2], stream, *row[4:]),
+                    )
+        original = self.db_path.read_bytes()
+        report = export.export_capture(self.root, self.mapping, self.destination)
+        for check in ("before_check", "after_check"):
+            self.assertEqual(report["database"][check]["calibration_stream_id"], 81)
+            self.assertEqual(report["database"][check]["device_anchors"], len(probes))
+            self.assertEqual(report["database"][check]["same_name_streams"], 3)
+        target = self.destination / export.OUTPUT_NAME / self.db_path.name
+        for old, new in zip(self.read(self.db_path, "TASK"), self.read(target, "TASK")):
+            self.assertEqual(old[2:], new[2:])
+            self.assertEqual(new[:2], tuple(export.convert_device_ns(v, self.mapping, self.epoch) for v in old[:2]))
+        self.assertEqual(self.db_path.read_bytes(), original)
+
+    def test_two_full_matching_lanes_are_not_guessed_even_if_one_has_json_tid(self):
+        self.database()
+        with sqlite3.connect(self.db_path) as db:
+            for row in self.add_rows(db):
+                db.execute("INSERT INTO TASK VALUES(?,?,?,?,?,?,?,?)", (*row[:3], 19, *row[4:]))
+        original = self.db_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, '"timestamp_matched_streams": 2'):
+            export.export_capture(self.root, self.mapping, self.destination)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.db_path.read_bytes(), original)
+
+    def test_incomplete_or_duplicate_probe_lane_is_not_matched_as_a_subset(self):
+        self.database()
+        with sqlite3.connect(self.db_path) as db:
+            row = self.add_rows(db)[0]
+            db.execute("DELETE FROM TASK WHERE globalTaskId=?", (row[4],))
+        with self.assertRaisesRegex(ValueError, '"count": 15'):
+            export.export_capture(self.root, self.mapping, self.destination)
+        with sqlite3.connect(self.db_path) as db:
+            db.executemany("INSERT INTO TASK VALUES(?,?,?,?,?,?,?,?)", [row, row])
+        with self.assertRaisesRegex(ValueError, '"count": 17'):
+            export.export_capture(self.root, self.mapping, self.destination)
+        self.assertFalse(self.destination.exists())
+
+    def test_missing_name_reports_available_add_names_without_guessing(self):
+        self.database()
+        with sqlite3.connect(self.db_path) as db:
+            db.execute(
+                "UPDATE STRING_IDS SET value='different_Add_kernel' WHERE value=?",
+                (self.mapping["calibration_stream"][2],),
+            )
+        original = self.db_path.read_bytes()
+        with self.assertRaisesRegex(ValueError, '"available_add_names": \\[\\["different_Add_kernel", 16\\]\\]'):
+            export.export_capture(self.root, self.mapping, self.destination)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.db_path.read_bytes(), original)
+
     def test_database_layout_and_host_preserved_device_converted_original_untouched(self):
         self.database()
         originals = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}

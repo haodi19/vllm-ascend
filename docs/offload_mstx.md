@@ -272,8 +272,11 @@ JSON 导入不同，参见 [MindStudio FAQ](https://github.com/Ascend/msinsight/
 摘要中 `IMPORT_ALIGNED_DIRECTORY` 给出应导入的目录；原 `profile/` 与原统计不改写。
 
 新目录以标准名称 `ASCEND_PROFILER_OUTPUT/trace_view.json` 保存对齐图。有数据库时，
-先用全部 Host 校准标记确认数据库与 JSON 的纪元换算，再用同一次采集的专用 Add
-逐项确认设备时间单位、坐标和流的唯一性，最后在独立数据库副本中转换 `TASK.startNs/endNs`
+先用全部 Host 校准标记确认数据库与 JSON 的纪元换算。同名 Add 可能同时出现在模型流和
+校准流，不能把它们合并计数；按设备和流分别检查完整样本数，再逐项核对全部原始 JSON
+校准点的起止时间，只接受唯一匹配，不假设 JSON 泳道编号等于数据库 streamId。
+数量不全、时间不符或有多个完整匹配时拒绝导出，并打印候选流的数量和时间差。
+最后在独立数据库副本中转换 `TASK.startNs/endNs`
 以及派生的 `OVERLAP_ANALYSIS`。模型、流、任务、连接、嵌套等标识保持不变，
 Host MSTX、CANN API、Python API 表保持原值。数据库完整性及转换后的校准点再次检查，
 不支持的结构或包含未校准通信域时明确报错，不默默混入旧任务时间。
