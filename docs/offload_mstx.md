@@ -53,10 +53,54 @@ token128 的中间轮为从 0 编号的第 29 轮，末轮为第 57 轮。两组
 共同发生相对漂移的强证据，尚不能指定错误来自哪一种时钟或哪个转换实现。
 摘要只列出部分轮次，没有验证全部 58 轮的跨流联合交集。
 
-下一步采用独立信息核对：`script/inspect_moe_profiler_clocks.py` 读取既有
-`profiler_info`、CANN `info.json`、`host_start.log` 和 `start_info` 等时钟字段，
-以及当前安装版本的相关转换源码；不导入 Torch、不启动 NPU、不重新解析 profile。
-可选的 Host 时钟短采样只反映执行脚本时的系统时钟关系，不能还原历史采集状态。
+独立元数据核对没有支持“系统 wall/raw 时钟以约 29 μs/秒持续漂移”的解释。
+按采集起止记录计算 `Δ(collectionTime × 1000 − clockMonotonicRaw)`，其中
+collectionTime 单位为 μs、RAW 为 ns，得到以下结果。设备目录里的字段仍是
+`clockMonotonicRaw`，不将其当作 NPU 硬件计数器。
+
+| 配置 | Host wall/raw 偏移变化（μs/秒） | device 目录 wall/raw 偏移变化（μs/秒） |
+| --- | ---: | ---: |
+| token5，MTE 默认 | −2.863 | −3.866 |
+| token5，MTE 组合 | −1.420 | −2.424 |
+| token128，MTE 默认 | −2.441 | −2.304 |
+| token128，MTE 组合 | −1.128 | −2.016 |
+
+这些首末锚点的变化明显小于前述相对偏差变化，不能解释约 +29 μs/秒的趋势；
+只有首末记录，不能排除中间变化。当前额外 5 秒采样中，MONOTONIC−RAW 和
+REALTIME−RAW 的变化分别为 −0.047、+0.002 μs/秒，均与测量不确定度内稳定相容，
+但这次采样不能还原 11 月 12 日的系统状态。
+
+四组 Torch profiler 均保存 `syscnt_enable=false`。已读取的转换实现此时直接
+返回输入时间，不使用该分支的 `freq=100` 换算，不能将这个数值认作根因。
+这不等于 CANN 导出的 MSTX 也不需要频率：官方
+[MSTX 导出实现](https://github.com/Ascend/msprof/blob/master/analysis/viewer/msproftx_viewer.py)
+使用 Host counter 转换，
+[时钟转换实现](https://github.com/Ascend/msprof/blob/master/analysis/common_func/info_conf_reader.py)
+读取 CPU Frequency 与 Host 锚点；设备 counter 使用另一套频率和基准。
+官方当前源码说明需检查的路径，服务器实际安装实现仍需逐项核对。
+
+四次 `host_start.log` 还保存了 `cntvct` 与 `clock_monotonic_raw`。
+在同一主机和启动时域、计数器连续且各 CPU 计数器同步的前提下，按相邻采集的
+`Δcntvct / ΔRAW` 独立估计与 RAW 时间一致的有效换算频率：
+
+| 相邻采集 | RAW 时间跨度（秒） | 估计 Host counter 频率（MHz） |
+| --- | ---: | ---: |
+| token5 默认 → token5 组合 | 396.529931 | 3544.671972 |
+| token5 组合 → token128 默认 | 2119.366183 | 3544.671969 |
+| token128 默认 → token128 组合 | 663.456336 | 3544.671968 |
+
+三个估计接近，且独立于 MoE 握手。下一步对照 CANN 实际保存和使用的频率，
+判断是否存在足以解释相对偏差变化的换算误差；尚未读到实际值，不能宣布已经定因。
+RAW 自身可能也来自同一硬件 counter，这不是对物理振荡器的独立测量，
+也不能把 CPU counter 频率直接当作 NPU 频率。
+若只有 Host 频率换算出错、设备时间正确，给设备加的偏移应以
+`(实测频率 / 配置频率 − 1) × 10^6 μs/秒` 增长。因此必须同时核对数值和方向，
+不能仅因两种频率不同就定因；起始偏移还取决于各自基准。
+
+只读工具 `script/inspect_moe_profiler_clocks.py` 原先遗漏标准编号文件名
+`info.json.N`、`host_start.log.N`、`dev_start.log.N`，首次输出不代表这些文件不存在。
+补齐识别后，一次读取四组的 Host/设备频率、原始锚点和当前安装的 CANN 转换源码。
+工具不导入 Torch、不启动 NPU、不重新解析 profile，不修改原时间戳。
 不能用握手约束拟合偏移后，再将同一批握手数据满足约束当作独立验证。
 
 当前纯 MTE 严格等待路径要求同一次任务满足以下顺序：

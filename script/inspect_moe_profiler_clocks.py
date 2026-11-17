@@ -19,11 +19,13 @@ MAX_FILES = 64
 MAX_FILE_BYTES = 1024 * 1024
 MAX_FIELDS = 100
 MAX_SOURCE_LINES = 48
+MAX_CANN_SOURCE_LINES = 220
+MAX_METHOD_LINES = 40
 SAMPLE_INTERVAL_SECONDS = 0.5
 PROFILER_INFO = re.compile(r"profiler_info(?:_\d+)?\.json$")
 CANN_METADATA = re.compile(
-    r"(?:host_(?:start|end)[\w.-]*\.(?:log|json|txt)|"
-    r"(?:start|end)_info(?:\.\d+)?(?:\.json)?|info(?:\.\d+)?\.json)$"
+    r"(?:(?:host|dev)_(?:start|end)[\w-]*\.(?:log|json|txt)(?:\.\d+)?|"
+    r"(?:start|end)_info(?:\.\d+)?(?:\.json)?|info(?:\.\d+)?\.json(?:\.\d+)?)$"
 )
 CLOCK_KEYS = frozenset(
     (
@@ -35,6 +37,14 @@ CLOCK_KEYS = frozenset(
         "endmonotonic",
         "syscnt",
         "cntvct",
+        "cntvctdiff",
+        "counter",
+        "devicesyscnt",
+        "monotonictime",
+        "hwtsfrequency",
+        "aicfrequency",
+        "clockfrequency",
+        "sysclockfreq",
         "clockmonotonicraw",
         "collectiontimebegin",
         "collectiontimeend",
@@ -65,6 +75,29 @@ SOURCE_KEYWORDS = re.compile(
     r"msprof_timeline_data =|_prune_trace_by_level\(msprof_timeline_data\)"
 )
 NUMBER = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+NUMBER_WITH_UNIT = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*([A-Za-zµμ]+)$")
+UNITS = frozenset(("hz", "khz", "mhz", "ghz", "s", "ms", "us", "ns", "µs", "μs", "ticks", "cycles"))
+UNIT_KEYS = frozenset(("unit", "units", "timeunit", "clockunit", "counterunit", "frequnit", "frequencyunit"))
+CANN_ROOTS = (Path("/usr/local/Ascend/ascend-toolkit/latest"), Path("/usr/local/Ascend/cann-9.1.0"))
+CANN_SOURCE_PREFIXES = ("tools/profiler/profiler_tool", "tools/profiler", "profiler_tool", "")
+CANN_SOURCE_METHODS = (
+    (
+        "analysis/common_func/info_conf_reader.py",
+        (
+            "get_host_freq",
+            "time_from_host_syscnt",
+            "get_host_duration",
+            "time_from_syscnt",
+            "_load_dev_start_time",
+            "_load_host_start_time",
+            "get_freq",
+            "_load_local_time_offset",
+            "trans_into_local_time",
+        ),
+    ),
+    ("analysis/viewer/msproftx_viewer.py", ("format_tx_timeline_data", "format_tx_ex_timeline_data")),
+    ("analysis/profiling_bean/basic_info/host_start.py", ("__init__", "host_mon")),
+)
 
 
 def normalized(value):
@@ -146,10 +179,20 @@ def read_small(path):
 
 def parse_metadata(path):
     text = read_small(path)
-    if path.suffix == ".json":
+    if re.search(r"\.json(?:\.\d+)?$", path.name):
         return json.loads(text)
     if path.name.startswith(("start_info", "end_info")):
         return ast.literal_eval(text)
+    if path.name.startswith(("dev_start", "dev_end")) and not text.lstrip().startswith("["):
+        values = {}
+        for line in text.splitlines():
+            key, separator, value = line.partition(":")
+            key = key.strip()
+            if separator and normalized(key) in CLOCK_KEYS | UNIT_KEYS:
+                if key in values:
+                    raise ValueError("duplicate device clock field")
+                values[key] = value.strip()
+        return values
     parser = configparser.ConfigParser(interpolation=None)
     parser.optionxform = str
     parser.read_string(text)
@@ -176,6 +219,14 @@ def clock_fields(data):
                 ) or (isinstance(child, str) and NUMBER.fullmatch(child.strip()) is not None)
                 if name in CLOCK_KEYS and numeric:
                     found.append({"key": child_path, "value": child, "type": type(child).__name__})
+                elif name in CLOCK_KEYS and isinstance(child, str):
+                    match = NUMBER_WITH_UNIT.fullmatch(child.strip())
+                    if match and match[2].lower() in UNITS:
+                        found.append({"key": child_path, "value": child, "type": "unparsed_unit_string"})
+                    else:
+                        found.append({"key": child_path, "type": "unparsed_string", "value_omitted": True})
+                elif name in UNIT_KEYS and isinstance(child, str) and child.strip().lower() in UNITS:
+                    found.append({"key": child_path, "value": child, "type": "declared_unit"})
                 elif name == "syscntenable" and isinstance(child, bool):
                     found.append({"key": child_path, "value": child, "type": "bool"})
                 elif name in VERSION_KEYS and isinstance(child, str) and re.fullmatch(r"[\w.+-]{1,100}", child):
@@ -188,7 +239,9 @@ def clock_fields(data):
 
     visit(data, "", 0)
     if len(found) > MAX_FIELDS:
-        raise ValueError(f"more than {MAX_FIELDS} matching fields; provide smaller metadata")
+        found.sort(key=lambda row: not re.search(r"(?:^|\.)(?:CPU\[0\]|DeviceInfo(?:\[0\])?)\.", row["key"], re.I))
+        omitted = len(found) - MAX_FIELDS
+        found = found[:MAX_FIELDS] + [{"key": "<field_limit>", "type": "truncation", "omitted_count": omitted}]
     return found
 
 
@@ -234,6 +287,71 @@ def inspect_installed_source():
                 print(f"CLOCK_SOURCE {relative}:{index + 1}: {line.strip()}")
                 remaining -= 1
     print("SOURCE_SCOPE=selected conversion lines only; not executed, not a calibration")
+
+
+def cann_source_paths(roots):
+    """Probe fixed known installation layouts, never recursively walk the toolkit."""
+    if len(roots) > MAX_ROOTS:
+        raise ValueError(f"more than {MAX_ROOTS} CANN installation roots")
+    found = {}
+    for root in roots:
+        root = Path(root).expanduser()
+        for prefix in CANN_SOURCE_PREFIXES:
+            for relative, methods in CANN_SOURCE_METHODS:
+                path = (root / prefix / relative).resolve()
+                if path.is_file():
+                    found[path] = (relative, methods)
+    return sorted(found.items())
+
+
+def source_method_lines(text, names):
+    """Return method bodies as source text; parsing AST does not execute the module."""
+    lines, result = text.splitlines(), {}
+    tree = ast.parse(text)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+            excluded = set()
+            for statement in node.body:
+                if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant):
+                    if isinstance(statement.value.value, str):
+                        excluded.update(range(statement.lineno, statement.end_lineno + 1))
+            selected = [
+                (index, lines[index - 1])
+                for index in range(node.lineno, node.end_lineno + 1)
+                if index not in excluded and lines[index - 1].strip() and not lines[index - 1].lstrip().startswith("#")
+            ]
+            result.setdefault(node.name, []).append(selected)
+    return result
+
+
+def inspect_cann_source(roots):
+    paths = cann_source_paths(roots)
+    print(f"CANN_SOURCE_FILES={len(paths)}; installed source is not proof of the capture/export version")
+    seen, remaining = set(), MAX_CANN_SOURCE_LINES
+    for path, (relative, methods) in paths:
+        seen.add(relative)
+        try:
+            blocks = source_method_lines(read_small(path), methods)
+        except (OSError, ValueError, SyntaxError):
+            print(f"CANN_SOURCE_UNREADABLE={path}")
+            continue
+        print(f"CANN_SOURCE_FILE={path}")
+        for method in methods:
+            if method not in blocks:
+                print(f"CANN_METHOD_MISSING={method}")
+            for block in blocks.get(method, []):
+                count = min(len(block), MAX_METHOD_LINES, remaining)
+                print(f"CANN_METHOD={method}; lines={len(block)}; shown={count}; truncated={count < len(block)}")
+                for number, line in block[:count]:
+                    if re.search(r"environ|proxy|password|credential", line, re.I):
+                        print(f"  {number}: [sensitive source line omitted]")
+                    else:
+                        print(f"  {number}: {line}")
+                remaining -= count
+    for relative, _ in CANN_SOURCE_METHODS:
+        if relative not in seen:
+            print(f"CANN_SOURCE_MISSING={relative}")
+    print("CANN_SOURCE_SCOPE=fixed paths and selected method bodies only; never imported or executed")
 
 
 def sample_host_clocks(seconds):
@@ -293,18 +411,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("inputs", nargs="+", type=Path)
     parser.add_argument("--sample-host-clocks-seconds", type=sample_seconds, default=0)
+    parser.add_argument(
+        "--cann-root", action="append", type=Path, help="CANN installation root; repeat for multiple roots"
+    )
     args = parser.parse_args()
     print(
         "READ ONLY: existing small clock metadata and installed source; "
         "no Torch/model/NPU/parser processes, no file writes."
     )
     print("METADATA_VALUES=original values; no inferred units/frequencies or timestamp correction")
+    print("SCRIPT_REVISION=profiler_clocks_v2; unit-bearing strings remain unparsed; unknown strings are redacted")
     try:
         roots = discover_roots(args.inputs)
         print(f"PROFILE_ROOT_COUNT={len(roots)}")
         for root in roots:
             inspect_root(root)
         inspect_installed_source()
+        inspect_cann_source(args.cann_root or CANN_ROOTS)
         if args.sample_host_clocks_seconds:
             sample_host_clocks(args.sample_host_clocks_seconds)
     except (OSError, ValueError) as error:
