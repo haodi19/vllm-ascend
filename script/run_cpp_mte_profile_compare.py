@@ -180,6 +180,9 @@ def checked_groups(report, backend):
 def print_profile(backend, report, root):
     policy = report.get("cache_policy_backend", "cpp")
     print(f"PROFILE {backend}: status={report.get('profile_status')}; path={root / 'profile' / backend / policy}")
+    if "clock_alignment" in report:
+        print("CLOCK_ALIGNMENT", backend, json.dumps(report["clock_alignment"], ensure_ascii=False))
+        print("对齐文件仅用于可视化；本次原始间隔统计仍保留原口径，不自动替换历史统计。")
     for field in ("profile_errors", "profile_warnings"):
         items = report.get(field, [])
         if items:
@@ -614,6 +617,8 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             print("两组均为MTE晚等待＋cpp LRC；只改变加载流：sync_launch → ordinary。")
             print("普通流若请求超时则终止本轮，不跳过设备完成检查，不继续推理。")
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
+        if args.align_profile_clocks:
+            print("同次采集请求前后校准设备时钟；成功后导入trace_view_aligned.json，原trace保留。")
         print(f"表格文档：{root / 'experiment_tables.md'}；同样附在summary.txt末尾。", flush=True)
         if args.measure_tpot:
             print("流式TTFT/TPOT已开启；结果与miracle估算统一写入summary.txt。")

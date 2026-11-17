@@ -23,6 +23,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from align_moe_profile_clock import align_capture
+from inspect_moe_profiler_clocks import discover_roots
 from moe_expert_trace_report import write_trace
 from moe_tpot import streaming_completion
 
@@ -448,6 +450,9 @@ def completion_payloads(args, model):
 
 def _inference(args, source, backend, env, log):
     profile_enabled = not getattr(args, "skip_profile", False)
+    align_clocks = getattr(args, "align_profile_clocks", False)
+    if align_clocks and (not profile_enabled or not getattr(args, "mstx", False)):
+        raise ValueError("clock alignment requires profiler and MSTX")
     profile_dir = args.profile_run_dir / backend
     prefix, command, model, _ = launch_spec(
         source, backend, args.npu, args.port, args.timing_port, profile_dir, mstx=getattr(args, "mstx", False)
@@ -576,9 +581,15 @@ def _inference(args, source, backend, env, log):
         if profile_enabled:
             if getattr(args, "profile_compare", False):
                 ensure_profile_storage(profile_dir, stage="before start_profile")
+            if align_clocks:
+                request(opener, args.timing_port, "/clock/prepare", {}, timeout=args.profile_timeout)
             request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
         requests = []
+        clock_samples = None
         try:
+            if align_clocks:
+                clock_samples = request(opener, args.timing_port, "/clock/before", {}, timeout=args.profile_timeout)
+                (args.output_dir / "profile_clock_samples.json").write_text(json.dumps(clock_samples), encoding="utf-8")
             request(opener, args.timing_port, "/start", {})
             with progress(f"{backend} measured inference: {args.requests} requests"):
                 for request_index, payload in enumerate(payloads, 1):
@@ -607,6 +618,11 @@ def _inference(args, source, backend, env, log):
         finally:
             try:
                 report = request(opener, args.timing_port, "/stop", {}, timeout=40)
+                if align_clocks and len(requests) == args.requests:
+                    clock_samples = request(opener, args.timing_port, "/clock/after", {}, timeout=args.profile_timeout)
+                    (args.output_dir / "profile_clock_samples.json").write_text(
+                        json.dumps(clock_samples), encoding="utf-8"
+                    )
                 if len(requests) == args.requests:
                     print_inference_report(backend, report, requests, profile_enabled=profile_enabled)
                     baseline = getattr(args, "python_baseline_report", None)
@@ -615,6 +631,15 @@ def _inference(args, source, backend, env, log):
             finally:
                 profile_status = finish_profile(opener, args, profile_dir) if profile_enabled else "skipped"
         report["profile_status"] = profile_status
+        if align_clocks:
+            try:
+                roots = discover_roots([profile_dir])
+                if len(roots) != 1 or clock_samples is None or clock_samples.get("phase") != "after":
+                    raise ValueError("missing same-capture clock calibration")
+                report["clock_alignment"] = align_capture(roots[0], clock_samples["samples"])
+            except Exception as error:
+                report["clock_alignment"] = {"status": "failed", "error": str(error)}
+            print("CLOCK_ALIGNMENT " + json.dumps(report["clock_alignment"], ensure_ascii=False), flush=True)
         report["request_specs"] = request_specs
         if getattr(args, "measure_tpot", False):
             report["stream_samples"] = stream_samples["measured"]

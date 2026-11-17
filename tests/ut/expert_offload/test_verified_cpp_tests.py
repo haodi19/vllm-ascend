@@ -511,6 +511,84 @@ class TestVerifiedRunner(unittest.TestCase):
         self.assertIn("TIMERS + PROFILER", captured.getvalue())
         self.assertNotIn("NO PROFILER", captured.getvalue())
 
+    def test_clock_probes_are_outside_both_request_timing_windows(self):
+        fn = self.module["_inference"]
+        with tempfile.TemporaryDirectory() as directory:
+            args = types.SimpleNamespace(
+                npu=1,
+                port=8155,
+                timing_port=18155,
+                startup_timeout=20,
+                request_timeout=10,
+                warmup_requests=1,
+                requests=1,
+                timing_requests=2,
+                max_tokens=5,
+                output_dir=Path(directory),
+                profile_run_dir=Path(directory) / "profile",
+                profile_timeout=10,
+                mstx=True,
+                profile_compare=True,
+                align_profile_clocks=True,
+            )
+            sequence = []
+
+            def request(opener, port, path, payload=None, timeout=None):
+                sequence.append(path)
+                if path == "/status":
+                    return dict(backend="cpp", load_backend="python", mstx_enabled=True, active=False)
+                if path == "/v1/completions":
+                    return dict(choices=[{"text": "synthetic"}], usage={"completion_tokens": 5})
+                if path == "/stop":
+                    return dict(count=5, errors=0, dropped=0, groups=[])
+                if path.startswith("/clock/"):
+                    return dict(phase=path.rsplit("/", 1)[-1], samples=[{"sample": 0}])
+                return {}
+
+            process = Mock()
+            process.poll.return_value = None
+            align = Mock(return_value={"status": "calibration_validated", "aligned_trace": "synthetic.json"})
+            with (
+                patch.dict(
+                    fn.__globals__,
+                    {
+                        "request": request,
+                        "assert_port_free": Mock(),
+                        "stop_owned_service": Mock(),
+                        "wait_profile": Mock(),
+                        "ensure_profile_storage": Mock(),
+                        "discover_roots": Mock(return_value=[Path(directory)]),
+                        "align_capture": align,
+                    },
+                ),
+                patch("subprocess.Popen", return_value=process),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                result = fn(args, self.source, "cpp", {}, None)
+            self.assertEqual(
+                sequence,
+                [
+                    "/health",
+                    "/status",
+                    "/v1/completions",
+                    "/status",
+                    "/v1/completions",
+                    "/v1/completions",
+                    "/status",
+                    "/clock/prepare",
+                    "/start_profile",
+                    "/clock/before",
+                    "/start",
+                    "/v1/completions",
+                    "/stop",
+                    "/clock/after",
+                    "/stop_profile",
+                ],
+            )
+            align.assert_called_once_with(Path(directory), [{"sample": 0}])
+            self.assertEqual(result["clock_alignment"]["status"], "calibration_validated")
+            self.assertEqual(json.loads((Path(directory) / "profile_clock_samples.json").read_text())["phase"], "after")
+
     def test_skip_profile_preserves_requests_and_cleanup_without_reading_traces(self):
         fn = self.module["_inference"]
         for verification_suite, fail_measured in ((False, False), (False, True), (True, False), (True, True)):

@@ -276,8 +276,9 @@ class CallbackTimings:
             mstx_errors=self.marker_errors,
         )
 
-    def serve(self, port, expert_trace=None):
+    def serve(self, port, expert_trace=None, clock_device=None):
         collector = self
+        clock_probe = None
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -309,11 +310,26 @@ class CallbackTimings:
                 )
 
             def do_POST(self):
+                nonlocal clock_probe
                 try:
                     # Consume the control request body before closing HTTP/1.0;
                     # unread bytes can cause a TCP reset instead of a response.
                     self.rfile.read(int(self.headers.get("Content-Length", "0")))
-                    if self.path == "/expert_trace/start" and expert_trace is not None:
+                    if self.path.startswith("/clock/") and clock_device is not None:
+                        if collector.active or collector.inflight:
+                            raise ValueError("clock probe requires inactive callback measurement window")
+                        if self.path == "/clock/prepare":
+                            from vllm_ascend.expert_offload.clock_probe import ProfileClockProbe
+
+                            if clock_probe is not None:
+                                raise ValueError("clock probe already exists")
+                            clock_probe = ProfileClockProbe(clock_device)
+                            self.respond(200, clock_probe.prepare())
+                        elif self.path in ("/clock/before", "/clock/after") and clock_probe is not None:
+                            self.respond(200, clock_probe.measure(self.path.rsplit("/", 1)[-1]))
+                        else:
+                            raise ValueError("unknown or unprepared clock probe")
+                    elif self.path == "/expert_trace/start" and expert_trace is not None:
                         expert_trace.start()
                         self.respond(200, {"started": True})
                     elif self.path == "/expert_trace/stop" and expert_trace is not None:
@@ -382,5 +398,10 @@ def install_callback_timing(manager, port):
             torch=torch.__version__,
             torch_npu=torch_npu.__version__,
         )
-    collector.serve(port, expert_trace)
+    clock_device = None
+    if mstx is not None:
+        from torch_npu.npu import current_device
+
+        clock_device = current_device()
+    collector.serve(port, expert_trace, clock_device=clock_device)
     manager._callback_timing = collector

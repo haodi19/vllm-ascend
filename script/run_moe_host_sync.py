@@ -519,6 +519,11 @@ def parse_args(
         help="Diagnostic: keep early publication, defer strict prefetch wait to consumer join",
     )
     parser.add_argument("--skip-profile", action="store_true", help="Run finite requests without starting profiler")
+    parser.add_argument(
+        "--align-profile-clocks",
+        action="store_true",
+        help="Calibrate in the same capture and export a separate aligned trace",
+    )
     parser.add_argument("--expert-trace", action="store_true", help="Request-scoped expert IDs/copies; diagnostic only")
     parser.add_argument(
         "--diagnose-prefetch-wait-before-gate",
@@ -612,6 +617,10 @@ def parse_args(
         "--runtime-source", type=Path, help="Copy missing runtime build artifacts from an existing working checkout"
     )
     args = parser.parse_args(argv)
+    if args.align_profile_clocks and (args.skip_profile or args.compare_join_cost or args.expert_trace):
+        parser.error(
+            "--align-profile-clocks requires profiler/MSTX; incompatible with skip-profile, join-cost or expert-trace"
+        )
     args.profile_compare = profile_compare
     args.stream_compare = stream_compare
     args.three_way = three_way
@@ -896,6 +905,7 @@ def run(args, root):
             requests=args.requests,
             timing_requests=getattr(args, "timing_requests", 0),
             measure_tpot=getattr(args, "measure_tpot", False),
+            align_profile_clocks=getattr(args, "align_profile_clocks", False),
             expert_trace=getattr(args, "expert_trace", False),
             warmup_requests=args.warmup_requests,
             max_tokens=getattr(
