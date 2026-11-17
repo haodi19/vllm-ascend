@@ -4,9 +4,12 @@
 import argparse
 import bisect
 import collections
+import contextlib
 import json
 import math
 import re
+import sys
+from decimal import Decimal
 from pathlib import Path
 
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
@@ -738,16 +741,184 @@ def discover(paths):
     return sorted(found)
 
 
-def main():
+def compare_aligned(path, order_tolerance_us=DEFAULT_ORDER_TOLERANCE_US):
+    """Check an existing export; never fit clocks using the MoE ordering."""
+    path = path.resolve()
+    aligned_path = path.with_name("trace_view_aligned.json")
+    mapping = json.loads(path.with_name("clock_alignment.json").read_text(encoding="utf-8"))
+    if (
+        mapping.get("status") != "calibration_validated"
+        or mapping.get("calibration_layout") != "model_request_brackets"
+    ):
+        raise ValueError("need successful same-model-capture alignment")
+    if Path(mapping["source"]).resolve() != path or Path(mapping["aligned_trace"]).resolve() != aligned_path:
+        raise ValueError("clock mapping points to another trace")
+    raw, aligned = read_trace(path), read_trace(aligned_path)
+    if raw["all_hosts"] != aligned["all_hosts"] or raw["groups"] != aligned["groups"]:
+        raise ValueError("Host callback/synchronize records changed in aligned trace")
+    if raw["hardware"] != aligned["hardware"] or sorted(mapping["device_pids"]) != raw["hardware"]:
+        raise ValueError("device time domains do not match mapping")
+    if raw["tasks"].keys() != aligned["tasks"].keys():
+        raise ValueError("handshake stream set changed")
+    if not raw["tasks"]:
+        raise ValueError("no MTE handshake tasks; select mte_default/mte_combined")
+    scale, offset, origin = (Decimal(mapping[key]) for key in ("device_scale", "device_offset_us", "trace_origin_us"))
+    if scale <= 0:
+        raise ValueError("invalid clock scale")
+    results, incomplete, residual = [], 0, 0
+
+    def identity(record):
+        return tuple(record[key] for key in ("index", "name", "pid", "tid", "ids"))
+
+    for stream, tasks in sorted(raw["tasks"].items()):
+        corrected = aligned["tasks"][stream]
+        if len(tasks) != len(corrected) or any(identity(a) != identity(b) for a, b in zip(tasks, corrected)):
+            raise ValueError("handshake event identities/order changed")
+        for a, b in zip(tasks, corrected):
+            for edge in ("start", "end"):
+                expected = origin + (Decimal(str(a[edge])) - origin - offset) / scale
+                # Existing reader uses float at absolute epoch; allow <=1 us
+                # for conversion/quantization, not a MoE causal tolerance.
+                if abs(Decimal(str(b[edge])) - expected) > DEFAULT_ORDER_TOLERANCE_US:
+                    raise ValueError("handshake coordinates disagree with saved clock mapping")
+        pairs, raw_order = task_pairs(tasks, order_tolerance_us)
+        aligned_pairs, aligned_order = task_pairs(corrected, order_tolerance_us)
+        kinds = [
+            kind
+            for kind, hosts in raw["groups"].items()
+            if kind not in raw["invalid_kinds"] and pairs and len(pairs) == len(hosts)
+        ]
+        result = dict(
+            stream=stream,
+            name=raw["threads"].get(stream),
+            raw_order=raw_order,
+            aligned_order=aligned_order,
+            strict_raw_order=task_pairs(tasks)[1],
+            strict_aligned_order=task_pairs(corrected)[1],
+        )
+        if raw_order != "ok" or aligned_order != "ok" or len(kinds) != 1:
+            incomplete += 1
+            result.update(status="no_unique_complete_ordinal_candidate", candidate_kinds=kinds)
+            results.append(result)
+            continue
+        kind = kinds[0]
+        hosts = raw["groups"][kind]
+        result.update(kind=kind, pairs=len(pairs), status="ordinal_candidate_not_slot_identity_proof")
+        before_after = {}
+        for label, selected in (("raw", pairs), ("aligned", aligned_pairs)):
+            deltas = {
+                "host_start_minus_publish_start_us": [
+                    host["start"] - pub["start"] for (pub, wait), host in zip(selected, hosts)
+                ],
+                "wait_end_minus_sync_end_us": [
+                    wait["end"] - host["sync"]["end"] for (pub, wait), host in zip(selected, hosts)
+                ],
+                "wait_end_minus_host_end_us": [wait["end"] - host["end"] for (pub, wait), host in zip(selected, hosts)],
+            }
+            summary = {
+                name: dict(
+                    min_us=min(values),
+                    mean_us=sum(values) / len(values),
+                    negative_count=sum(value < 0 for value in values),
+                    below_minus_1us_count=sum(value < -DEFAULT_ORDER_TOLERANCE_US for value in values),
+                )
+                for name, values in deltas.items()
+            }
+            summary["wait_fully_inside_own_sync"] = sum(
+                host["sync"]["start"] <= wait["start"] <= wait["end"] <= host["sync"]["end"]
+                for (_, wait), host in zip(selected, hosts)
+            )
+            summary["wait_starts_in_prefetch_sync_ends_in_reactive_sync"] = cross_kind_overlap(
+                [wait for _, wait in selected], raw["groups"]
+            )["wait_start_prefetch_and_end_reactive"]
+            if label == "aligned":
+                residual += sum(value["below_minus_1us_count"] for value in summary.values() if isinstance(value, dict))
+            before_after[label] = summary
+        result.update(before_after)
+        # First and last instances aid visual lookup without changing the fit.
+        result["view_examples"] = [
+            dict(
+                context=hosts[index]["context"],
+                host_start_from_calibration_origin_us=hosts[index]["start"] - float(origin),
+                raw_wait_end_minus_sync_end_us=pairs[index][1]["end"] - hosts[index]["sync"]["end"],
+                aligned_wait_end_minus_sync_end_us=aligned_pairs[index][1]["end"] - hosts[index]["sync"]["end"],
+            )
+            for index in sorted({0, len(hosts) - 1})
+        ]
+        results.append(result)
+    kind_counts = collections.Counter(row["kind"] for row in results if "kind" in row)
+    ambiguous_kinds = sorted(
+        kind
+        for kind in set(raw["groups"]) | raw["invalid_kinds"]
+        if kind_counts[kind] != 1 or kind in raw["invalid_kinds"]
+    )
+    return dict(
+        source=str(path),
+        aligned_trace=str(aligned_path),
+        host_issues=raw["issues"],
+        host_counts={kind: len(hosts) for kind, hosts in raw["groups"].items()},
+        mapping_envelope_width_us=mapping.get("endpoint_mapping_envelope_width_us"),
+        streams=results,
+        unpaired_streams=incomplete,
+        ambiguous_or_uncovered_kinds=ambiguous_kinds,
+        remaining_negative_relations_over_1us=residual,
+        status="incomplete_pairing"
+        if incomplete or ambiguous_kinds
+        else "residual_negative_relations"
+        if residual
+        else "no_negative_relations_over_1us_in_ordinal_candidates",
+        scope="ordinal candidates only; all samples retained; no extra clock fit or IQR filtering",
+    )
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", help="existing trace_view.json files or run/profile directories")
+    parser.add_argument(
+        "--compare-aligned", action="store_true", help="Compare original/aligned MTE waits using saved calibration"
+    )
+    parser.add_argument(
+        "--summary-file", type=Path, help="Write a new compact alignment audit; never overwrite an existing file"
+    )
     parser.add_argument(
         "--order-tolerance-us",
         type=nonnegative_us,
         default=DEFAULT_ORDER_TOLERANCE_US,
         help="explicit tolerance for additional device-order candidates; strict result stays reported",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.summary_file and not args.compare_aligned:
+        parser.error("--summary-file requires --compare-aligned")
+    if args.compare_aligned:
+        with (
+            args.summary_file.open("x", encoding="utf-8")
+            if args.summary_file
+            else contextlib.nullcontext(sys.stdout) as report
+        ):
+
+            def output(label, value):
+                line = label + " " + json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+                print(line, file=report, flush=True)
+                if report is not sys.stdout:
+                    print(line, flush=True)
+
+            output("SCOPE", "只读本轮原图/对齐图；不导入Torch、不启动模型/NPU、不修改profile。仅写指定的新摘要。")
+            output("PAIRING", "按流内顺序和完整数量形成唯一候选，不按时间重叠配对；未证明slot/generation身份。")
+            output(
+                "TOLERANCE", dict(device_order_us=args.order_tolerance_us, causal_report_us=DEFAULT_ORDER_TOLERANCE_US)
+            )
+            try:
+                for path in discover(args.paths):
+                    result = compare_aligned(path, args.order_tolerance_us)
+                    streams = result.pop("streams")
+                    output("TRACE_COMPARISON", result)
+                    for stream in streams:
+                        output("WAIT_COMPARISON", stream)
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                output("FAILED", f"{type(exc).__name__}: {exc}")
+                return 1
+            output("DONE", "检查完成；负差值表示图上仍提前。零计数只说明候选序列无此矛盾，不证明协议或零误差。")
+        return 0
     print("只读已有 trace；不导入 Torch、不启动模型/NPU、不写文件。全部数值为原导出坐标，单位 us。", flush=True)
     print(
         f"额外顺序容差={args.order_tolerance_us:g} us，仅为诊断假设，不是已验证的计时精度；"

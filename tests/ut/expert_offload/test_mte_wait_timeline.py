@@ -11,10 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "script"))
 from diagnose_mte_wait_timeline import (
     analyze,
     candidate,
+    compare_aligned,
     containment,
     cross_kind_overlap,
     discover,
     layer_cycles,
+    main,
     neighbors,
     nonnegative_us,
     order_audit,
@@ -399,6 +401,85 @@ class TimelineTests(unittest.TestCase):
         data = self.read([*host_events(1, 50, layer="unknown"), *hardware_events(0, 30)])
         pairs, _ = task_pairs(data["tasks"]["hardware", "25"])
         self.assertEqual(layer_cycles(pairs, data["groups"]["prefetch"])["status"], "non_numeric_or_negative_layers")
+
+    def aligned_fixture(self, rows=None, shift=90):
+        self.read(rows if rows is not None else [*host_events(1, 100), *hardware_events(0, 30)])
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        for item in payload["traceEvents"]:
+            if item["pid"] == "hardware" and item["ph"] == "X":
+                item["ts"] += shift
+        aligned_path = self.path.with_name("trace_view_aligned.json")
+        aligned_path.write_text(json.dumps(payload), encoding="utf-8")
+        mapping = dict(
+            status="calibration_validated",
+            calibration_layout="model_request_brackets",
+            source=str(self.path.resolve()),
+            aligned_trace=str(aligned_path.resolve()),
+            device_scale="1",
+            device_offset_us=str(-shift),
+            trace_origin_us="0",
+            device_pids=["hardware"],
+        )
+        self.path.with_name("clock_alignment.json").write_text(json.dumps(mapping), encoding="utf-8")
+        return aligned_path
+
+    def test_aligned_audit_reports_before_after_without_refitting(self):
+        self.aligned_fixture()
+        result = compare_aligned(self.path)
+        self.assertEqual(result["remaining_negative_relations_over_1us"], 0)
+        stream = result["streams"][0]
+        self.assertEqual(stream["kind"], "prefetch")
+        self.assertEqual(stream["raw"]["wait_end_minus_sync_end_us"]["negative_count"], 1)
+        self.assertEqual(stream["aligned"]["wait_end_minus_sync_end_us"]["negative_count"], 0)
+        self.assertEqual(stream["aligned"]["wait_end_minus_sync_end_us"]["min_us"], 2)
+
+    def test_aligned_audit_retains_residual_contradictions(self):
+        self.aligned_fixture(shift=50)
+        result = compare_aligned(self.path)
+        self.assertEqual(result["status"], "residual_negative_relations")
+        self.assertEqual(result["streams"][0]["aligned"]["wait_end_minus_sync_end_us"]["min_us"], -38)
+
+    def test_aligned_audit_does_not_guess_kind_when_counts_match_both(self):
+        self.aligned_fixture([*host_events(1, 100), *host_events(2, 200, kind="reactive"), *hardware_events(0, 30)])
+        result = compare_aligned(self.path)
+        self.assertEqual(result["status"], "incomplete_pairing")
+        self.assertEqual(result["streams"][0]["status"], "no_unique_complete_ordinal_candidate")
+
+    def test_aligned_audit_rejects_changed_host_or_incorrect_device_transform(self):
+        for domain, pattern in (("host", "Host callback"), ("hardware", "coordinates disagree")):
+            aligned_path = self.aligned_fixture()
+            payload = json.loads(aligned_path.read_text(encoding="utf-8"))
+            item = next(
+                item
+                for item in payload["traceEvents"]
+                if item["pid"] == domain
+                and item["ph"] == "X"
+                and (domain == "host" or item["name"].startswith("host_sync_wait"))
+            )
+            item["ts"] += 3
+            aligned_path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, pattern):
+                compare_aligned(self.path)
+
+    def test_aligned_cli_writes_one_new_summary_and_preserves_traces(self):
+        aligned = self.aligned_fixture()
+        originals = {path: path.read_bytes() for path in (self.path, aligned)}
+        summary = self.path.with_name("audit.txt")
+        argv = [str(self.path), "--compare-aligned", "--summary-file", str(summary)]
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(argv), 0)
+        content = summary.read_text(encoding="utf-8")
+        self.assertIn("WAIT_COMPARISON", content)
+        self.assertIn("no_negative_relations_over_1us_in_ordinal_candidates", content)
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+        with self.assertRaises(FileExistsError):
+            main(argv)
+
+    def test_two_streams_for_same_host_sequence_remain_ambiguous(self):
+        self.aligned_fixture([*host_events(1, 100), *hardware_events(0, 30), *hardware_events(0, 30, tid="27")])
+        result = compare_aligned(self.path)
+        self.assertEqual(result["status"], "incomplete_pairing")
+        self.assertEqual(result["ambiguous_or_uncovered_kinds"], ["prefetch"])
 
 
 if __name__ == "__main__":

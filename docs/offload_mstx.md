@@ -239,6 +239,28 @@ Host MSTX 和 Host API 坐标保持原值，根元数据保留。未知时间域
 这个入口验证的是已有小张量图的时间轴转换，不能代替真实 MoE wait 的验收，
 也不把校准参数套用到另一份缺少时间基准的历史模型 profile。
 
+11 月 17 日 `moe_aligned_01` 的四组真实模型采集均完成同次校准与对齐导出。
+每组 24 个留出校准点在原图中全部越界，对齐后零容差越界数均为 0。
+早期回调、当前回调、MTE 默认、MTE 组合的修正前最大越界分别为
+182.209、170.810、175.134、188.185 μs；映射端点范围宽度约为 24～42 μs。
+这确认真实模型采集中的校准与导出流程通过，不等于已经逐个验收 MoE wait。
+
+对真实 wait 的后续核查使用
+`script/diagnose_mte_wait_timeline.py <MTE profile目录> --compare-aligned --summary-file <新文件>`。
+工具读取原图、对齐图和该采集的 `clock_alignment.json`，先核对 Host 标记未变、
+设备握手事件身份/顺序未变且坐标符合已保存映射，再按完整数量和流内顺序形成唯一候选。
+并列报告修正前后的 `wait_end − synchronize_end`、`wait_end − host_callback_end`、
+`host_callback_start − publish_start`，保留全部样本的负差值，另外列出小于 −1 μs 的数量。
+1 μs 是明确显示的检查容差，不把校准范围宽度当作自动放行阈值。
+同序号候选仍不等于 slot/generation 身份证明；若仍有负差值，会明确报告残留，
+不利用这些 wait 重新拟合或进一步移动时间轴。只写指定的新摘要，无须重新运行模型。
+
+查看对齐可视化时，将选定组的 `trace_view_aligned.json` 单独放入一个新目录，
+以 `trace_view.json` 文件名导入 MindStudio Insight 的时间线，保留原图供比较。
+不要直接导入原始采集根目录，以免工具优先读取原 DB 或原 `trace_view.json`。
+先搜索 `moe_offload/host_callback` 定位请求内的卸载阶段，再查看同层、同序号候选的
+`moe_offload/synchronize` 与设备 `host_sync_wait_2` 右边界；不按横向重叠认定对应关系。
+
 当前纯 MTE 严格等待路径要求同一次任务满足以下顺序：
 
 ```text
