@@ -12,9 +12,14 @@ from diagnose_mte_wait_timeline import (
     analyze,
     candidate,
     containment,
+    cross_kind_overlap,
     discover,
+    layer_cycles,
     neighbors,
+    nonnegative_us,
+    order_audit,
     read_trace,
+    shift_diagnostics,
     spanning_callbacks,
     task_pairs,
 )
@@ -220,6 +225,180 @@ class TimelineTests(unittest.TestCase):
             if line.startswith("CROSS_STREAM_SHIFT_HYPOTHESIS ")
         ]
         self.assertEqual({r["hardware_pid"] for r in results}, {"hardware", "second"})
+        self.assertTrue(all(row["coverage"] == "single_stream_only" for row in results))
+
+    def test_order_audit_reports_all_edge_overlaps_and_preserves_strict_result(self):
+        data = self.read(
+            [
+                event("host_sync_publish_1", 0, 2.25, "hardware", "27"),
+                event("host_sync_wait_2", 2, 20, "hardware", "27"),
+                event("host_sync_publish_1", 21.75, 2, "hardware", "27"),
+                event("host_sync_wait_2", 23.5, 10, "hardware", "27"),
+            ]
+        )
+        tasks = data["tasks"]["hardware", "27"]
+        before = json.dumps(tasks)
+        report = order_audit(tasks, 1.0)
+        self.assertEqual(report["strict_result"], "publish_wait_overlap_on_same_stream")
+        self.assertEqual(report["tolerance_result"], "ok")
+        self.assertEqual(report["publish_to_wait"]["overlap_us"]["count"], 2)
+        self.assertEqual(report["wait_to_next_publish"]["overlap_us"]["count"], 1)
+        self.assertEqual(report["publish_to_wait"]["overlap_us"]["max_us"], 0.25)
+        self.assertEqual(len(task_pairs(tasks, 1.0)[0]), 2)
+        self.assertEqual(task_pairs(tasks)[0], [])
+        self.assertEqual(json.dumps(tasks), before)
+
+    def test_tolerance_does_not_accept_large_overlap(self):
+        data = self.read(
+            [event("host_sync_publish_1", 0, 4, "hardware", "27"), event("host_sync_wait_2", 2, 20, "hardware", "27")]
+        )
+        report = order_audit(data["tasks"]["hardware", "27"], 1)
+        self.assertNotEqual(report["tolerance_result"], "ok")
+        self.assertEqual(report["publish_to_wait"]["above_tolerance"], 1)
+
+    def test_real_epoch_quarter_microsecond_overlap_preserves_strict_result(self):
+        epoch = 1_794_000_000_000_000.0
+        data = self.read(
+            [
+                event("host_sync_publish_1", epoch, 2.25, "hardware", "27"),
+                event("host_sync_wait_2", epoch + 2, 20, "hardware", "27"),
+            ]
+        )
+        tasks = data["tasks"]["hardware", "27"]
+        before = json.dumps(tasks)
+        report = order_audit(tasks, 1.0)
+        self.assertEqual(report["publish_to_wait"]["overlap_us"]["max_us"], 0.25)
+        self.assertEqual(report["strict_result"], "publish_wait_overlap_on_same_stream")
+        self.assertEqual(report["tolerance_result"], "ok")
+        self.assertEqual(task_pairs(tasks)[0], [])
+        self.assertEqual(len(task_pairs(tasks, 1.0)[0]), 1)
+        self.assertEqual(json.dumps(tasks), before)
+
+    def test_tolerance_does_not_accept_reversed_task_types(self):
+        data = self.read(
+            [event("host_sync_wait_2", 0, 2, "hardware", "27"), event("host_sync_publish_1", 2, 2, "hardware", "27")]
+        )
+        self.assertEqual(
+            order_audit(data["tasks"]["hardware", "27"], 1)["tolerance_result"], "not_alternating_publish_wait"
+        )
+
+    def test_analysis_labels_tolerated_candidate_separately(self):
+        self.read(
+            [
+                *host_events(1, 10),
+                event("host_sync_publish_1", 0, 2.25, "hardware", "27"),
+                event("host_sync_wait_2", 2, 40, "hardware", "27"),
+            ]
+        )
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            analyze(self.path)
+        output = capture.getvalue()
+        self.assertIn("ORDER_TOLERATED_ORDINAL_CANDIDATE", output)
+        self.assertIn('"strict_result":"publish_wait_overlap_on_same_stream"', output)
+        capture = io.StringIO()
+        with contextlib.redirect_stdout(capture):
+            analyze(self.path, 0)
+        self.assertNotIn("ORDER_TOLERATED_ORDINAL_CANDIDATE", capture.getvalue())
+
+    def test_shift_windows_expose_time_variation_without_filtering(self):
+        rows = []
+        for i, shift in enumerate((50, 50, 120, 120)):
+            rows.extend(host_events(i, 100 * i + shift, layer=i % 2))
+            rows.extend(hardware_events(100 * i, 100 * i + 30))
+        data = self.read(rows)
+        pairs, _ = task_pairs(data["tasks"]["hardware", "25"])
+        hosts = data["groups"]["prefetch"]
+        full = candidate(pairs, hosts)
+        diagnostics = shift_diagnostics(pairs, hosts, 2)
+        self.assertFalse(full["constant_shift_feasible"])
+        self.assertEqual(diagnostics["windows"]["total_windows"], 2)
+        self.assertEqual(diagnostics["windows"]["infeasible_windows"], 0)
+        self.assertEqual(diagnostics["binding_lower_sample"]["ordinal"], 2)
+        self.assertEqual(diagnostics["binding_upper_sample"]["ordinal"], 0)
+        self.assertEqual(diagnostics["binding_lower_sample"]["context"]["layer"], "0")
+        self.assertEqual(diagnostics["layers"]["infeasible_layers"], 2)
+
+    def test_diagnostic_rows_bounded_but_totals_complete(self):
+        rows = []
+        for i in range(160):
+            rows.extend(host_events(i, 100 * i + 50, layer=i % 40))
+            rows.extend(hardware_events(100 * i, 100 * i + 30))
+        data = self.read(rows)
+        pairs, _ = task_pairs(data["tasks"]["hardware", "25"])
+        diagnostics = shift_diagnostics(pairs, data["groups"]["prefetch"], 2)
+        self.assertEqual(diagnostics["windows"]["total_windows"], 80)
+        self.assertEqual(diagnostics["layers"]["total_layers"], 40)
+        self.assertLessEqual(len(diagnostics["windows"]["rows"]), 5)
+        self.assertLessEqual(len(diagnostics["layers"]["rows"]), 5)
+
+    def test_same_wait_cross_kind_overlap_count_not_independent_counts(self):
+        data = self.read(
+            [
+                *host_events(1, 0, duration=50),
+                *host_events(2, 60, kind="reactive", duration=50),
+                *hardware_events(10, 90),
+            ]
+        )
+        waits = [data["tasks"]["hardware", "25"][1]]
+        report = cross_kind_overlap(waits, data["groups"])
+        self.assertEqual(report["wait_start_prefetch_and_end_reactive"], 1)
+        self.assertEqual(report["same_layer_context"], 1)
+        self.assertEqual(report["examples"][0]["start_prefetch_context"]["call"], "1")
+        self.assertEqual(report["examples"][0]["end_reactive_context"]["call"], "2")
+        split = [dict(start=10, end=40), dict(start=70, end=90)]
+        self.assertEqual(cross_kind_overlap(split, data["groups"])["wait_start_prefetch_and_end_reactive"], 0)
+
+    def test_tolerance_converter_rejects_negative_nonfinite(self):
+        for value in ("nan", "inf", "-0.1"):
+            with self.assertRaises(ValueError):
+                order_audit([], float(value))
+        self.assertEqual(nonnegative_us("0"), 0)
+
+    def test_complete_layer_cycles_each_feasible_without_global_intersection(self):
+        rows = []
+        for i, (layer, shift) in enumerate(((3, 50), (4, 50), (3, 120), (4, 120))):
+            rows.extend(host_events(i, 100 * i + shift, layer=layer))
+            rows.extend(hardware_events(100 * i, 100 * i + 30))
+        data = self.read(rows)
+        pairs, _ = task_pairs(data["tasks"]["hardware", "25"])
+        result = layer_cycles(pairs, data["groups"]["prefetch"])
+        self.assertEqual(result["status"], "validated_complete_repetitions")
+        self.assertEqual(result["observed_layer_order"], [3, 4])
+        self.assertEqual(result["total_cycles"], 2)
+        self.assertEqual(result["infeasible_cycles"], 0)
+        self.assertEqual(result["global_necessary_bounds_us"], [110, 50])
+        self.assertEqual([row[0] for row in result["rows"]], [0, 1])
+
+    def test_missing_layer_in_one_cycle_not_silently_trimmed(self):
+        rows = []
+        for i, layer in enumerate((0, 1, 2, 0, 2)):
+            rows.extend(host_events(i, 100 * i + 50, layer=layer))
+            rows.extend(hardware_events(100 * i, 100 * i + 30))
+        data = self.read(rows)
+        pairs, _ = task_pairs(data["tasks"]["hardware", "25"])
+        result = layer_cycles(pairs, data["groups"]["prefetch"])
+        self.assertEqual(result["status"], "incomplete_or_nonrepeating_layer_sequence")
+        self.assertEqual(result["samples"], 5)
+        self.assertNotIn("rows", result)
+        self.assertEqual(result["first_mismatches"][0], dict(ordinal=4, actual=2, expected=1))
+
+    def test_partial_prefix_and_suffix_reported(self):
+        rows = []
+        for i, layer in enumerate((1, 2, 0, 1)):
+            rows.extend(host_events(i, 100 * i + 50, layer=layer))
+            rows.extend(hardware_events(100 * i, 100 * i + 30))
+        data = self.read(rows)
+        pairs, _ = task_pairs(data["tasks"]["hardware", "25"])
+        result = layer_cycles(pairs, data["groups"]["prefetch"])
+        self.assertTrue(result["partial_first_cycle"])
+        self.assertTrue(result["partial_last_cycle"])
+        self.assertNotIn("total_cycles", result)
+
+    def test_non_numeric_layer_cannot_claim_cycles(self):
+        data = self.read([*host_events(1, 50, layer="unknown"), *hardware_events(0, 30)])
+        pairs, _ = task_pairs(data["tasks"]["hardware", "25"])
+        self.assertEqual(layer_cycles(pairs, data["groups"]["prefetch"])["status"], "non_numeric_or_negative_layers")
 
 
 if __name__ == "__main__":

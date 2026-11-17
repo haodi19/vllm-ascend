@@ -5,6 +5,7 @@ import argparse
 import bisect
 import collections
 import json
+import math
 import re
 from pathlib import Path
 
@@ -15,6 +16,9 @@ MAX_TRACES = 16
 MAX_EXAMPLES = 3
 MAX_NEIGHBORS = 2
 PROGRESS_EVENTS = 500000
+DEFAULT_ORDER_TOLERANCE_US = 1.0
+SHIFT_WINDOW_PAIRS = 64
+MAX_DIAGNOSTIC_ROWS = 5
 CONTEXT_FIELDS = ("backend", "layer", "kind", "rows", "call")
 HANDSHAKE = re.compile(r"^host_sync_(publish|wait)(?:_\d+)?$")
 IDENTITY_FIELDS = frozenset(("streamid", "taskid", "connectionid", "correlationid", "modelid"))
@@ -148,7 +152,7 @@ def read_trace(path):
     )
 
 
-def task_pairs(tasks):
+def task_pairs(tasks, tolerance_us=0.0):
     """A stream must alternate publish/wait, without overlapping executions."""
     if len(tasks) % 2:
         return [], "odd_handshake_count"
@@ -157,12 +161,262 @@ def task_pairs(tasks):
         publish, wait = tasks[index : index + 2]
         if not publish["name"].startswith("host_sync_publish") or not wait["name"].startswith("host_sync_wait"):
             return [], "not_alternating_publish_wait"
-        if publish["end"] > wait["start"]:
+        if publish["end"] - wait["start"] > tolerance_us:
             return [], "publish_wait_overlap_on_same_stream"
-        if index and tasks[index - 1]["end"] > publish["start"]:
+        if index and tasks[index - 1]["end"] - publish["start"] > tolerance_us:
             return [], "successive_tasks_overlap_on_same_stream"
         pairs.append((publish, wait))
     return pairs, "ok" if pairs else "empty"
+
+
+def order_audit(tasks, tolerance_us):
+    """Retain the strict result and report every overlap, without adjusting times."""
+    if not math.isfinite(tolerance_us) or tolerance_us < 0:
+        raise ValueError("order tolerance must be finite and nonnegative")
+    _, strict_reason = task_pairs(tasks)
+    _, tolerant_reason = task_pairs(tasks, tolerance_us)
+    groups = {"publish_to_wait": [], "wait_to_next_publish": []}
+    for left, right in zip(tasks, tasks[1:]):
+        a, b = HANDSHAKE.fullmatch(left["name"]), HANDSHAKE.fullmatch(right["name"])
+        if a is None or b is None:
+            continue
+        key = (
+            "publish_to_wait"
+            if (a[1], b[1]) == ("publish", "wait")
+            else "wait_to_next_publish"
+            if (a[1], b[1]) == ("wait", "publish")
+            else None
+        )
+        if key is None or left["end"] <= right["start"]:
+            continue
+        groups[key].append(
+            dict(
+                overlap_us=left["end"] - right["start"],
+                left_index=left["index"],
+                left_name=left["name"],
+                left_start=left["start"],
+                left_end=left["end"],
+                right_index=right["index"],
+                right_name=right["name"],
+                right_start=right["start"],
+                right_end=right["end"],
+            )
+        )
+    report = dict(
+        strict_result=strict_reason,
+        tolerance_us=tolerance_us,
+        tolerance_result=tolerant_reason,
+        timestamps_modified=False,
+    )
+    for name, rows in groups.items():
+        values = [row["overlap_us"] for row in rows]
+        report[name] = dict(
+            overlap_us=_stats(values),
+            min_us=min(values, default=None),
+            above_tolerance=sum(value > tolerance_us for value in values),
+            examples=sorted(rows, key=lambda row: row["overlap_us"], reverse=True)[:MAX_EXAMPLES],
+        )
+    return report
+
+
+def shift_diagnostics(pairs, hosts, window_size=SHIFT_WINDOW_PAIRS):
+    """All ordinal samples retained; local bounds expose time/layer dependence."""
+    if window_size < 1:
+        raise ValueError("shift window must be positive")
+    if len(pairs) != len(hosts):
+        raise ValueError("shift diagnostics require equal pair and host counts")
+    samples = []
+    for ordinal, ((publish, wait), host) in enumerate(zip(pairs, hosts)):
+        samples.append(
+            dict(
+                ordinal=ordinal,
+                context=host["context"],
+                host_start=host["start"],
+                host_end=host["end"],
+                publish_start=publish["start"],
+                wait_start=wait["start"],
+                wait_end=wait["end"],
+                lower_us=host["end"] - wait["end"],
+                upper_us=host["start"] - publish["start"],
+            )
+        )
+    if not samples:
+        return {}
+    origin = samples[0]["host_start"]
+    windows = []
+    for first in range(0, len(samples), window_size):
+        rows = samples[first : first + window_size]
+        lower, upper = max(row["lower_us"] for row in rows), min(row["upper_us"] for row in rows)
+        windows.append(
+            [
+                first,
+                first + len(rows) - 1,
+                round((rows[0]["host_start"] - origin) / 1000, 3),
+                round((rows[-1]["host_start"] - origin) / 1000, 3),
+                lower,
+                upper,
+                lower <= upper,
+            ]
+        )
+    layers = collections.defaultdict(list)
+    for row in samples:
+        layers[row["context"]["layer"]].append(row)
+    layer_rows = []
+    for layer, rows in sorted(layers.items(), key=lambda entry: (len(str(entry[0])), str(entry[0]))):
+        lower_values = [row["lower_us"] for row in rows]
+        stats = _stats(lower_values)
+        lower, upper = max(lower_values), min(row["upper_us"] for row in rows)
+        layer_rows.append(
+            [
+                layer,
+                len(rows),
+                round(stats["mean_us"], 3),
+                stats["p50_us"],
+                stats["p95_us"],
+                lower,
+                upper,
+                lower <= upper,
+            ]
+        )
+    window_indices = sorted(
+        {
+            0,
+            len(windows) // 2,
+            len(windows) - 1,
+            max(range(len(windows)), key=lambda i: windows[i][4]),
+            min(range(len(windows)), key=lambda i: windows[i][5]),
+        }
+    )
+    worst_layers = sorted(range(len(layer_rows)), key=lambda i: layer_rows[i][5] - layer_rows[i][6], reverse=True)[:3]
+    layer_indices = sorted(
+        set(
+            worst_layers
+            + [
+                min(range(len(layer_rows)), key=lambda i: layer_rows[i][2]),
+                max(range(len(layer_rows)), key=lambda i: layer_rows[i][2]),
+            ]
+        )
+    )
+    return dict(
+        binding_lower_sample=max(samples, key=lambda row: row["lower_us"]),
+        binding_upper_sample=min(samples, key=lambda row: row["upper_us"]),
+        first_sample=samples[0],
+        last_sample=samples[-1],
+        windows=dict(
+            pair_count=window_size,
+            total_windows=len(windows),
+            infeasible_windows=sum(not row[6] for row in windows),
+            lower_range_us=[min(row[4] for row in windows), max(row[4] for row in windows)],
+            upper_range_us=[min(row[5] for row in windows), max(row[5] for row in windows)],
+            selection="first/middle/last/max-lower/min-upper windows; all windows computed",
+            columns=[
+                "first_ordinal",
+                "last_ordinal",
+                "first_rel_host_ms",
+                "last_rel_host_ms",
+                "lower_us",
+                "upper_us",
+                "feasible",
+            ],
+            rows=[windows[i] for i in window_indices][:MAX_DIAGNOSTIC_ROWS],
+        ),
+        layers=dict(
+            columns=[
+                "layer",
+                "n",
+                "lower_mean_us",
+                "lower_p50_us",
+                "lower_p95_us",
+                "lower_max_us",
+                "upper_min_us",
+                "feasible",
+            ],
+            total_layers=len(layer_rows),
+            infeasible_layers=sum(not row[7] for row in layer_rows),
+            selection="three worst lower-minus-upper gaps plus min/max lower-mean layers; all layers computed",
+            rows=[layer_rows[i] for i in layer_indices][:MAX_DIAGNOSTIC_ROWS],
+        ),
+        scope="same ordinal hypothesis; all samples retained; bounds are necessary, not calibrated offsets",
+    )
+
+
+def layer_cycles(pairs, hosts):
+    """Validate whole ascending repetitions of the observed numeric layer set."""
+    if not hosts or len(pairs) != len(hosts):
+        return dict(status="count_mismatch_or_empty", device_pairs=len(pairs), host_callbacks=len(hosts))
+    values = [host["context"].get("layer") for host in hosts]
+    if any(not re.fullmatch(r"\d+", str(value)) for value in values):
+        return dict(status="non_numeric_or_negative_layers")
+    layers = [int(value) for value in values]
+    order = sorted(set(layers))
+    common = dict(
+        observed_layer_order=order,
+        layer_count=len(order),
+        samples=len(hosts),
+        scope="complete repetitions of observed layers only; not proof of model-wide layer coverage",
+    )
+    if len(order) < 2:
+        return dict(status="insufficient_layer_span", **common)
+    mismatches = [index for index, layer in enumerate(layers) if layer != order[index % len(order)]]
+    if len(layers) % len(order) or mismatches:
+        return dict(
+            status="incomplete_or_nonrepeating_layer_sequence",
+            **common,
+            partial_first_cycle=layers[0] != order[0],
+            partial_last_cycle=layers[-1] != order[-1],
+            sample_count_remainder=len(layers) % len(order),
+            mismatched_positions=len(mismatches),
+            first_mismatches=[
+                dict(ordinal=index, actual=layers[index], expected=order[index % len(order)])
+                for index in mismatches[:MAX_EXAMPLES]
+            ],
+        )
+    rows = []
+    origin = hosts[0]["start"]
+    for cycle, first in enumerate(range(0, len(hosts), len(order))):
+        selected_pairs, selected_hosts = pairs[first : first + len(order)], hosts[first : first + len(order)]
+        lower = max(host["end"] - wait["end"] for (_, wait), host in zip(selected_pairs, selected_hosts))
+        upper = min(host["start"] - publish["start"] for (publish, _), host in zip(selected_pairs, selected_hosts))
+        rows.append(
+            [
+                cycle,
+                first,
+                first + len(order) - 1,
+                round((selected_hosts[0]["start"] - origin) / 1000, 3),
+                round((selected_hosts[-1]["start"] - origin) / 1000, 3),
+                lower,
+                upper,
+                lower <= upper,
+            ]
+        )
+    indices = sorted(
+        {
+            0,
+            len(rows) // 2,
+            len(rows) - 1,
+            max(range(len(rows)), key=lambda i: rows[i][5] - rows[i][6]),
+            max(range(len(rows)), key=lambda i: rows[i][5]),
+        }
+    )
+    return dict(
+        status="validated_complete_repetitions",
+        **common,
+        total_cycles=len(rows),
+        infeasible_cycles=sum(not row[7] for row in rows),
+        global_necessary_bounds_us=[max(row[5] for row in rows), min(row[6] for row in rows)],
+        selection="first/middle/last/worst-gap/max-lower cycles; all cycles computed; zero-based cycle index",
+        columns=[
+            "cycle",
+            "first_ordinal",
+            "last_ordinal",
+            "first_rel_host_ms",
+            "last_rel_host_ms",
+            "lower_us",
+            "upper_us",
+            "feasible",
+        ],
+        rows=[rows[index] for index in indices][:MAX_DIAGNOSTIC_ROWS],
+    )
 
 
 def candidate(pairs, hosts, valid=True):
@@ -220,6 +474,7 @@ def candidate(pairs, hosts, valid=True):
         ),
         constant_device_shift_necessary_bounds_us=[lower, upper],
         constant_shift_feasible=lower <= upper,
+        shift_diagnostics=shift_diagnostics(pairs, hosts),
         examples=examples,
     )
 
@@ -267,6 +522,46 @@ def spanning_callbacks(waits, hosts):
     )
 
 
+def cross_kind_overlap(waits, groups):
+    """The SAME wait begins in a prefetch sync and ends in a reactive sync."""
+    lookups = {}
+    for kind in ("prefetch", "reactive"):
+        rows = sorted(groups.get(kind, []), key=lambda row: row["sync"]["start"])
+        lookups[kind] = ([row["sync"]["start"] for row in rows], rows)
+
+    def containing(kind, value):
+        starts, rows = lookups[kind]
+        index = bisect.bisect_right(starts, value) - 1
+        if index >= 0 and value <= rows[index]["sync"]["end"]:
+            return rows[index]
+        return None
+
+    count, same_layer, examples = 0, 0, []
+    for wait in waits:
+        pre, react = containing("prefetch", wait["start"]), containing("reactive", wait["end"])
+        if pre is None or react is None:
+            continue
+        count += 1
+        same_layer += pre["context"]["layer"] == react["context"]["layer"]
+        if len(examples) < MAX_EXAMPLES:
+            examples.append(
+                dict(
+                    wait_start=wait["start"],
+                    wait_end=wait["end"],
+                    start_prefetch_context=pre["context"],
+                    end_reactive_context=react["context"],
+                    prefetch_sync=[pre["sync"]["start"], pre["sync"]["end"]],
+                    reactive_sync=[react["sync"]["start"], react["sync"]["end"]],
+                )
+            )
+    return dict(
+        wait_start_prefetch_and_end_reactive=count,
+        same_layer_context=same_layer,
+        examples=examples,
+        basis="raw-coordinate overlap for same wait; not task identity",
+    )
+
+
 def neighbors(path, tasks):
     """Nearest nonoverlapping time intervals, independent of JSON event order."""
     found = {}
@@ -307,7 +602,7 @@ def emit(label, value):
     print(label + " " + json.dumps(value, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
-def analyze(path):
+def analyze(path, order_tolerance_us=DEFAULT_ORDER_TOLERANCE_US):
     print(f"TRACE={path}; READ=1/2", flush=True)
     data = read_trace(path)
     emit(
@@ -342,6 +637,12 @@ def analyze(path):
     for key, tasks in sorted(data["tasks"].items()):
         waits = [item for item in tasks if item["name"].startswith("host_sync_wait")]
         pairs, reason = task_pairs(tasks)
+        audit = order_audit(tasks, order_tolerance_us)
+        chosen_reason = reason
+        pairing_basis = "strict_device_order"
+        if reason != "ok" and audit["tolerance_result"] == "ok":
+            pairs, chosen_reason = task_pairs(tasks, order_tolerance_us)
+            pairing_basis = "device_order_with_explicit_tolerance"
         emit(
             "DEVICE_STREAM",
             dict(
@@ -354,6 +655,8 @@ def analyze(path):
                 order=reason,
             ),
         )
+        emit("ORDER_AUDIT", dict(stream=key, **audit))
+        emit("RAW_CROSS_KIND_OVERLAP_NOT_PAIRING", dict(stream=key, **cross_kind_overlap(waits, data["groups"])))
         emit("RAW_WAIT_SPANS_NOT_PAIRING", dict(stream=key, **spanning_callbacks(waits, data["all_hosts"])))
         for item in nearby[key]:
             emit("DEVICE_NEIGHBORS", item)
@@ -362,10 +665,31 @@ def analyze(path):
             hosts = data["groups"].get(kind, [])
             emit("RAW_OVERLAP_NOT_PAIRING", dict(stream=key, kind=kind, **containment(waits, hosts)))
             result = (
-                candidate(pairs, hosts, kind not in data["invalid_kinds"]) if reason == "ok" else dict(status=reason)
+                candidate(pairs, hosts, kind not in data["invalid_kinds"])
+                if chosen_reason == "ok"
+                else dict(status=reason)
             )
             examples = result.pop("examples", [])
-            emit("ORDINAL_CANDIDATE", dict(stream=key, kind=kind, **result))
+            diagnostics = result.pop("shift_diagnostics", None)
+            label = (
+                "ORDINAL_CANDIDATE" if pairing_basis == "strict_device_order" else "ORDER_TOLERATED_ORDINAL_CANDIDATE"
+            )
+            emit(label, dict(stream=key, kind=kind, pairing_basis=pairing_basis, **result))
+            if diagnostics:
+                emit(
+                    "SHIFT_BINDING_SAMPLES",
+                    dict(
+                        stream=key,
+                        kind=kind,
+                        **{
+                            name: diagnostics[name]
+                            for name in ("binding_lower_sample", "binding_upper_sample", "first_sample", "last_sample")
+                        },
+                    ),
+                )
+                emit("SHIFT_WINDOWS", dict(stream=key, kind=kind, **diagnostics["windows"]))
+                emit("SHIFT_LAYERS", dict(stream=key, kind=kind, **diagnostics["layers"], scope=diagnostics["scope"]))
+                emit("SHIFT_LAYER_CYCLES", dict(stream=key, kind=kind, **layer_cycles(pairs, hosts)))
             for example in examples:
                 emit("CONTRADICTION_EXAMPLE", dict(stream=key, kind=kind, **example))
             if result["status"] == "ordinal_candidate_not_identity_proof":
@@ -373,14 +697,17 @@ def analyze(path):
         if len(usable) == 1:
             kind, result = usable[0]
             lower, upper = result["constant_device_shift_necessary_bounds_us"]
-            device_bounds[key[0]].append((key, kind, lower, upper))
+            device_bounds[key[0]].append((key, kind, lower, upper, pairing_basis))
     for pid, bounds in device_bounds.items():
         lower, upper = max(row[2] for row in bounds), min(row[3] for row in bounds)
         emit(
             "CROSS_STREAM_SHIFT_HYPOTHESIS",
             dict(
                 hardware_pid=pid,
+                candidate_stream_count=len(bounds),
+                coverage="multiple_streams" if len(bounds) > 1 else "single_stream_only",
                 candidate_stream_kinds=[(row[0], row[1]) for row in bounds],
+                candidate_order_basis=[(row[0], row[4]) for row in bounds],
                 necessary_bounds_us=[lower, upper],
                 feasible=lower <= upper,
                 prerequisite="pure MTE strict successful path required; kernel name alone is insufficient",
@@ -414,17 +741,38 @@ def discover(paths):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("paths", nargs="+", help="existing trace_view.json files or run/profile directories")
+    parser.add_argument(
+        "--order-tolerance-us",
+        type=nonnegative_us,
+        default=DEFAULT_ORDER_TOLERANCE_US,
+        help="explicit tolerance for additional device-order candidates; strict result stays reported",
+    )
     args = parser.parse_args()
     print("只读已有 trace；不导入 Torch、不启动模型/NPU、不写文件。全部数值为原导出坐标，单位 us。", flush=True)
+    print(
+        f"额外顺序容差={args.order_tolerance_us:g} us，仅为诊断假设，不是已验证的计时精度；"
+        "严格检查结果保留，不修改任何时间戳。",
+        flush=True,
+    )
     print("因果约束以本轮配置确认为纯 MTE 严格等待且成功完成为前提；同名算子不能排除有界诊断变体。", flush=True)
     try:
         paths = discover(args.paths)
         for path in paths:
-            analyze(path)
+            analyze(path, args.order_tolerance_us)
     except (OSError, ValueError, TypeError) as exc:
         print(f"FAILED: {type(exc).__name__}: {exc}; incomplete input is not evidence of protocol success", flush=True)
         return 1
     return 0
+
+
+def nonnegative_us(value):
+    try:
+        result = float(value)
+        if not math.isfinite(result) or result < 0:
+            raise ValueError
+        return result
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be finite nonnegative microseconds") from exc
 
 
 if __name__ == "__main__":
