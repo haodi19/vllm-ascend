@@ -597,7 +597,8 @@ def parse_args(
         parser.add_argument(
             "--measure-tpot",
             action="store_true",
-            help="Stream completions to measure TTFT/TPOT; historical non-streaming data cannot recover TTFT",
+            default=handoff_compare,
+            help="Compatibility flag: handoff comparisons always stream for primary Decode latency and TTFT/TPOT",
         )
         parser.add_argument(
             "--timing-requests",

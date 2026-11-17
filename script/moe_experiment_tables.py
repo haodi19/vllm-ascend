@@ -107,8 +107,11 @@ def render_tables(reports, labels, *, bubbles="", settings=None, failure=None):
         streams = window.get("stream_samples", [])
         if streams:
             stream_summary = summarize_streams(streams)
-            metrics.extend((name, stream_summary[key]) for name, key in (("TTFT", "ttft_ms"), ("TPOT", "tpot_ms")))
-        for name in ("端到端", "TTFT", "TPOT"):
+            metrics.extend(
+                (name, stream_summary[key])
+                for name, key in (("Decode（主数据）", "decode_ms"), ("TTFT", "ttft_ms"), ("TPOT", "tpot_ms"))
+            )
+        for name in ("Decode（主数据）", "端到端", "TTFT", "TPOT"):
             stats = next((value for metric, value in metrics if metric == name), {})
             raw, clean = stats.get("raw") or {}, stats.get("filtered") or {}
             rows.append(
@@ -126,11 +129,14 @@ def render_tables(reports, labels, *, bubbles="", settings=None, failure=None):
     lines.extend(
         [
             "",
-            "## 无profiler请求性能",
+            "## 无profiler请求性能：Decode为主数据",
             "",
             table(["组", "指标/ms", "n", "raw均值", "filtered均值", "raw P50", "raw P95", "剔除数"], rows),
             "",
+            "Decode=最后非空文本块到达−首个非空文本块到达；排除首字前阶段（含Prefill）和HTTP收尾，保留调度/传输开销。",
+            "它是客户端观测的后续生成总时延，不是纯NPU计算耗时；完整端到端仍含首字前阶段与HTTP收尾。",
             "TPOT=(最后文本块到达−首个文本块到达)/(实际输出token数−1)，MTP块数不等于token数。",
+            "缺少流式数据时Decode留空，不从独立筛选后的端到端与TTFT均值相减；单块输出不能反映设备内部Decode节奏。",
             "filtered使用3×IQR，各指标独立筛选，分项不可相加；统计长尾不等于已证实的外部干扰。",
         ]
     )

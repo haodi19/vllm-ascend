@@ -118,9 +118,64 @@ def summarize_streams(samples):
         valid_tpot=len(valid),
         undefined_single_token=len(samples) - len(valid),
         one_content_chunk=sum(sample["content_chunks"] == 1 for sample in samples),
+        completion_tokens_counts=dict(
+            sorted(collections.Counter(sample["completion_tokens"] for sample in samples).items())
+        ),
+        decode_ms=outlier_summary([sample["decode_us"] / 1000 for sample in samples]),
         ttft_ms=outlier_summary([sample["ttft_us"] / 1000 for sample in samples]),
         tpot_ms=outlier_summary([sample["tpot_us"] / 1000 for sample in valid]),
     )
+
+
+def print_decode_comparison(windows, labels):
+    """Report per-request post-first-content latency, never subtract filtered means."""
+    summaries = {}
+    reference = windows[labels[0]]
+    for label in labels:
+        window = windows[label]
+        if any(window[key] != reference[key] for key in ("count", "request_specs", "digests", "usage")):
+            raise ValueError("decode comparison requires matching request windows and outputs")
+        samples = window.get("stream_samples", [])
+        if len(samples) != window["count"] or not samples:
+            raise ValueError(f"{label}: missing complete streaming request window; cannot recover decode from E2E")
+        summaries[label] = summarize_streams(samples)
+    print("PRIMARY_METRIC=decode_ms；无profiler；Decode总时延=最后非空文本块到达−首个非空文本块到达。")
+    print("排除首字前阶段（含Prefill）和HTTP收尾；保留调度/传输开销，不代表纯NPU计算时间。")
+    print("逐请求计算后独立做3×IQR；不相减两个filtered均值，不用max_tokens推算实际输出数。")
+    for label, summary in summaries.items():
+        print(
+            "DECODE_NO_PROFILE "
+            + json.dumps(
+                dict(
+                    case=label,
+                    unit="ms",
+                    one_content_chunk=summary["one_content_chunk"],
+                    completion_tokens_counts=summary["completion_tokens_counts"],
+                    **summary["decode_ms"],
+                ),
+                ensure_ascii=False,
+            )
+        )
+        print(
+            "DECODE_SAMPLES_MS "
+            + label
+            + ": "
+            + json.dumps([s["decode_us"] / 1000 for s in windows[label]["stream_samples"]])
+        )
+    pairs = [(labels[0], label) for label in labels[1:]]
+    if "mte_default" in labels and "mte_combined" in labels:
+        pairs.append(("mte_default", "mte_combined"))
+    for baseline, candidate in pairs:
+        for scope in ("raw", "filtered"):
+            first, last = (summaries[label]["decode_ms"][scope]["mean"] for label in (baseline, candidate))
+            if first <= 0 or any(summaries[label]["one_content_chunk"] for label in (baseline, candidate)):
+                print(f"DECODE_DELTA_UNAVAILABLE {candidate} vs {baseline}: single-content-chunk or zero baseline")
+                break
+            print(
+                f"DECODE_DELTA {candidate} vs {baseline}: {scope}; delta_ms={last - first:+.3f}; "
+                f"delta_pct={100 * (last / first - 1):+.3f}%"
+            )
+    return summaries
 
 
 def read_host_intervals(path):

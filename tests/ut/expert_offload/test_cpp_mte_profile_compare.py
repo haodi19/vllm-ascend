@@ -267,7 +267,7 @@ class CppMteProfileTests(unittest.TestCase):
                     reports["mte_combined"]["worker_policy"]["scan"] = "all"
                 if wrong_policy == "legacy_debug":
                     reports["callback_legacy"]["moe_offload_debug"] = False
-                if wrong_policy == "tpot":
+                if args.measure_tpot:
                     self.assertTrue(args.measure_tpot)
                     for report in reports.values():
                         sample = dict(
@@ -277,6 +277,7 @@ class CppMteProfileTests(unittest.TestCase):
                             http_wall_us=1000,
                             tpot_us=200,
                             content_chunks=3,
+                            completion_tokens=5,
                         )
                         report["stream_samples"] = [sample]
                         report["request_window"]["stream_samples"] = [sample, sample]
@@ -317,6 +318,10 @@ class CppMteProfileTests(unittest.TestCase):
                     self.assertIn("自动在同次采集请求前后校准设备时钟", summary)
                     self.assertIn("profile_aligned修复版目录", summary)
                     self.assertIn("NO_PROFILE_COMBINED_VS_DEFAULT", summary)
+                    self.assertIn("PRIMARY_METRIC=decode_ms", summary)
+                    self.assertIn('"decode_ms":', summary)
+                    self.assertLess(summary.index("DECODE_NO_PROFILE"), summary.index("REQUEST_NO_PROFILE callback:"))
+                    self.assertIn("Decode（主数据） | 2 | 0.800", summary)
                     self.assertIn("mte_combined-mte_default=", summary)
                     self.assertIn(str(root / "profile/mte_combined/cpp"), summary)
                     self.assertNotIn("sync_launch-callback=", summary)
@@ -630,15 +635,22 @@ class CppMteProfileTests(unittest.TestCase):
             with self.subTest(value=value), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 self.args("--max-tokens", value)
 
-    def test_tpot_cli_is_opt_in_and_requires_handoff_comparison(self):
+    def test_handoff_streams_by_default_and_accepts_legacy_tpot_flag(self):
         self.assertFalse(self.args().measure_tpot)
         with patch.object(sys, "platform", "linux"):
             args = self.runner.parse_args(
-                ["--npu", "0", "--cache-policy-backend", "cpp", "--measure-tpot", "--include-legacy-callback"],
+                ["--npu", "0", "--cache-policy-backend", "cpp", "--include-legacy-callback"],
                 profile_compare=True,
                 handoff_compare=True,
             )
         self.assertTrue(args.measure_tpot and args.include_legacy_callback)
+        with patch.object(sys, "platform", "linux"):
+            compatible = self.runner.parse_args(
+                ["--npu", "0", "--cache-policy-backend", "cpp", "--measure-tpot"],
+                profile_compare=True,
+                handoff_compare=True,
+            )
+        self.assertTrue(compatible.measure_tpot)
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.args("--measure-tpot")
 

@@ -81,6 +81,26 @@ class ProfileTrialTests(unittest.TestCase):
         for position in range(4):
             self.assertEqual({order[position] for order in orders}, set(reference))
 
+    def test_repeated_trials_include_decode_as_primary_request_metric(self):
+        entry = self.entry()
+        sample = dict(
+            ttft_us=1000,
+            output_latency_us=3000,
+            decode_us=2000,
+            http_wall_us=4000,
+            tpot_us=500,
+            completion_tokens=5,
+            content_chunks=3,
+        )
+        for report in entry["reports"].values():
+            report["request_window"]["stream_samples"] = [sample] * 20
+        rows = self.module.observations(entry)
+        self.assertEqual(rows[0]["metric"], "Decode/ms")
+        self.assertEqual(rows[0]["mean"], 2)
+        result = self.module.render_trials([entry], 1, {})
+        self.assertIn("Decode/ms为主", result)
+        self.assertIn("Decode/ms", result)
+
     def test_equal_weight_trials_not_event_pooling_and_no_removed_trials(self):
         entries = [self.entry(value=100, count=1000), self.entry(trial=2, value=300, count=8)]
         text = self.module.render_trials(entries, 4, {})

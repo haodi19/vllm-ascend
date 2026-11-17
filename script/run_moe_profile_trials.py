@@ -70,14 +70,14 @@ def observations(entry):
                 )
 
         window = report.get("request_window", {})
+        if window.get("stream_samples"):
+            streams = summarize_streams(window["stream_samples"])
+            for name, key in (("Decode/ms", "decode_ms"), ("TTFT/ms", "ttft_ms"), ("TPOT/ms", "tpot_ms")):
+                stats = streams[key]
+                append(name, stats["raw"], filtered_mean=stats["filtered"].get("mean"))
         if window.get("samples_us"):
             result = outlier_summary([v / 1000 for v in window["samples_us"]])
             append("E2E/ms", result["raw"], filtered_mean=result["filtered"]["mean"])
-        if window.get("stream_samples"):
-            streams = summarize_streams(window["stream_samples"])
-            for name, key in (("TTFT/ms", "ttft_ms"), ("TPOT/ms", "tpot_ms")):
-                stats = streams[key]
-                append(name, stats["raw"], filtered_mean=stats["filtered"].get("mean"))
         if report.get("profile_status") not in VALID_INTERVAL_STATUSES:
             continue
         traces = report.get("profile_trace_data", [])
@@ -144,6 +144,8 @@ def render_trials(entries, expected, settings):
     lines += [
         table(["配置", "含义"], CASE_DESCRIPTIONS.items()),
         "",
+        "请求性能以无profiler Decode/ms为主：首个非空输出至最后非空输出，排除首字前阶段及HTTP收尾。",
+        "E2E/ms保留作对照；MTP按实际输出token计算TPOT，不以SSE块数代替token数。",
         "Host间隔=前一回调结束到后一回调开始；raw与3×IQR filtered并列。",
         "加载流对全部设备任务取占用并集（含MEMCPY、Transpose），仅保留10≤gap<5000μs，不再IQR。",
         "full_capture含Prefill；callback_window为首末卸载回调间连续范围。空泡不等于整卡空闲。",
@@ -227,7 +229,9 @@ def render_trials(entries, expected, settings):
         ]
     lines += ["方向关联partial仅是可唯一关联的子集，不能用其收益代替完整方向；不纳入下方跨轮收益表。", ""]
     aggregate = []
-    metrics = sorted({r["metric"] for r in rows if "subset" not in r["metric"]})
+    metrics = sorted(
+        {r["metric"] for r in rows if "subset" not in r["metric"]}, key=lambda name: (name != "Decode/ms", name)
+    )
     for metric in metrics:
         for label in LABELS:
             selected = [r for r in rows if r["case"] == label and r["metric"] == metric and r["comparable"]]

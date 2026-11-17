@@ -62,6 +62,51 @@ class TpotTests(unittest.TestCase):
         self.assertEqual(result["content_chunks"], 2)  # MTP chunks are not tokens.
         self.assertEqual(result["digest"], hashlib.sha256(b"abcde").hexdigest())
 
+    def test_decode_summary_uses_each_request_and_excludes_http_tail_with_variable_tokens(self):
+        sample = self.sample()
+        other = dict(
+            sample, completion_tokens=3, decode_us=40000, output_latency_us=50000, http_wall_us=60000, tpot_us=20000
+        )
+        summary = self.module.summarize_streams([sample, other])
+        self.assertEqual(summary["decode_ms"]["raw"]["mean"], 30)
+        self.assertEqual(summary["decode_ms"]["filtered"]["mean"], 30)
+        self.assertEqual(summary["completion_tokens_counts"], {3: 1, 5: 1})
+        self.assertEqual(summary["tpot_ms"]["raw"]["mean"], 12.5)
+        # Neither mean(TPOT)*mean(tokens-1) nor HTTP minus TTFT is Decode.
+        self.assertNotEqual(30, 12.5 * 3)
+        self.assertNotEqual(30, (40 + 60) / 2 - 10)
+
+    def test_decode_filters_per_request_before_aggregation(self):
+        samples = [
+            dict(self.sample(), decode_us=value * 1000, ttft_us=(1000000 if i == 9 else 10000))
+            for i, value in enumerate([10, 11, 12, 13, 14, 15, 16, 17, 18, 1000])
+        ]
+        for sample in samples:
+            sample["output_latency_us"] = sample["ttft_us"] + sample["decode_us"]
+            sample["http_wall_us"] = sample["output_latency_us"] + 1000
+            sample["tpot_us"] = sample["decode_us"] / 4
+        summary = self.module.summarize_streams(samples)
+        self.assertEqual(summary["decode_ms"]["removed_count"], 1)
+        self.assertEqual(summary["decode_ms"]["filtered"]["mean"], 14)
+
+    def test_decode_comparison_rejects_missing_streams_or_mismatched_outputs(self):
+        window = dict(count=2, request_specs=["fixed"] * 2, digests=["same"] * 2, usage=[5] * 2)
+        good = dict(window, stream_samples=[self.sample()] * 2)
+        for bad in (dict(good, stream_samples=[self.sample()]), dict(good, digests=["wrong"] * 2)):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.module.print_decode_comparison({"callback": good, "mte_default": bad}, ["callback", "mte_default"])
+
+    def test_single_chunk_does_not_claim_zero_decode_improvement(self):
+        sample = dict(self.sample(), content_chunks=1, decode_us=0, tpot_us=0, output_latency_us=10000)
+        window = dict(count=1, request_specs=["fixed"], digests=["same"], usage=[5], stream_samples=[sample])
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.module.print_decode_comparison(
+                {"callback": window, "mte_default": window}, ["callback", "mte_default"]
+            )
+        self.assertIn("DECODE_DELTA_UNAVAILABLE", output.getvalue())
+        self.assertNotIn("delta_pct=", output.getvalue())
+
     def test_single_output_token_is_undefined_and_one_chunk_is_visible(self):
         result = self.parse(tokens=1, text_chunks=("a",))
         self.assertIsNone(result["tpot_us"])

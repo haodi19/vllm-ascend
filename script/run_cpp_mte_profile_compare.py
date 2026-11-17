@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from moe_experiment_tables import VALID_INTERVAL_STATUSES, write_tables
 from moe_outlier_stats import group_outliers, outlier_summary
-from moe_tpot import print_tpot_comparison
+from moe_tpot import print_decode_comparison, print_tpot_comparison
 from mte_join_cost import LOAD_STATS
 from run_moe_host_sync import (
     WORKER_PROFILE_CASES,
@@ -251,6 +251,10 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
     if any(windows.values()):
         if not all(windows.values()):
             raise ValueError("部分组缺少独立请求计时窗口，不能比较")
+        if any(window.get("stream_samples") for window in windows.values()):
+            print_decode_comparison(windows, labels)
+        elif handoff_compare:
+            print("DECODE_UNAVAILABLE: 缺少流式样本；以下完整端到端数据仅作对照，不代替Decode主数据。")
         print("独立整体时延：profiler尚未启动，回调分项计时未开启；包装检查仍在，不是零插桩二进制。")
         for label, window in windows.items():
             print_request_window(label, window)
@@ -626,7 +630,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         print("自动在同次采集请求前后校准设备时钟；成功后导入profile_aligned修复版目录，原profile保留。")
         print(f"表格文档：{root / 'experiment_tables.md'}；同样附在summary.txt末尾。", flush=True)
         if args.measure_tpot:
-            print("流式TTFT/TPOT已开启；结果与miracle估算统一写入summary.txt。")
+            print("默认流式测量：以无profiler Decode总时延为主，完整端到端/TTFT/TPOT为对照；统一写入summary.txt。")
         if args.bubble_stream_name:
             print(f"自动统计加载流空泡：{args.bubble_stream_name}；精简结果及覆盖检查统一写入summary.txt。")
             print("只需返回summary.txt；bubble_details.log保留逐事件核查记录，不另生成bubble_summary.txt。")

@@ -28,11 +28,28 @@ class ExperimentTableTests(unittest.TestCase):
         result = self.module.render_tables({"mte_combined": report}, ["mte_combined"])
         self.assertIn("| mte_combined | 端到端 | 2 | 1500.000", result)
         self.assertIn("| mte_combined | TPOT | — | —", result)
+        self.assertIn("| mte_combined | Decode（主数据） | — | —", result)
         self.assertIn("| mte_combined | prefetch->reactive | 2 | 40.000", result)
         self.assertIn("incomplete | recovered_intervals", result)
         report["profile_status"] = "invalid"
         result = self.module.render_tables({"mte_combined": report}, ["mte_combined"])
         self.assertNotIn("| 40.000", result)
+
+    def test_decode_is_first_and_keeps_full_e2e_as_reference(self):
+        sample = dict(
+            ttft_us=1000,
+            output_latency_us=3000,
+            decode_us=2000,
+            http_wall_us=4000,
+            tpot_us=500,
+            completion_tokens=5,
+            content_chunks=3,
+        )
+        report = dict(request_window=dict(samples_us=[4000], stream_samples=[sample]))
+        result = self.module.render_tables({"mte_combined": report}, ["mte_combined"])
+        self.assertIn("| mte_combined | Decode（主数据） | 1 | 2.000", result)
+        self.assertIn("| mte_combined | 端到端 | 1 | 4.000", result)
+        self.assertLess(result.index("| Decode（主数据）"), result.index("| 端到端"))
 
     def test_bubbles_keep_scopes_counts_totals_and_partial_direction_warning(self):
         bubbles = "CASE=mte_combined; traces=1\n"
