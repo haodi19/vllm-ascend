@@ -92,9 +92,12 @@ class CppMteProfileTests(unittest.TestCase):
             self.assertEqual(report["profile_export_status"], "incomplete")
             self.assertEqual(report["profile_status"], "recovered_intervals")
             self.assertEqual(report["profile_trace_data"][0]["host_gaps"][0]["mean_us"], 20)
-            with contextlib.redirect_stdout(io.StringIO()):
+            report["aligned_profile"] = {"status": "exported", "directory": "profile_aligned/callback", "format": "db"}
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
                 self.assertTrue(self.compare.print_profile("callback", report, root))
                 bubbles = self.compare.loading_bubble_summary({"callback": report}, root, ["callback"], "Stream 56")
+            self.assertIn("IMPORT_ALIGNED_DIRECTORY callback: profile_aligned/callback; format=db", printed.getvalue())
             self.assertIn("TARGET_GAPS_US", bubbles)
             self.assertNotIn("BUBBLES_UNAVAILABLE", bubbles)
             wrong = self.report("incomplete")

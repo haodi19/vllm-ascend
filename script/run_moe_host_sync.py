@@ -522,7 +522,7 @@ def parse_args(
     parser.add_argument(
         "--align-profile-clocks",
         action="store_true",
-        help="Calibrate in the same capture and export a separate aligned trace",
+        help="Calibrate in the same capture and export an aligned trace plus an importable profile directory",
     )
     parser.add_argument("--expert-trace", action="store_true", help="Request-scoped expert IDs/copies; diagnostic only")
     parser.add_argument(
@@ -899,6 +899,7 @@ def run(args, root):
         run_args = SimpleNamespace(
             output_dir=directory,
             profile_run_dir=root / "profile" / label,
+            aligned_profile_dir=root / "profile_aligned" / label,
             npu=args.npu,
             port=port,
             timing_port=args.timing_port,

@@ -548,6 +548,7 @@ class TestVerifiedRunner(unittest.TestCase):
             process = Mock()
             process.poll.return_value = None
             align = Mock(return_value={"status": "calibration_validated", "aligned_trace": "synthetic.json"})
+            view = Mock(return_value={"status": "exported", "format": "db"})
             with (
                 patch.dict(
                     fn.__globals__,
@@ -559,6 +560,7 @@ class TestVerifiedRunner(unittest.TestCase):
                         "ensure_profile_storage": Mock(),
                         "discover_roots": Mock(return_value=[Path(directory)]),
                         "align_capture": align,
+                        "export_capture": view,
                     },
                 ),
                 patch("subprocess.Popen", return_value=process),
@@ -587,6 +589,12 @@ class TestVerifiedRunner(unittest.TestCase):
             )
             align.assert_called_once_with(Path(directory), [{"sample": 0}])
             self.assertEqual(result["clock_alignment"]["status"], "calibration_validated")
+            view.assert_called_once_with(
+                Path(directory),
+                align.return_value,
+                Path(directory) / "profile_aligned/cpp" / Path(directory).name,
+            )
+            self.assertEqual(result["aligned_profile"], view.return_value)
             self.assertEqual(json.loads((Path(directory) / "profile_clock_samples.json").read_text())["phase"], "after")
 
     def test_skip_profile_preserves_requests_and_cleanup_without_reading_traces(self):

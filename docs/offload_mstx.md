@@ -243,7 +243,7 @@ Host MSTX 和 Host API 坐标保持原值，根元数据保留。未知时间域
 每组 24 个留出校准点在原图中全部越界，对齐后零容差越界数均为 0。
 早期回调、当前回调、MTE 默认、MTE 组合的修正前最大越界分别为
 182.209、170.810、175.134、188.185 μs；映射端点范围宽度约为 24～42 μs。
-这确认真实模型采集中的校准与导出流程通过，不等于已经逐个验收 MoE wait。
+这确认真实模型采集中的校准与导出流程通过；后续 wait 核查结果如下。
 
 对真实 wait 的后续核查使用
 `script/diagnose_mte_wait_timeline.py <MTE profile目录> --compare-aligned --summary-file <新文件>`。
@@ -255,11 +255,48 @@ Host MSTX 和 Host API 坐标保持原值，根元数据保留。未知时间域
 同序号候选仍不等于 slot/generation 身份证明；若仍有负差值，会明确报告残留，
 不利用这些 wait 重新拟合或进一步移动时间轴。只写指定的新摘要，无须重新运行模型。
 
-查看对齐可视化时，将选定组的 `trace_view_aligned.json` 单独放入一个新目录，
-以 `trace_view.json` 文件名导入 MindStudio Insight 的时间线，保留原图供比较。
-不要直接导入原始采集根目录，以免工具优先读取原 DB 或原 `trace_view.json`。
+本轮两组 MTE 共 340 个候选配对在对齐后均没有出现 wait 早于对应 synchronize
+或 Host 回调结束，零容差下也没有负差值。预取 wait 完全包含在同步块内的数量，
+默认组由 58 降至 0，组合组由 50 降至 0；按需 wait 起点落在预取同步内、终点落在
+按需同步内的数量分别由 67、65 降至 0。未剔除样本、未按 wait 边界重新拟合。
+同一设备流内仍有不超过 1 μs 的 publish/wait 边界重叠，跨域修正不会消除这一现象。
+本轮原先的可视化倒序已消除；24～42 μs 是校准允许的映射范围宽度，不能解释为
+实测剩余误差，也不能据此声称所有边界精确到零误差。到此结束重复定位，使用同次校准导出。
+
+目录导入时 MindStudio 优先读取 `ascend_pytorch_profiler*.db`，其泳道组织与单独
+JSON 导入不同，参见 [MindStudio FAQ](https://github.com/Ascend/msinsight/blob/master/docs/zh/support/faq.md)。
+因此只替换 `trace_view.json` 无法修正仍被优先读取的数据库。开启 `--align-profile-clocks`
+后，完整实验脚本自动生成 `profile_aligned/<配置组>/<python或cpp>/<采集名>_ascend_pt/`。
+摘要中 `IMPORT_ALIGNED_DIRECTORY` 给出应导入的目录；原 `profile/` 与原统计不改写。
+
+新目录以标准名称 `ASCEND_PROFILER_OUTPUT/trace_view.json` 保存对齐图。有数据库时，
+先用全部 Host 校准标记确认数据库与 JSON 的纪元换算，再用同一次采集的专用 Add
+逐项确认设备时间单位、坐标和流的唯一性，最后在独立数据库副本中转换 `TASK.startNs/endNs`
+以及派生的 `OVERLAP_ANALYSIS`。模型、流、任务、连接、嵌套等标识保持不变，
+Host MSTX、CANN API、Python API 表保持原值。数据库完整性及转换后的校准点再次检查，
+不支持的结构或包含未校准通信域时明确报错，不默默混入旧任务时间。
+无数据库时生成 TEXT 目录；不会凭空创建 DB 布局。原始二进制和 MindStudio 旧解析缓存
+不复制，避免再次解析出旧时间轴。辅助 CSV/JSON 表保留原统计值，未重新计算跨域归属；
+它们不是本次对齐后的性能报告。目录实际显示仍以用户使用的 MindStudio 版本为准。
+
+已有 `moe_aligned_01` 不需要重跑模型，在项目根目录离线执行一次：
+
+```bash
+python -B script/export_moe_aligned_profile.py --run /data/w00919836/moeoffload/bench_results/moe_aligned_01
+```
+
+该命令只读取已有对齐结果并写新目录，不导入 Torch、不启动 NPU。成功时打印
+`ALIGNED_PROFILE` 的 `directory` 与 `format`。目录存在则拒绝覆盖；打开其中选定一组
+的 `*_ascend_pt` 目录，不同时导入原版与修正版，也无需单独选择 JSON。
 先搜索 `moe_offload/host_callback` 定位请求内的卸载阶段，再查看同层、同序号候选的
 `moe_offload/synchronize` 与设备 `host_sync_wait_2` 右边界；不按横向重叠认定对应关系。
+
+历史测量的影响按时间域区分：端到端、TTFT/TPOT、Host 分项与纯 Host 回调间隔
+不受这次 Host/NPU 对齐修正影响；miracle 的 Host 间隔减法也未使用设备时间，仍只是假设估算。
+纯设备流内间隔会抵消固定偏移，只受倍率影响，本轮约 37 ppm，即 1 ms 约变化 0.037 μs。
+但用 Host 回调窗口筛选设备任务、给设备空泡标注方向、排除与空载回调重叠的空泡，
+都依赖跨域对齐，样本归属可能改变，不能用上述微小倍率变化推断这些派生表完全不受影响。
+这些表需要用同次对齐图重新计算；没有同次校准的旧采集不能直接套用本轮参数。
 
 当前纯 MTE 严格等待路径要求同一次任务满足以下顺序：
 

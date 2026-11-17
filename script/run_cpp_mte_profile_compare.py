@@ -183,6 +183,12 @@ def print_profile(backend, report, root):
     if "clock_alignment" in report:
         print("CLOCK_ALIGNMENT", backend, json.dumps(report["clock_alignment"], ensure_ascii=False))
         print("对齐文件仅用于可视化；本次原始间隔统计仍保留原口径，不自动替换历史统计。")
+    view = report.get("aligned_profile")
+    if view:
+        if view.get("status") == "exported":
+            print(f"IMPORT_ALIGNED_DIRECTORY {backend}: {view['directory']}; format={view['format']}")
+        else:
+            print(f"ALIGNED_DIRECTORY_FAILED {backend}: {view.get('error')}; 原始 profile 保留。")
     for field in ("profile_errors", "profile_warnings"):
         items = report.get(field, [])
         if items:

@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 
 from align_moe_profile_clock import align_capture
+from export_moe_aligned_profile import export_capture
 from inspect_moe_profiler_clocks import discover_roots
 from moe_expert_trace_report import write_trace
 from moe_tpot import streaming_completion
@@ -640,6 +641,15 @@ def _inference(args, source, backend, env, log):
             except Exception as error:
                 report["clock_alignment"] = {"status": "failed", "error": str(error)}
             print("CLOCK_ALIGNMENT " + json.dumps(report["clock_alignment"], ensure_ascii=False), flush=True)
+            if report["clock_alignment"].get("status") == "calibration_validated":
+                try:
+                    view_base = getattr(args, "aligned_profile_dir", args.output_dir / "profile_aligned")
+                    report["aligned_profile"] = export_capture(
+                        roots[0], report["clock_alignment"], view_base / backend / roots[0].name
+                    )
+                except Exception as error:
+                    report["aligned_profile"] = {"status": "failed", "error": str(error)}
+                print("ALIGNED_PROFILE " + json.dumps(report["aligned_profile"], ensure_ascii=False), flush=True)
         report["request_specs"] = request_specs
         if getattr(args, "measure_tpot", False):
             report["stream_samples"] = stream_samples["measured"]
