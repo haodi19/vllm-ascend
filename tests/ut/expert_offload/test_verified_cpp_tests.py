@@ -511,7 +511,7 @@ class TestVerifiedRunner(unittest.TestCase):
         self.assertIn("TIMERS + PROFILER", captured.getvalue())
         self.assertNotIn("NO PROFILER", captured.getvalue())
 
-    def test_clock_probes_are_outside_both_request_timing_windows(self):
+    def test_profile_clock_correction_is_automatic_and_outside_request_timing_windows(self):
         fn = self.module["_inference"]
         with tempfile.TemporaryDirectory() as directory:
             args = types.SimpleNamespace(
@@ -529,7 +529,6 @@ class TestVerifiedRunner(unittest.TestCase):
                 profile_timeout=10,
                 mstx=True,
                 profile_compare=True,
-                align_profile_clocks=True,
             )
             sequence = []
 

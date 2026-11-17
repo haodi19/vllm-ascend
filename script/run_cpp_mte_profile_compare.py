@@ -623,8 +623,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             print("两组均为MTE晚等待＋cpp LRC；只改变加载流：sync_launch → ordinary。")
             print("普通流若请求超时则终止本轮，不跳过设备完成检查，不继续推理。")
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
-        if args.align_profile_clocks:
-            print("同次采集请求前后校准设备时钟；成功后导入trace_view_aligned.json，原trace保留。")
+        print("自动在同次采集请求前后校准设备时钟；成功后导入profile_aligned修复版目录，原profile保留。")
         print(f"表格文档：{root / 'experiment_tables.md'}；同样附在summary.txt末尾。", flush=True)
         if args.measure_tpot:
             print("流式TTFT/TPOT已开启；结果与miracle估算统一写入summary.txt。")

@@ -451,9 +451,10 @@ def completion_payloads(args, model):
 
 def _inference(args, source, backend, env, log):
     profile_enabled = not getattr(args, "skip_profile", False)
-    align_clocks = getattr(args, "align_profile_clocks", False)
-    if align_clocks and (not profile_enabled or not getattr(args, "mstx", False)):
-        raise ValueError("clock alignment requires profiler and MSTX")
+    # Host/device visualization always includes same-capture clock correction.
+    # MSTX is already enabled by the normal MoE profile presets. Runs without
+    # profiling or without Host ranges do not collect these calibration probes.
+    align_clocks = profile_enabled and getattr(args, "mstx", False)
     profile_dir = args.profile_run_dir / backend
     prefix, command, model, _ = launch_spec(
         source, backend, args.npu, args.port, args.timing_port, profile_dir, mstx=getattr(args, "mstx", False)

@@ -38,6 +38,12 @@ class CppMteProfileTests(unittest.TestCase):
         self.storage = self.enterContext(patch.object(self.runner, "ensure_profile_storage"))
         self.inference_storage = self.enterContext(patch.object(self.infer, "ensure_profile_storage"))
 
+    def test_clock_alignment_is_not_a_cli_switch(self):
+        self.assertFalse(hasattr(self.args(), "align_profile_clocks"))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as rejected:
+            self.args("--align-profile-clocks")
+        self.assertEqual(rejected.exception.code, 2)
+
     def report(self, status="complete"):
         return dict(
             units="us",
@@ -308,6 +314,8 @@ class CppMteProfileTests(unittest.TestCase):
                     self.assertIn("只需返回summary.txt", tpot)
                 if not failed:
                     summary = (root / "summary.txt").read_text(encoding="utf-8")
+                    self.assertIn("自动在同次采集请求前后校准设备时钟", summary)
+                    self.assertIn("profile_aligned修复版目录", summary)
                     self.assertIn("NO_PROFILE_COMBINED_VS_DEFAULT", summary)
                     self.assertIn("mte_combined-mte_default=", summary)
                     self.assertIn(str(root / "profile/mte_combined/cpp"), summary)
@@ -600,7 +608,7 @@ class CppMteProfileTests(unittest.TestCase):
             self.assertEqual(reports["mte"]["request_us"], 1000.0)
             scan.assert_not_called()
 
-    def test_profile_inference_does_not_copy_or_rescan_trace_and_keeps_failed_export_report(self):
+    def test_profile_export_failure_keeps_timings_without_publishing_aligned_view(self):
         self.check_inference_sequence(0)
 
     def test_repeated_requests_precede_profiler_and_survive_export_failure(self):
@@ -775,6 +783,8 @@ class CppMteProfileTests(unittest.TestCase):
                 )
             if path == "/stop":
                 return dict(count=2, errors=0, dropped=0, groups=[], mstx_enabled=True)
+            if path.startswith("/clock/"):
+                return dict(phase=path.rsplit("/", 1)[-1], samples=[{"sample": 0}])
             return {}
 
         process = Mock(pid=123, returncode=None)
@@ -793,6 +803,9 @@ class CppMteProfileTests(unittest.TestCase):
             patch.object(self.infer, "wait_service_ports_free"),
             patch.object(self.infer.subprocess, "Popen", return_value=process),
             patch.object(self.infer, "finish_profile", return_value="incomplete") as finish,
+            patch.object(self.infer, "discover_roots", return_value=[]),
+            patch.object(self.infer, "align_capture") as align,
+            patch.object(self.infer, "export_capture") as aligned_view,
             patch.object(self.infer, "inspect_mstx_trace", side_effect=AssertionError("duplicate scan")),
             contextlib.redirect_stdout(io.StringIO()),
         ):
@@ -809,9 +822,22 @@ class CppMteProfileTests(unittest.TestCase):
             ["/health", "/status"]
             + ["/v1/completions"] * 3
             + (["/status"] + ["/v1/completions"] * timing_count + ["/status"] if timing_count else [])
-            + ["STORAGE", "/start_profile", "/start", "/v1/completions", "/stop"],
+            + [
+                "STORAGE",
+                "/clock/prepare",
+                "/start_profile",
+                "/clock/before",
+                "/start",
+                "/v1/completions",
+                "/stop",
+                "/clock/after",
+            ],
         )
         self.assertEqual(result["profile_status"], "incomplete")
+        self.assertEqual(result["clock_alignment"]["status"], "failed")
+        self.assertNotIn("aligned_profile", result)
+        align.assert_not_called()
+        aligned_view.assert_not_called()
         self.assertEqual(len(result["digests"]), 1)
         self.assertEqual(result["request_specs"][0]["max_tokens"], max_tokens)
         self.assertEqual(result["request_specs"][0].get("ignore_eos", False), ignore_eos)

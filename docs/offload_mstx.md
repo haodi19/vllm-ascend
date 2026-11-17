@@ -205,7 +205,9 @@ RAW 速率允许范围分别为 −39.733～−17.537、−36.912～−18.517 μ
 与旧 MoE 采集中约 29 μs/秒的相对偏差方向和量级一致。本问题停止重复校准排查，
 后续转为可视化对齐；尚不指定错误属于物理时钟、驱动还是 CANN 的具体实现。
 
-四组实验入口新增 `--align-profile-clocks`，显式开启同次采集校准和可视化导出。
+MoE 可视化实验自动执行同次采集校准和修复版目录导出，不再提供单独的对齐开关。
+沿用原四组实验命令即可；之前额外添加的 `--align-profile-clocks` 应从命令中删除。
+不采集 profile 的专家追踪、无采集计时等流程不运行校准。
 完成无 profiler 请求计时后，控制线程预热一个专用小张量 Add 流；profiler 启动后、
 正式采集请求前记录 24 个校准点，所有请求及回调计时结束后再记录 24 个。
 两段均在同一 EngineCore、设备及 profile 内，不插入模型层或 MoE worker 的热路径。
@@ -265,8 +267,8 @@ Host MSTX 和 Host API 坐标保持原值，根元数据保留。未知时间域
 
 目录导入时 MindStudio 优先读取 `ascend_pytorch_profiler*.db`，其泳道组织与单独
 JSON 导入不同，参见 [MindStudio FAQ](https://github.com/Ascend/msinsight/blob/master/docs/zh/support/faq.md)。
-因此只替换 `trace_view.json` 无法修正仍被优先读取的数据库。开启 `--align-profile-clocks`
-后，完整实验脚本自动生成 `profile_aligned/<配置组>/<python或cpp>/<采集名>_ascend_pt/`。
+因此只替换 `trace_view.json` 无法修正仍被优先读取的数据库。完整实验脚本在校准通过后
+自动生成 `profile_aligned/<配置组>/<python或cpp>/<采集名>_ascend_pt/`。
 摘要中 `IMPORT_ALIGNED_DIRECTORY` 给出应导入的目录；原 `profile/` 与原统计不改写。
 
 新目录以标准名称 `ASCEND_PROFILER_OUTPUT/trace_view.json` 保存对齐图。有数据库时，
