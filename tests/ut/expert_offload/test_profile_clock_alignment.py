@@ -1,10 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
+import builtins
+import contextlib
+import io
 import json
+import shutil
 import sys
 import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "script"))
 import align_moe_profile_clock as alignment
@@ -153,6 +158,58 @@ class ProfileAlignmentTests(unittest.TestCase):
         aligned = alignment.transform_event(device_flow, mapping, counts)
         self.assertLess(abs(Decimal(aligned["ts"]) - self.origin), 1)
         self.assertEqual(aligned["id"], 10)
+
+    def test_standalone_does_not_relax_model_capture_requirements(self):
+        rows = [{key: value for key, value in row.items() if key != "phase"} for row in self.rows]
+        with self.assertRaisesRegex(ValueError, "before/after"):
+            alignment.fit_alignment(self.root, rows)
+        result = alignment.fit_alignment(self.root, rows, require_model_phases=False)
+        self.assertEqual(result["calibration_layout"], "standalone_calibration")
+        self.assertEqual(result["held_out_before"]["outside_bracket_1us_tolerance"], 8)
+        self.assertEqual(result["held_out_after"]["outside_bracket_1us_tolerance"], 0)
+        self.assertEqual(result["held_out_after"]["max_distance_outside_us"], "0")
+        with self.assertRaisesRegex(ValueError, "at least 16"):
+            alignment.fit_alignment(self.root, rows[:8], require_model_phases=False)
+
+    def saved_calibration(self):
+        run = Path(self.temp.name) / "saved_run"
+        rows = [{key: value for key, value in row.items() if key != "phase"} for row in self.rows]
+        for mode in ("eager", "graph"):
+            case = run / mode
+            shutil.copytree(self.root, case / "profile" / self.root.name)
+            (case / "host_brackets.json").write_text(json.dumps(rows), encoding="utf-8")
+        return run, Path(self.temp.name) / "offline_result"
+
+    def test_saved_calibration_command_preserves_inputs_without_torch(self):
+        run, output = self.saved_calibration()
+        originals = {path: path.read_bytes() for path in run.rglob("*") if path.is_file()}
+        real_import = builtins.__import__
+
+        def check_import(name, *args, **kwargs):
+            if name.split(".")[0] in ("torch", "torch_npu"):
+                raise AssertionError("offline alignment must not import device libraries")
+            return real_import(name, *args, **kwargs)
+
+        with contextlib.redirect_stdout(io.StringIO()), mock.patch("builtins.__import__", side_effect=check_import):
+            result = alignment.main(["--calibration-run", str(run), "--output-dir", str(output)])
+        self.assertEqual(result, 0)
+        self.assertEqual({path: path.read_bytes() for path in run.rglob("*") if path.is_file()}, originals)
+        for mode in ("eager", "graph"):
+            self.assertTrue((output / mode / "trace_view_aligned.json").is_file())
+            mapping = json.loads((output / mode / "clock_alignment.json").read_text(encoding="utf-8"))
+            self.assertEqual(mapping["held_out_after"]["outside_bracket_1us_tolerance"], 0)
+        self.assertIn("PASS", (output / "summary.txt").read_text(encoding="utf-8"))
+
+    def test_saved_calibration_failure_is_reported_without_overwriting_inputs(self):
+        run, output = self.saved_calibration()
+        samples = run / "graph/host_brackets.json"
+        samples.write_text("[]", encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(alignment.align_saved_calibration(run, output), 1)
+        self.assertTrue((output / "eager/trace_view_aligned.json").is_file())
+        self.assertFalse((output / "graph/trace_view_aligned.json").exists())
+        self.assertEqual(samples.read_text(encoding="utf-8"), "[]")
+        self.assertIn("ALIGNMENT_FAILED mode=graph", (output / "summary.txt").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

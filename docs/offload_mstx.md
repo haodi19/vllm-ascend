@@ -229,6 +229,16 @@ Host MSTX 和 Host API 坐标保持原值，根元数据保留。未知时间域
 现阶段原始实验统计继续保留原口径；对齐文件不自动替换历史空泡表，也不宣称已完成
 底层计时修复或 MoE 协议精度验收。真实 PR 上的采集与 MindStudio 展示需要运行验证。
 
+模型因专家 pinned memory 分配失败而无法启动时，可先离线验证对齐导出：
+`python -B script/align_moe_profile_clock.py --calibration-run <已有小张量校准目录> --output-dir <新目录>`。
+输入为原 eager / graph 两组的 `host_brackets.json` 和各自 profile；这些记录来自同次采集，
+因此可以使用。工具不导入 Torch、不初始化 NPU、不加载模型，不修改原目录。
+沿用模型对齐的拟合、留出样本检查及转换实现，分别生成两组 `trace_view_aligned.json`，
+并在一个 `summary.txt` 中列出修正前后的留出样本越界数、最大越界距离和输出路径。
+普通模型采集仍要求请求前后的校准点；独立校准采集按时间顺序使用原记录，不伪造请求阶段。
+这个入口验证的是已有小张量图的时间轴转换，不能代替真实 MoE wait 的验收，
+也不把校准参数套用到另一份缺少时间基准的历史模型 profile。
+
 当前纯 MTE 严格等待路径要求同一次任务满足以下顺序：
 
 ```text

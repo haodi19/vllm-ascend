@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Create a separate aligned trace using probes from the SAME model capture."""
+"""Create a separate aligned trace using probes from the SAME capture."""
 
 import argparse
 import collections
@@ -9,20 +9,36 @@ from pathlib import Path
 
 from analyze_callback_gaps import _TraceReader, events
 from calibrate_moe_profiler_clock import MARKER_PREFIX, affine_clock_bounds
-from inspect_moe_profiler_clocks import metadata_files, parse_metadata
+from inspect_moe_profiler_clocks import discover_roots, metadata_files, parse_metadata
 
 QUANTIZATION_US = Decimal("1")
 MIN_SAMPLES_PER_PHASE = 8
 
 
-def fit_alignment(root, rows):
+def boundary_stats(measurements, scale=Decimal(1), offset=Decimal(0)):
+    distances = [
+        max(Decimal(0), submit - (start - offset) / scale, (end - offset) / scale - sync)
+        for submit, sync, start, end in measurements
+    ]
+    return {
+        "n": len(distances),
+        "outside_bracket_zero_tolerance": sum(distance > 0 for distance in distances),
+        "outside_bracket_1us_tolerance": sum(distance > QUANTIZATION_US for distance in distances),
+        "max_distance_outside_us": str(max(distances, default=Decimal(0))),
+    }
+
+
+def fit_alignment(root, rows, *, require_model_phases=True):
     if [row["sample"] for row in rows] != list(range(len(rows))):
         raise ValueError("incomplete calibration sample sequence")
-    phases = [row.get("phase") for row in rows]
-    if any(phases.count(phase) < MIN_SAMPLES_PER_PHASE for phase in ("before", "after")):
-        raise ValueError("need before/after probes from this capture")
-    if phases != sorted(phases, key=lambda phase: {"before": 0, "after": 1}[phase]):
-        raise ValueError("calibration phases out of order")
+    if require_model_phases:
+        phases = [row.get("phase") for row in rows]
+        if any(phases.count(phase) < MIN_SAMPLES_PER_PHASE for phase in ("before", "after")):
+            raise ValueError("need before/after probes from this capture")
+        if phases != sorted(phases, key=lambda phase: {"before": 0, "after": 1}[phase]):
+            raise ValueError("calibration phases out of order")
+    elif len(rows) < 2 * MIN_SAMPLES_PER_PHASE:
+        raise ValueError("need at least 16 standalone calibration samples")
     host_files = [p for p in metadata_files(root) if p.parent.name == "host" and p.name == "start_info"]
     if len(host_files) != 1:
         raise ValueError("ambiguous Host epoch metadata")
@@ -93,9 +109,10 @@ def fit_alignment(root, rows):
     if lower > upper:
         raise ValueError("no common offset at selected rate")
     offset = (lower + upper) / 2
-    for submit, sync, start, end in measurements[1::2]:
-        if (start - offset) / scale < submit - QUANTIZATION_US or (end - offset) / scale > sync + QUANTIZATION_US:
-            raise ValueError("held-out probes fail alignment; no corrected trace exported")
+    validation_before = boundary_stats(measurements[1::2])
+    validation_after = boundary_stats(measurements[1::2], scale, offset)
+    if validation_after["outside_bracket_1us_tolerance"]:
+        raise ValueError(f"held-out probes fail alignment; no corrected trace exported: {validation_after}")
     # Uncertainty envelope of all feasible training mappings, not just chosen midpoint.
     uncertainty = []
     for host in (measurements[0][0], measurements[-1][1]):
@@ -113,6 +130,9 @@ def fit_alignment(root, rows):
         "calibration_stream": identity,
         "training_samples": len(train),
         "held_out_samples": len(measurements[1::2]),
+        "held_out_before": validation_before,
+        "held_out_after": validation_after,
+        "calibration_layout": "model_request_brackets" if require_model_phases else "standalone_calibration",
         "training_rate_bounds_us_per_second": [str(low), str(high)],
         "endpoint_mapping_envelope_width_us": uncertainty,
         "host_span_us": [str(measurements[0][0]), str(measurements[-1][1])],
@@ -198,23 +218,69 @@ def write_aligned_trace(source, destination, mapping):
     return dict(counts)
 
 
-def align_capture(root, samples):
-    mapping = fit_alignment(root, samples)
-    output = root / "ASCEND_PROFILER_OUTPUT/trace_view_aligned.json"
+def align_capture(root, samples, *, output_dir=None, require_model_phases=True):
+    mapping = fit_alignment(root, samples, require_model_phases=require_model_phases)
+    output = (output_dir if output_dir is not None else root / "ASCEND_PROFILER_OUTPUT") / "trace_view_aligned.json"
     mapping.update(write_aligned_trace(Path(mapping["source"]), output, mapping))
     mapping["aligned_trace"] = str(output)
     output.with_name("clock_alignment.json").write_text(json.dumps(mapping, indent=2), encoding="utf-8")
     return mapping
 
 
-def main():
+def align_saved_calibration(run, output_dir):
+    """Use existing eager/graph captures and their own RAW records; no Torch/NPU."""
+    output_dir.mkdir(parents=True, exist_ok=False)
+    failed = False
+    with (output_dir / "summary.txt").open("w", encoding="utf-8") as summary:
+
+        def emit(value):
+            print(value, flush=True)
+            summary.write(value + "\n")
+            summary.flush()
+
+        emit("离线验证可视化对齐：读取已有小张量校准，不导入Torch、不初始化NPU、不加载模型。")
+        emit(f"SOURCE_RUN={run}; SUMMARY_FILE={output_dir / 'summary.txt'}")
+        emit("偶数样本拟合，奇数样本独立检验；输出到新目录，原采集和原测量记录保持不变。")
+        for mode in ("eager", "graph"):
+            try:
+                case = run / mode
+                roots = discover_roots([case / "profile"])
+                if len(roots) != 1:
+                    raise ValueError("expected exactly one capture per case")
+                samples = json.loads((case / "host_brackets.json").read_text(encoding="utf-8"))
+                target = output_dir / mode
+                target.mkdir()
+                result = align_capture(roots[0], samples, output_dir=target, require_model_phases=False)
+                emit("ALIGNMENT " + json.dumps({"mode": mode, **result}, ensure_ascii=False))
+            except Exception as error:
+                failed = True
+                emit(f"ALIGNMENT_FAILED mode={mode}; {type(error).__name__}: {error}")
+        emit(
+            "PASS：对齐导出及留出样本检查通过；仅验证小张量采集，不代表真实MoE wait已验收。"
+            if not failed
+            else "FAIL：至少一组未通过；请返回本summary.txt，不重新加载模型。"
+        )
+    return int(failed)
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--capture", required=True, type=Path)
-    parser.add_argument("--samples", required=True, type=Path)
-    args = parser.parse_args()
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--capture", type=Path)
+    source.add_argument("--calibration-run", type=Path, help="Offline check of an existing eager/graph calibration run")
+    parser.add_argument("--samples", type=Path)
+    parser.add_argument("--output-dir", type=Path, help="New output directory for --calibration-run")
+    args = parser.parse_args(argv)
+    if args.calibration_run:
+        if args.output_dir is None or args.samples is not None:
+            parser.error("--calibration-run requires --output-dir and does not use --samples")
+        return align_saved_calibration(args.calibration_run.resolve(strict=True), args.output_dir.resolve())
+    if args.samples is None or args.output_dir is not None:
+        parser.error("--capture requires --samples and does not use --output-dir")
     payload = json.loads(args.samples.read_text(encoding="utf-8"))
     print(json.dumps(align_capture(args.capture, payload["samples"]), ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
