@@ -10,6 +10,7 @@ from moe_tpot import summarize_streams
 VALID_INTERVAL_STATUSES = ("complete", "complete_with_warnings", "recovered_intervals")
 CASE_DESCRIPTIONS = {
     "callback_legacy": "早期回调配置：Python LRC，debug=true（当前代码复现配置）",
+    "callback_python": "关闭debug的回调：Python LRC，debug=false",
     "callback": "当前回调：C++ LRC，debug=false",
     "mte_default": "MTE默认：C++ LRC，all/locked/yield",
     "mte_combined": "MTE组合：C++ LRC，allocated/atomic/yield",
@@ -250,7 +251,7 @@ def render_tables(reports, labels, *, bubbles="", settings=None, failure=None):
     return "\n".join(lines)
 
 
-def write_tables(root, reports, labels, **kwargs):
+def write_tables(root, reports, labels, *, overlap="", **kwargs):
     text = render_tables(reports, labels, **kwargs)
     miracle_path = root / "tpot_miracle.json"
     if miracle_path.is_file():
@@ -269,5 +270,6 @@ def write_tables(root, reports, labels, **kwargs):
             )
         except (OSError, ValueError, KeyError, TypeError):
             text += "\nMiracle数据缺失或无效，未补算替代值。\n"
+    text += overlap
     (root / "experiment_tables.md").write_text(text, encoding="utf-8")
     return text

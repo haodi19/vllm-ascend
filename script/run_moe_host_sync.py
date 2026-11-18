@@ -51,9 +51,10 @@ HANDOFF_PROFILE_CASES = (
 )
 
 
-def handoff_profile_cases(include_legacy=False, rotation=0):
+def handoff_profile_cases(include_legacy=False, rotation=0, include_python=False):
     legacy = (("callback_legacy", "callback", "all", "locked", "yield"),) if include_legacy else ()
-    cases = legacy + HANDOFF_PROFILE_CASES
+    python = (("callback_python", "callback", "all", "locked", "yield"),) if include_python else ()
+    cases = legacy + python + HANDOFF_PROFILE_CASES
     offset = rotation % len(cases)
     return cases[offset:] + cases[:offset]
 
@@ -475,7 +476,7 @@ def parse_args(
         parser.add_argument(
             "--case-rotation",
             type=int,
-            choices=range(4),
+            choices=range(5),
             default=0,
             help="Rotate service order; report columns retain their original order",
         )
@@ -483,6 +484,11 @@ def parse_args(
             "--include-legacy-callback",
             action="store_true",
             help="Prepend callback with Python LRC and moe_offload_debug enabled on current code",
+        )
+        parser.add_argument(
+            "--include-python-callback",
+            action="store_true",
+            help="Add Python LRC callback with debug disabled to isolate debug and C++ LRC effects",
         )
     if worker_compare:
         trials = parser.add_mutually_exclusive_group()
@@ -870,13 +876,16 @@ def run(args, root):
         cases = tuple((label, "mte", "ordinary") for label in worker_policies)
     if handoff_compare:
         handoff_cases = handoff_profile_cases(
-            getattr(args, "include_legacy_callback", False), getattr(args, "case_rotation", 0)
+            getattr(args, "include_legacy_callback", False),
+            getattr(args, "case_rotation", 0),
+            getattr(args, "include_python_callback", False),
         )
         cases = tuple((label, backend, "ordinary") for label, backend, *_ in handoff_cases)
         worker_policies = {label: (scan, probe, idle) for label, _, scan, probe, idle in handoff_cases}
     for label, backend, load_stream_mode in cases:
         legacy_callback = handoff_compare and label == "callback_legacy"
-        case_policy = "python" if legacy_callback else cache_policy_backend
+        python_callback = handoff_compare and label in ("callback_legacy", "callback_python")
+        case_policy = "python" if python_callback else cache_policy_backend
         if profile_compare:
             ensure_profile_storage(root / "profile" / label / case_policy, stage=f"before service {label}")
         scan, probe, idle = (

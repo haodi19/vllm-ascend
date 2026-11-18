@@ -261,6 +261,6 @@ def print_tpot_comparison(reports, root, labels):
         (root / "tpot_miracle.json").write_text(json.dumps(results, ensure_ascii=False), encoding="utf-8")
         for result in results:
             print("MIRACLE_ESTIMATE " + json.dumps(result, ensure_ascii=False))
-        print("miracle仅与同次with_profile TPOT比较；不与20次无采集TPOT混算，不是实际运行的第五个版本。")
+        print("miracle仅与同次with_profile TPOT比较；不与无采集TPOT混算，不是实测配置。")
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        print(f"MIRACLE_UNAVAILABLE: {exc}; 四组实测TPOT仍保留，未用其他窗口数据代填。")
+        print(f"MIRACLE_UNAVAILABLE: {exc}; 各组实测TPOT仍保留，未用其他窗口数据代填。")

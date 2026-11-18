@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from moe_experiment_tables import VALID_INTERVAL_STATUSES, write_tables
 from moe_outlier_stats import group_outliers, outlier_summary
+from moe_overlap_report import overlap_summary
 from moe_tpot import print_decode_comparison, print_tpot_comparison
 from mte_join_cost import LOAD_STATS
 from run_moe_host_sync import (
@@ -215,12 +216,14 @@ def print_profile(backend, report, root):
 def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=None):
     """Keep descriptive timings even when profile export fails; reject unequal outputs."""
     if "callback_legacy" in labels:
-        print("\n早期配置对照：callback_legacy 使用 Python LRC＋debug=true，其余三组 C++ LRC＋debug=false。")
+        print("\n早期配置对照：callback_legacy 使用 Python LRC＋debug=true；其余组 debug=false。")
         print("在当前代码上复现指定配置，不是切换历史提交；权重准备/提交仍用 Python/Torch。")
-    else:
+    elif "callback_python" not in labels:
         print(
             f"\n本轮{len(labels)}组 LRC=cpp（observe/choose_victims 及配套状态管理）；权重准备/提交仍用 Python/Torch。"
         )
+    if "callback_python" in labels:
+        print("callback_python=Python LRC＋debug=false；与早期组隔离debug，与callback组隔离C++ LRC。")
     print("未开启融合规划、ACL 搬运或 CPU 重排。")
     print("采集窗口的 REQUEST 和分项计时含 profiler、MSTX 开销；无采集整体时延单独列为 REQUEST_NO_PROFILE。")
     print("间隔覆盖整个采集窗口：Host 仅同进程相邻回调；MEMCPY 仅同设备同流，包含批次内/批次间。")
@@ -232,7 +235,7 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
     print("逐指标独立筛选，clean分项不能相加；剔除统计长尾不证明它来自外部干扰。")
     if set(reports) != set(labels):
         raise ValueError("对照组未全部完成；已完成组的 profile_report.json 和原始 profile 保留")
-    handoff_cases = handoff_profile_cases("callback_legacy" in labels)
+    handoff_cases = handoff_profile_cases("callback_legacy" in labels, include_python="callback_python" in labels)
     handoff_compare = labels == tuple(case[0] for case in handoff_cases)
     if handoff_compare:
         for label, backend, scan, probe, idle in handoff_cases:
@@ -243,7 +246,7 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
                 report.get("load_stream_mode"),
                 report.get("cache_policy_backend"),
                 report.get("worker_policy"),
-            ) != (backend, "ordinary", "python" if label == "callback_legacy" else "cpp", policy):
+            ) != (backend, "ordinary", "python" if label in ("callback_legacy", "callback_python") else "cpp", policy):
                 raise ValueError(f"{label}: wrong handoff experiment identity")
             if report.get("moe_offload_debug", False) is not (label == "callback_legacy"):
                 raise ValueError(f"{label}: wrong debug experiment identity")
@@ -257,6 +260,7 @@ def print_comparison(reports, root, labels=("callback", "mte"), *, worker_cases=
             print("DECODE_UNAVAILABLE: 缺少流式样本；以下完整端到端数据仅作对照，不代替Decode主数据。")
         print("独立整体时延：profiler尚未启动，回调分项计时未开启；包装检查仍在，不是零插桩二进制。")
         for label, window in windows.items():
+            print(f"TIMING_MSTX_CHECK {label}: {json.dumps(window.get('mstx_window_check'), ensure_ascii=False)}")
             print_request_window(label, window)
         if any(
             windows[label][key] != windows[labels[0]][key]
@@ -492,7 +496,7 @@ def print_partial_reports(root, labels=("callback", "mte")):
                 print(f"PARTIAL_REQUEST_WINDOW {backend}: {exc}")
         path = root / backend / "profile_report.json"
         if not path.is_file():
-            policy = "python" if backend == "callback_legacy" else "cpp"
+            policy = "python" if backend in ("callback_legacy", "callback_python") else "cpp"
             print(f"PARTIAL {backend}: 未取得完成报告；service_log={root / backend / f'inference_{policy}.log'}")
             continue
         try:
@@ -518,7 +522,7 @@ def print_partial_reports(root, labels=("callback", "mte")):
 
 def print_failure_logs(root, labels):
     for label in labels:
-        policy = "python" if label == "callback_legacy" else "cpp"
+        policy = "python" if label in ("callback_legacy", "callback_python") else "cpp"
         path = root / label / f"inference_{policy}.log"
         if path.is_file() and not (root / label / "profile_report.json").exists():
             print(f"FAILED_CASE {label}; service_log={path}")
@@ -590,7 +594,10 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
         labels = tuple(case[0] for case in worker_profile_cases(args.atomic_trials, args.combination_trials))
         prefix = "moe_worker_profile"
     if handoff_compare:
-        labels = tuple(case[0] for case in handoff_profile_cases(args.include_legacy_callback))
+        labels = tuple(
+            case[0]
+            for case in handoff_profile_cases(args.include_legacy_callback, include_python=args.include_python_callback)
+        )
         prefix = "moe_callback_worker"
     root = (args.output_dir or REPO / "bench_results" / f"{prefix}_{uuid4().hex[:8]}").resolve()
     root.mkdir(parents=True, exist_ok=False)
@@ -600,14 +607,19 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
     ):
         if handoff_compare:
             execution_labels = [
-                case[0] for case in handoff_profile_cases(args.include_legacy_callback, args.case_rotation)
+                case[0]
+                for case in handoff_profile_cases(
+                    args.include_legacy_callback, args.case_rotation, args.include_python_callback
+                )
             ]
             print("顺序运行：" + " → ".join(execution_labels) + "；全部普通加载流。")
             if args.include_legacy_callback:
-                print("callback_legacy=Python LRC＋moe_offload_debug=true；其余三组=C++ LRC＋debug=false。")
+                print("callback_legacy=Python LRC＋moe_offload_debug=true；其余组debug=false。")
                 print("这是当前代码上的早期配置对照，包含LRC与debug两项差异，不作单因素归因。")
-            else:
+            elif not args.include_python_callback:
                 print("全部使用C++ LRC，moe_offload_debug=false。")
+            if args.include_python_callback:
+                print("callback_python=Python LRC＋debug=false；callback及两组MTE=C++ LRC＋debug=false。")
             print("MTE默认=all/locked/yield；MTE改动=allocated/atomic/yield；两组均在消费者处严格等待。")
             print(f"不绑核、不启用C++轮询内部计时；{len(labels)}个独立服务，分别保存profile。")
         elif worker_compare and args.combination_trials:
@@ -685,12 +697,14 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
                 print(bubbles)
             if args.measure_tpot:
                 print_tpot_comparison(reports, root, labels)
+            overlap = overlap_summary(reports, root, labels) if handoff_compare else ""
             print(
                 write_tables(
                     root,
                     reports,
                     labels,
                     bubbles=bubbles,
+                    overlap=overlap,
                     settings={
                         "物理NPU": args.npu,
                         "max_tokens": args.max_tokens,

@@ -132,7 +132,7 @@ class CppMteProfileTests(unittest.TestCase):
         self.assertFalse(legacy.diagnose_prefetch_wait_at_join)
 
     def test_handoff_three_groups_runtime_configuration_and_failure_guards(self):
-        for failure in (None, "policy", "window", "timeout", "legacy", "long", "rotated"):
+        for failure in (None, "policy", "window", "timeout", "legacy", "long", "rotated", "five"):
             with tempfile.TemporaryDirectory() as directory, patch.object(sys, "platform", "linux"):
                 root, calls, settings = Path(directory), [], []
                 args = self.runner.parse_args(
@@ -142,8 +142,9 @@ class CppMteProfileTests(unittest.TestCase):
                         "--cache-policy-backend",
                         "cpp",
                         "--measure-tpot",
-                        *(["--include-legacy-callback"] if failure in ("legacy", "long", "rotated") else []),
+                        *(["--include-legacy-callback"] if failure in ("legacy", "long", "rotated", "five") else []),
                         *(["--case-rotation", "1"] if failure == "rotated" else []),
+                        *(["--include-python-callback"] if failure == "five" else []),
                         *(["--max-tokens", "128", "--ignore-eos"] if failure == "long" else []),
                     ],
                     profile_compare=True,
@@ -162,7 +163,11 @@ class CppMteProfileTests(unittest.TestCase):
                     legacy = label == "callback_legacy"
                     self.assertEqual(
                         (run_args.timing_requests, run_args.max_tokens, policy),
-                        (20, 128 if failure == "long" else 5, "python" if legacy else "cpp"),
+                        (
+                            20,
+                            128 if failure == "long" else 5,
+                            "python" if label in ("callback_legacy", "callback_python") else "cpp",
+                        ),
                     )
                     self.assertEqual(run_args.ignore_eos, failure == "long")
                     self.assertFalse(run_args.skip_profile)
@@ -172,7 +177,9 @@ class CppMteProfileTests(unittest.TestCase):
                     settings.append(config)
                     expected = next(
                         case
-                        for case in self.runner.handoff_profile_cases(failure in ("legacy", "long", "rotated"))
+                        for case in self.runner.handoff_profile_cases(
+                            failure in ("legacy", "long", "rotated", "five"), include_python=failure == "five"
+                        )
                         if case[0] == label
                     )
                     _, backend, scan, probe, idle = expected
@@ -209,7 +216,7 @@ class CppMteProfileTests(unittest.TestCase):
                     patch.object(self.runner, "inference", side_effect=fake_inference),
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
-                    if failure and failure not in ("legacy", "long", "rotated"):
+                    if failure and failure not in ("legacy", "long", "rotated", "five"):
                         with self.assertRaises((RuntimeError, TimeoutError)):
                             self.runner.run(args, root)
                         self.assertEqual(
@@ -225,13 +232,20 @@ class CppMteProfileTests(unittest.TestCase):
                             [
                                 case[0]
                                 for case in self.runner.handoff_profile_cases(
-                                    failure in ("legacy", "long", "rotated"), int(failure == "rotated")
+                                    failure in ("legacy", "long", "rotated", "five"),
+                                    int(failure == "rotated"),
+                                    failure == "five",
                                 )
                             ],
                         )
                         self.assertIsNone(reports["callback"]["worker_policy"])
                         if failure != "rotated":
                             self.assertEqual(sum(settings[-2][key] != settings[-1][key] for key in settings[-2]), 2)
+                        if failure == "five":
+                            changed_debug = {k for k in settings[0] if settings[0][k] != settings[1][k]}
+                            changed_lrc = {k for k in settings[1] if settings[1][k] != settings[2][k]}
+                            self.assertEqual(changed_debug, {"moe_offload_debug"})
+                            self.assertEqual(changed_lrc, {"cache_policy_backend"})
                         if failure == "legacy":
                             changed = {key for key in settings[0] if settings[0][key] != settings[1][key]}
                             self.assertEqual(changed, {"cache_policy_backend", "moe_offload_debug"})
@@ -240,18 +254,18 @@ class CppMteProfileTests(unittest.TestCase):
                     self.assertTrue((root / "callback/profile_report.json").is_file())
 
     def test_handoff_entry_summary_labels_and_policy_validation(self):
-        for wrong_policy in (False, True, "legacy", "legacy_debug", "tpot"):
+        for wrong_policy in (False, True, "legacy", "legacy_debug", "tpot", "five"):
 
             def fake_run(args, root, *, wrong_policy=wrong_policy):
                 reports = {}
                 for label, backend, scan, probe, idle in self.runner.handoff_profile_cases(
-                    args.include_legacy_callback
+                    args.include_legacy_callback, include_python=args.include_python_callback
                 ):
                     report = self.report()
                     report.update(
                         host_backend=backend,
                         load_stream_mode="ordinary",
-                        cache_policy_backend="python" if label == "callback_legacy" else "cpp",
+                        cache_policy_backend="python" if label in ("callback_legacy", "callback_python") else "cpp",
                         moe_offload_debug=label == "callback_legacy",
                         worker_policy=dict(scan=scan, probe=probe, idle=idle) if backend == "mte" else None,
                     )
@@ -297,6 +311,7 @@ class CppMteProfileTests(unittest.TestCase):
                         "--output-dir",
                         str(root),
                         *(["--include-legacy-callback"] if isinstance(wrong_policy, str) else []),
+                        *(["--include-python-callback"] if wrong_policy == "five" else []),
                         *(["--measure-tpot", "--bubble-stream-name", "Stream 56"] if wrong_policy == "tpot" else []),
                     ],
                     handoff_compare=True,
@@ -786,7 +801,15 @@ class CppMteProfileTests(unittest.TestCase):
         def request(opener, port, path, payload=None, timeout=None):
             sequence.append(path)
             if path == "/status":
-                return dict(backend="cpp", load_backend="python", active=timers_active, mstx_enabled=True)
+                return dict(
+                    backend="cpp",
+                    load_backend="python",
+                    active=timers_active,
+                    mstx_enabled=True,
+                    mstx_active=timers_active,
+                    inflight=0,
+                    mstx_marker_attempts=0,
+                )
             if path == "/v1/completions":
                 self.assertEqual(payload["max_tokens"], max_tokens)
                 self.assertEqual(payload.get("ignore_eos", False), ignore_eos)
@@ -822,7 +845,7 @@ class CppMteProfileTests(unittest.TestCase):
             contextlib.redirect_stdout(io.StringIO()),
         ):
             if timers_active:
-                with self.assertRaisesRegex(RuntimeError, "inactive callback timers"):
+                with self.assertRaisesRegex(RuntimeError, "inactive, drained MoE timers/MSTX"):
                     self.infer._inference(args, self.source, "cpp", {}, log)
                 self.assertNotIn("/start_profile", sequence)
                 finish.assert_not_called()

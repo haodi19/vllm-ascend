@@ -817,3 +817,52 @@ python -B script/run_worker_poll_tests.py --npu 7
 ```bash
 python -m pip install ./csrc/host_sync --no-build-isolation --no-deps --force-reinstall
 ```
+
+## 五组真实模型后台复测（token5 与 token128）
+
+在已配置环境的容器内，从项目目录执行：
+
+```bash
+bash script/run_moe_five_way_night.sh --work-root /data/w00919836/moeoffload --npu 1
+```
+
+脚本自动加载工作目录下的 `env.sh`，后台顺序运行 token5、token128，每轮包含五个独立服务：
+
+| 配置名 | Host机制 | LRC | debug |
+| --- | --- | --- | --- |
+| callback_legacy | 回调 | Python | 开 |
+| callback_python | 回调 | Python | 关 |
+| callback | 回调 | C++ | 关 |
+| mte_default | 内存共享 | C++ | 关 |
+| mte_combined | 内存共享 | C++ | 关 |
+
+两组 MTE 使用普通加载流、消费者处严格等待；worker 分别为
+`all/locked/yield` 和 `allocated/atomic/yield`。
+前两组只差 debug，第二、三组只差 LRC 实现。全部配置在当前代码上运行，不切换历史提交。
+
+每组预热 5 次、独立计时 20 次，之后采集 1 次 profile。
+token128 设置 `ignore_eos=true`，token5 保持原来的 EOS 行为。
+默认服务端口为 8156、计时端口为 18156，可用 `--port`、`--timing-port` 修改；不会停止占用端口的其他服务。
+
+主时延为无 profiler 的 Decode 时间：最后非空文本块到达减去首个非空文本块到达。
+完整端到端、TTFT、TPOT 同时保留。计时窗口不启动 MoE MSTX，前后检查 collector
+未激活、无进行中的标记回调，且累计 MSTX 标记调用数没有增加；检查不通过时不作为无插桩结果。
+随后单独开启 profiler、MSTX 和同次采集时钟校准，保留原始与对齐后的可视化。
+miracle TPOT 使用 MTE 组合组同次 profile 请求估算全部 Host 间隔消失的情形，
+只与同次带采集 TPOT 比较，不作为无采集请求的实测加速。
+
+原 Host 间隔、加载流空泡和分项计时继续保留；MTE 两组额外自动统计：
+
+- 预取→按需方向，计算推进早于、晚于预取回调结束的数量及比例；不确定、无法识别分别列出。
+- 晚完成样本中预取零加载、任一端零加载的数量及比例，未知加载量不当作零。
+- 去掉晚完成样本、扣除晚完成样本中剩余计算等待时间两种统计，原始值保留。
+  同时列出直接判定和带校准保守余量的判定；全样本统计保留无法判定样本的原值，另列仅确定样本。
+
+上述边界分析只用于已核查的 MTE publish/wait 流程，回调组不套用该配对规则。
+分析读取本轮对齐采集，不更改原始时间戳，不用旧实验填补缺失数据。
+
+输出目录默认为工作目录下的 `bench_results/night_five_way_<时间>_<PID>`，也可用
+`--output-root` 指定一个尚不存在的目录。启动命令会打印 PID 和 `tail -f` 命令。
+两轮结束后，该目录的 `summary.txt` 汇总 token5、token128 全部结果，复制这一份即可；
+每轮自己的 `summary.txt`、`experiment_tables.md` 和详细日志仍保留。
+可视化导入对应轮次的 `profile_aligned/<配置>/<python或cpp>/<采集目录>`。

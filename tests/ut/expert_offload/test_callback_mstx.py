@@ -51,6 +51,7 @@ class TestMstx(unittest.TestCase):
         call = collector.wrap_callback(outer)
         call(self.args(prefetch=True))
         self.assertEqual(mstx.events, [])
+        self.assertEqual(collector.marker_attempts, 0)
         collector.start()
         self.assertEqual(call(self.args(prefetch=True)), 5)
         report = collector.stop()
@@ -65,8 +66,26 @@ class TestMstx(unittest.TestCase):
             ["moe_offload/host_callback", "moe_offload/prefetch_snapshot", "moe_offload/update_weights"],
         )
         self.assertEqual(len({s.partition("|")[2] for s in starts}), 1)
+        self.assertEqual(collector.marker_attempts, len(starts))
         self.assertEqual(collector.inflight, 0)
         self.assertIsNone(collector.local.outer_context)
+
+    def test_uninstrumented_window_requires_counters_and_rejects_markers(self):
+        check = RUNNER["check_uninstrumented_window"]
+        before = dict(active=False, mstx_active=False, inflight=0, mstx_marker_attempts=0)
+        check(before)
+        check(dict(before), before)
+        for changed in (
+            dict(active=True),
+            dict(mstx_active=True),
+            dict(inflight=1),
+            dict(mstx_marker_attempts=None),
+            dict(mstx_marker_attempts=1),
+        ):
+            with self.assertRaises(RuntimeError):
+                check(dict(before, **changed), before)
+        with self.assertRaises(RuntimeError):
+            check(dict(active=False))
 
     def test_outer_exception_drains_and_closes(self):
         collector = TIMING["CallbackTimings"]("python", mstx=FakeMstx())

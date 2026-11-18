@@ -72,6 +72,7 @@ class CallbackTimings:
         self.clock = clock
         self.mstx = mstx
         self.marker_errors = 0
+        self.marker_attempts = 0
         self.call_id = 0
         self.local = threading.local()
         self.condition = threading.Condition()
@@ -93,6 +94,7 @@ class CallbackTimings:
     def range_start(self, name):
         if self.mstx is None:
             return None
+        self.marker_attempts += 1
         try:
             # No stream argument: measure CPU execution/waiting, not NPU work.
             range_id = self.mstx.range_start(f"moe_offload/{name}|{self.local.context}")
@@ -306,6 +308,9 @@ class CallbackTimings:
                         transport="torch",
                         load_backend="python",
                         mstx_enabled=collector.mstx is not None,
+                        mstx_active=collector.active and collector.mstx is not None,
+                        mstx_marker_attempts=collector.marker_attempts,
+                        inflight=collector.inflight,
                     ),
                 )
 

@@ -461,6 +461,21 @@ def analyze(path):
                 )
             )
 
+    return dict(
+        trace=str(path),
+        rows=rows,
+        classification=summarize(rows),
+        direct_classification=summarize(
+            [dict(row, **{"class": row.get("zero_margin_class", "unmapped")}) for row in rows]
+        ),
+        late_loads=load_breakdown(rows)["late"],
+        conservative=restat_host_gaps(rows),
+        direct=restat_host_gaps(rows, "zero_margin_class"),
+        sensitivity_margin_us=margin,
+        load_issues=load_issues,
+        reasons=dict(reasons),
+    )
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

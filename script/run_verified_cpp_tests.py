@@ -535,21 +535,24 @@ def _inference(args, source, backend, env, log):
         if timing_count:
             if not profile_enabled or not getattr(args, "profile_compare", False):
                 raise ValueError("Repeated pre-profile requests require the profile comparison preset")
-            if request(opener, args.timing_port, "/status").get("active") is not False:
-                raise RuntimeError("Repeated request window requires inactive callback timers")
+            timing_before = request(opener, args.timing_port, "/status")
+            check_uninstrumented_window(timing_before)
             # Profiler has not started. Inactive callback wrappers skip both
             # per-stage clocks and MSTX ranges; wrapper checks still remain.
             with progress(f"{backend} no-profiler requests: {timing_count}"):
                 samples = [
                     completion(payloads[index % len(payloads)], phase="no_profiler") for index in range(timing_count)
                 ]
-            if request(opener, args.timing_port, "/status").get("active") is not False:
-                raise RuntimeError("Callback timers became active during repeated request window")
+            timing_after = request(opener, args.timing_port, "/status")
+            check_uninstrumented_window(timing_after, timing_before)
             summarize = runpy.run_path(str(REPO / "vllm_ascend/expert_offload/callback_timing.py"))["summarize"]
             durations = [sample[0] for sample in samples]
             request_window = dict(
                 count=timing_count,
-                instrumentation="profiler_not_started; callback_timers_inactive; wrappers_retained",
+                instrumentation=(
+                    "profiler_not_started; callback_timers_inactive; moe_mstx_zero_markers; wrappers_retained"
+                ),
+                mstx_window_check=dict(before=timing_before, after=timing_after, marker_delta=0),
                 samples_us=durations,
                 stats_us=summarize(durations),
                 stddev_us=statistics.pstdev(durations),
@@ -676,6 +679,19 @@ def _inference(args, source, backend, env, log):
         with progress(f"{backend} service cleanup and port release; up to 50s"):
             stop_owned_service(child)
             wait_service_ports_free(args)
+
+
+def check_uninstrumented_window(status, before=None):
+    """Require current control API evidence; missing counters are not proof of zero markers."""
+    if (
+        status.get("active") is not False
+        or status.get("mstx_active") is not False
+        or status.get("inflight") != 0
+        or type(status.get("mstx_marker_attempts")) is not int
+    ):
+        raise RuntimeError("Timing window requires inactive, drained MoE timers/MSTX and marker counters")
+    if before is not None and status["mstx_marker_attempts"] != before["mstx_marker_attempts"]:
+        raise RuntimeError("MoE MSTX markers were emitted during the no-profile timing window")
 
 
 def inspect_mstx_trace(profile_dir):
