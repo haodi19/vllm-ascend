@@ -62,6 +62,17 @@ class EmptyExpertTests(unittest.TestCase):
         r["copies"] = [{"bytes": 128}]
         self.assertEqual(REPORT.classify(r), "unknown_copies_without_loads")
 
+    def test_duplicate_mstx_calls_are_not_valid_links(self):
+        rows = [record(1), record(2)]
+        for row in rows:
+            row["mstx_call_id"] = 7
+        trace = dict(complete=True, errors=0, dropped=0, metadata={"moe_layers": 1}, records=rows)
+        self.assertIn("MSTX_LINK=INCOMPLETE", "\n".join(REPORT.report(trace)))
+        rows[1]["mstx_call_id"] = 9
+        text = "\n".join(REPORT.report(trace))
+        self.assertIn("MSTX_LINK=PASS", text)
+        self.assertIn("2/0/reactive/9/0/all_needed_resident", text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -113,6 +113,25 @@ class ExpertTraceTests(unittest.TestCase):
         self.assertEqual(reactive["prefetched_ids_used"], [2])
         self.assertEqual(reactive["logical_h2d_bytes"], 0)
 
+    def test_expert_record_links_to_enclosing_mstx_call(self):
+        self.manager._callback_timing = SimpleNamespace(
+            local=SimpleNamespace(outer_context="backend=cpp|layer=1|kind=reactive|rows=1|call=79")
+        )
+        self.trace.start()
+        self.manager._update_weights(self.args([[0, 1]], np.array([0, 1, -1, -1])))
+        record = self.trace.stop()["records"][0]
+        self.assertEqual(record["mstx_call_id"], 79)
+        self.assertEqual(record["loads"], [])
+
+    def test_mismatched_mstx_context_fails_instead_of_guessing(self):
+        self.manager._callback_timing = SimpleNamespace(
+            local=SimpleNamespace(outer_context="backend=cpp|layer=9|kind=reactive|rows=1|call=79")
+        )
+        self.trace.start()
+        with self.assertRaisesRegex(ValueError, "enclosing MSTX"):
+            self.manager._update_weights(self.args([[0, 1]], np.array([0, 1, -1, -1])))
+        self.assertFalse(self.trace.stop()["complete"])
+
     def test_failed_copy_not_reported_completed(self):
         self.trace.start()
 
@@ -207,7 +226,7 @@ class ExpertTraceTests(unittest.TestCase):
 
         def fake_run(args, root):
             self.assertTrue(args.expert_trace)
-            self.assertTrue(args.skip_profile)
+            self.assertFalse(args.skip_profile)
             self.assertTrue(args.no_load_diagnostics)
             self.assertTrue(args.diagnose_prefetch_wait_at_join)
             self.assertEqual((args.worker_scan, args.worker_probe), ("allocated", "atomic"))
@@ -215,6 +234,9 @@ class ExpertTraceTests(unittest.TestCase):
             directory.mkdir()
             (directory / "expert_trace_001.txt").write_text("COMPLETE true\nEVENT {}\n", encoding="utf-8")
             (directory / "inference_cpp.log").write_text("Actual usage: weights=33 GiB\n", encoding="utf-8")
+            (directory / "profile_report.json").write_text(
+                '{"aligned_profile": {"status": "exported", "directory": "test_ascend_pt"}}', encoding="utf-8"
+            )
             print("Effective serve command: example")
             return 0
 
@@ -229,6 +251,7 @@ class ExpertTraceTests(unittest.TestCase):
             text = (root / "expert_trace.txt").read_text(encoding="utf-8")
             self.assertIn("EVENT {}", text)
             self.assertIn("EMPTY_CHECK=INCOMPLETE", (root / "summary.txt").read_text(encoding="utf-8"))
+            self.assertIn("VISUALIZATION_DIRECTORY=test_ascend_pt", (root / "summary.txt").read_text(encoding="utf-8"))
             self.assertIn("weights=33 GiB", text)
             self.assertIn("Effective serve command: example", text)
 
@@ -242,6 +265,8 @@ class ExpertTraceTests(unittest.TestCase):
         with patch.object(sys, "platform", "linux"):
             args = runner.parse_args(["--npu", "0", "--backend", "mte", "--skip-profile", "--expert-trace"])
             self.assertTrue(args.expert_trace)
+            profiled = runner.parse_args(["--npu", "0", "--backend", "mte", "--expert-trace"])
+            self.assertFalse(profiled.skip_profile)
             with self.assertRaises(SystemExit):
                 runner.parse_args(["--npu", "0", "--expert-trace"])
 

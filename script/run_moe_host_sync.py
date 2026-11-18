@@ -624,10 +624,8 @@ def parse_args(
         parser.error("--max-tokens must be positive")
     if args.verification_suite and (args.max_tokens != VERIFICATION_MAX_TOKENS or args.ignore_eos):
         parser.error("verification suite requires its original 32-token limit and EOS behavior")
-    if args.expert_trace and (
-        profile_compare or args.compare_join_cost or not args.skip_profile or args.backend == "both"
-    ):
-        parser.error("--expert-trace requires a single backend and --skip-profile; not a performance comparison")
+    if args.expert_trace and (profile_compare or args.compare_join_cost or args.backend == "both"):
+        parser.error("--expert-trace requires a single backend; not a performance comparison")
     if getattr(args, "measure_tpot", False) and not handoff_compare:
         parser.error("--measure-tpot requires run_moe_callback_worker_compare.py")
     if getattr(args, "timing_requests", 0) < 0:
@@ -910,7 +908,7 @@ def run(args, root):
             request_timeout=args.request_timeout,
             profile_timeout=args.profile_timeout,
             strict_profile=False,
-            mstx=not cost_mode and not getattr(args, "expert_trace", False),
+            mstx=not cost_mode and (not getattr(args, "expert_trace", False) or not args.skip_profile),
             skip_profile=args.skip_profile,
             compare_join_cost=cost_mode,
             profile_compare=profile_compare,
@@ -990,7 +988,7 @@ def run(args, root):
             expected = f"[MOE-MTE] weight load stream={expected_type}; mode={load_stream_mode}; H2D wait retained"
             if expected not in log:
                 raise RuntimeError(f"Missing runtime load stream evidence: {expected}")
-        if profile_compare:
+        if profile_compare or getattr(args, "expert_trace", False):
             (directory / "profile_report.json").write_text(json.dumps(reports[label]), encoding="utf-8")
         if stream_compare or worker_compare or handoff_compare:
             positions = reports[label]["engine_error_log_positions"]

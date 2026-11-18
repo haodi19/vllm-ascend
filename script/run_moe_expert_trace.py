@@ -23,6 +23,8 @@ def main():
     parser.add_argument("--warmup-requests", type=int, default=5)
     parser.add_argument("--port", type=int, default=8155)
     parser.add_argument("--timing-port", type=int, default=18155)
+    parser.add_argument("--skip-profile", action="store_true", help="仅保留专家记录；默认同时采集可视化")
+    parser.add_argument("--profile-timeout", type=int, default=300)
     options = parser.parse_args()
     args = parse_args(
         [
@@ -40,7 +42,9 @@ def main():
             "yield",
             "--diagnose-prefetch-wait-at-join",
             "--no-load-diagnostics",
-            "--skip-profile",
+            *(["--skip-profile"] if options.skip_profile else []),
+            "--profile-timeout",
+            str(options.profile_timeout),
             "--expert-trace",
             "--requests",
             str(options.requests),
@@ -62,7 +66,9 @@ def main():
         contextlib.redirect_stdout(SummaryTee(sys.stdout, summary)),
     ):
         print("MTE普通流＋cpp LRC＋allocated/atomic/yield；消费者处严格等待。")
-        print("诊断请求：预热后开启专家记录；不采profile，不用于TPOT/时延比较；max_tokens=5。")
+        print(f"诊断请求：预热后开启专家记录；profile={not options.skip_profile}；不用于时延比较；max_tokens=5。")
+        if not options.skip_profile:
+            print("同一请求采集专家ID和MSTX；自动校准Host/NPU时间轴；mstx_call_id对应host_callback名称中的call。")
         try:
             result = run(args, root)
         except Exception as exc:
@@ -118,6 +124,17 @@ def main():
                     print(f"EMPTY_CHECK=INCOMPLETE；无法解析专家记录：{exc}")
                     result = 1
             print(f"完整专家ID记录：{output}；返回本目录summary.txt即可，已含空载原因核验。")
+            if not options.skip_profile:
+                try:
+                    capture = json.loads((root / "mte/profile_report.json").read_text(encoding="utf-8"))
+                    aligned = capture.get("aligned_profile", {})
+                    if aligned.get("status") != "exported":
+                        raise ValueError(f"对齐目录未成功导出：{aligned}")
+                    print(f"VISUALIZATION_DIRECTORY={aligned['directory']}")
+                    print("在MindStudio导入上述整个*_ascend_pt目录；原始profile另行保留。")
+                except (OSError, ValueError, KeyError) as exc:
+                    print(f"VISUALIZATION_INCOMPLETE: {exc}；保留已取得记录，不视为可视化核验完成。")
+                    result = 1
     return result
 
 

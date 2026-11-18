@@ -528,6 +528,7 @@ class TestVerifiedRunner(unittest.TestCase):
                 profile_run_dir=Path(directory) / "profile",
                 profile_timeout=10,
                 mstx=True,
+                expert_trace=True,
                 profile_compare=True,
             )
             sequence = []
@@ -540,6 +541,8 @@ class TestVerifiedRunner(unittest.TestCase):
                     return dict(choices=[{"text": "synthetic"}], usage={"completion_tokens": 5})
                 if path == "/stop":
                     return dict(count=5, errors=0, dropped=0, groups=[])
+                if path == "/expert_trace/stop":
+                    return dict(complete=True, records=[])
                 if path.startswith("/clock/"):
                     return dict(phase=path.rsplit("/", 1)[-1], samples=[{"sample": 0}])
                 return {}
@@ -560,6 +563,7 @@ class TestVerifiedRunner(unittest.TestCase):
                         "discover_roots": Mock(return_value=[Path(directory)]),
                         "align_capture": align,
                         "export_capture": view,
+                        "write_trace": Mock(),
                     },
                 ),
                 patch("subprocess.Popen", return_value=process),
@@ -580,7 +584,9 @@ class TestVerifiedRunner(unittest.TestCase):
                     "/start_profile",
                     "/clock/before",
                     "/start",
+                    "/expert_trace/start",
                     "/v1/completions",
+                    "/expert_trace/stop",
                     "/stop",
                     "/clock/after",
                     "/stop_profile",

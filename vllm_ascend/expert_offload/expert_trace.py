@@ -112,6 +112,15 @@ class ExpertTrace:
                 return fn(*args, **kwargs)
             self.local.record = record
             try:
+                if not prefill:
+                    timing = getattr(self.manager, "_callback_timing", None)
+                    context = getattr(getattr(timing, "local", None), "outer_context", None)
+                    if context:
+                        fields = dict(part.split("=", 1) for part in context.split("|"))
+                        if int(fields["layer"]) != layer or fields["kind"] != kind:
+                            raise ValueError("Expert record does not match enclosing MSTX callback")
+                        record["mstx_call_id"] = int(fields["call"])
+                        record["mstx_context"] = context
                 if prefill:
                     record["pool_slot"] = layer % self.manager.num_device_layers
                     record["full_pool_experts"] = self.manager.num_total_experts

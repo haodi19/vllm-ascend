@@ -46,6 +46,16 @@ def report(trace):
     sweeps = layer_rounds(trace)
     yield "SWEEPS " + json.dumps(sweeps, ensure_ascii=False)
     yield "REASONS " + json.dumps(dict(Counter(classes.values())), ensure_ascii=False)
+    if any("mstx_call_id" in r for r in records):
+        ids = [r.get("mstx_call_id") for r in records]
+        linked = None not in ids and len(set(ids)) == len(ids)
+        yield f"MSTX_LINK={'PASS' if linked else 'INCOMPLETE'}；按call精确关联同次采集，不按时间猜测。"
+        yield "CALL_MAP visit/layer/kind/call/loaded/reason"
+        for r in records:
+            yield (
+                f"{r['layer_visit']}/{r['layer']}/{r['kind']}/{r.get('mstx_call_id')}/"
+                f"{len(r['loads'])}/{classes[r['event_id']]}"
+            )
     yield (
         "all_needed_resident=非空所需集合全部已驻留；empty_candidates=所需集合为空；"
         "missing_but_not_loaded=仍有缺失，不能算全命中。"
@@ -87,6 +97,7 @@ def report(trace):
         if 14 <= r["layer"] <= 19:
             fields = (
                 "event_id",
+                "mstx_call_id",
                 "kind",
                 "layer_visit",
                 "layer",
