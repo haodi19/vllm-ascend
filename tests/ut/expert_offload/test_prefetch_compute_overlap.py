@@ -9,7 +9,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "script"))
 
-from analyze_prefetch_compute_overlap import analyze, bind_streams, classify, consumer_boundary, summarize
+from analyze_prefetch_compute_overlap import (
+    analyze,
+    bind_streams,
+    classify,
+    consumer_boundary,
+    load_annotations,
+    load_breakdown,
+    load_pair,
+    summarize,
+)
 
 
 def task(name, start, end):
@@ -72,6 +81,80 @@ class OverlapTests(unittest.TestCase):
 
     def test_empty_group_has_no_invented_ratio(self):
         self.assertNotIn("late_vs_early", summarize([]))
+
+    def test_load_pair_unknown_is_not_empty(self):
+        self.assertEqual(load_pair(None, 0), "unknown")
+        self.assertEqual(load_pair(0, None), "unknown")
+        self.assertEqual(load_pair(0, 1), "prefetch_zero_only")
+        self.assertEqual(load_pair(1, 0), "reactive_zero_only")
+        self.assertEqual(load_pair(0, 0), "both_zero")
+        self.assertEqual(load_pair(1, 2), "both_loaded")
+
+    def test_late_load_composition_and_conditional_rate_have_different_denominators(self):
+        rows = [
+            dict(gap_us=300, load_pair="both_zero", **{"class": "late"}),
+            dict(gap_us=100, load_pair="both_loaded", **{"class": "late"}),
+            dict(gap_us=50, load_pair="both_loaded", **{"class": "early"}),
+            dict(gap_us=50, load_pair="both_loaded", **{"class": "uncertain"}),
+        ]
+        result = load_breakdown(rows)
+        self.assertEqual(result["late"]["both_zero"]["pct_of_timing_group"], 50)
+        self.assertEqual(result["late"]["both_zero"]["gap_sum_share_pct"], 75)
+        self.assertEqual(result["late_rate_by_load_pair"]["both_zero"]["late_pct"], 100)
+        self.assertAlmostEqual(result["late_rate_by_load_pair"]["both_loaded"]["late_pct"], 100 / 3)
+
+    def annotation_fixture(self):
+        host = dict(
+            pid="host", tid="worker", start=0, end=100, index=0, context=dict(call="1", layer="15", kind="prefetch")
+        )
+        meta = dict(call="1", layer="15", kind="prefetch", rows="1")
+        stages = {
+            1: {
+                name: [dict(start=a, end=b, tid="worker", meta=meta)]
+                for name, a, b in (
+                    ("update_weights", 1, 99),
+                    ("load_submit", 10, 50),
+                    ("copy_submit", 20, 30),
+                    ("synchronize", 60, 90),
+                )
+            }
+        }
+        report = dict(
+            count=1,
+            errors=0,
+            dropped=0,
+            mstx_errors=0,
+            mstx_enabled=True,
+            load_backend="python",
+            h2d_backend="torch",
+            groups=[dict(kind="prefetch", token_rows=1, count=1, loads=dict(mean=0))],
+        )
+        return [host], stages, report
+
+    def test_confirmed_empty_does_not_depend_on_duration(self):
+        hosts, stages, report = self.annotation_fixture()
+        loads, issues = load_annotations(hosts, stages, report)
+        self.assertEqual(issues, [])
+        self.assertEqual(loads, {"1": 0})
+
+    def test_missing_report_or_lost_markers_cannot_prove_empty(self):
+        hosts, stages, report = self.annotation_fixture()
+        self.assertIsNone(load_annotations(hosts, stages, None)[0]["1"])
+        report["groups"][0]["loads"]["mean"] = 1
+        loads, issues = load_annotations(hosts, stages, report)
+        self.assertIsNone(loads["1"])
+        self.assertTrue(issues)
+
+    def test_actual_one_expert_count_is_loaded(self):
+        hosts, stages, report = self.annotation_fixture()
+        for name in ("load_prepare", "scale_refresh"):
+            stages[1][name] = [
+                dict(start=11, end=12, tid="worker", meta=dict(call="1", layer="15", kind="prefetch", rows="1"))
+            ]
+        report["groups"][0]["loads"]["mean"] = 1
+        loads, issues = load_annotations(hosts, stages, report)
+        self.assertFalse(issues)
+        self.assertEqual(loads["1"], 1)
 
     def test_saved_capture_end_to_end(self):
         records = [dict(ph="M", name="process_name", pid="device", args=dict(name="Ascend Hardware"))]
