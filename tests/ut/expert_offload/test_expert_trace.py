@@ -213,7 +213,7 @@ class ExpertTraceTests(unittest.TestCase):
             self.assertEqual((args.worker_scan, args.worker_probe), ("allocated", "atomic"))
             directory = root / "mte"
             directory.mkdir()
-            (directory / "expert_trace_001.txt").write_text("COMPLETE true\nEVENT test\n", encoding="utf-8")
+            (directory / "expert_trace_001.txt").write_text("COMPLETE true\nEVENT {}\n", encoding="utf-8")
             (directory / "inference_cpp.log").write_text("Actual usage: weights=33 GiB\n", encoding="utf-8")
             print("Effective serve command: example")
             return 0
@@ -227,7 +227,8 @@ class ExpertTraceTests(unittest.TestCase):
             ):
                 self.assertEqual(entry.main(), 0)
             text = (root / "expert_trace.txt").read_text(encoding="utf-8")
-            self.assertIn("EVENT test", text)
+            self.assertIn("EVENT {}", text)
+            self.assertIn("EMPTY_CHECK=INCOMPLETE", (root / "summary.txt").read_text(encoding="utf-8"))
             self.assertIn("weights=33 GiB", text)
             self.assertIn("Effective serve command: example", text)
 

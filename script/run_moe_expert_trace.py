@@ -8,6 +8,8 @@ import re
 import sys
 from pathlib import Path
 
+from moe_empty_expert_report import read_trace_text
+from moe_empty_expert_report import report as empty_expert_report
 from run_moe_host_sync import REPOSITORY_ROOT, SummaryTee, failure_excerpt, parse_args, run
 from run_verified_cpp_tests import launch_spec
 
@@ -20,6 +22,7 @@ def main():
     parser.add_argument("--requests", type=int, default=1)
     parser.add_argument("--warmup-requests", type=int, default=5)
     parser.add_argument("--port", type=int, default=8155)
+    parser.add_argument("--timing-port", type=int, default=18155)
     options = parser.parse_args()
     args = parse_args(
         [
@@ -47,6 +50,8 @@ def main():
             str(options.test_script),
             "--port",
             str(options.port),
+            "--timing-port",
+            str(options.timing_port),
         ]
     )
     root = options.output_dir.resolve()
@@ -104,7 +109,15 @@ def main():
                     print("MODEL_CONFIG " + json.dumps(config, ensure_ascii=False), file=combined)
                 except (OSError, ValueError) as exc:
                     print(f"MODEL_CONFIG unavailable: {exc}", file=combined)
-            print(f"完整诊断文本：{output}；请复制其内容返回。")
+            for trace in traces:
+                print(f"\nEMPTY_EXPERT_REQUEST={trace.name}")
+                try:
+                    for line in empty_expert_report(read_trace_text(trace)):
+                        print(line)
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    print(f"EMPTY_CHECK=INCOMPLETE；无法解析专家记录：{exc}")
+                    result = 1
+            print(f"完整专家ID记录：{output}；返回本目录summary.txt即可，已含空载原因核验。")
     return result
 
 
