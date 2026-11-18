@@ -112,6 +112,83 @@ def summarize(rows):
     return groups
 
 
+def restat_host_gaps(rows, classification_key="class"):
+    """Descriptive residuals, not a measurement of hardware compute utilization.
+
+    Keep undecidable samples unchanged in the all-sample result and show a
+    separate decidable-only result. Never silently remove or correct them.
+    Bounds reflect the saved aligned coordinates, not physical clock certainty.
+    """
+    output = {}
+    for scope in ("all_samples", "decidable_only"):
+        selected = [r for r in rows if scope == "all_samples" or r.get(classification_key) in ("early", "late")]
+        kept, adjusted, low_residual, high_residual = [], [], [], []
+        counts = collections.Counter()
+        removed_us = 0.0
+        for row in selected:
+            kind = row.get(classification_key, "unmapped")
+            counts[kind] += 1
+            gap = row["gap_us"]
+            if kind != "late":
+                kept.append(gap)
+                adjusted.append(gap)
+                low_residual.append(gap)
+                high_residual.append(gap)
+                continue
+            lower, upper = row["readiness_minus_prefetch_end_bounds_us"]
+            if not 0 <= lower <= upper <= gap:
+                # Retain the raw value if the candidate correction is invalid.
+                counts["invalid_subtraction"] += 1
+                adjusted.append(gap)
+                low_residual.append(gap)
+                high_residual.append(gap)
+                continue
+            deduction = (lower + upper) / 2
+            adjusted.append(gap - deduction)
+            low_residual.append(gap - upper)
+            high_residual.append(gap - lower)
+            removed_us += deduction
+        output[scope] = dict(
+            selected=len(selected),
+            excluded=len(rows) - len(selected),
+            counts=dict(counts),
+            original=_stats([row["gap_us"] for row in selected]),
+            method1_drop_late=_stats(kept),
+            method2_subtract_remaining_compute=_stats(adjusted),
+            method2_aligned_boundary_low=_stats(low_residual),
+            method2_aligned_boundary_high=_stats(high_residual),
+            subtracted_total_us=removed_us,
+            unknown_policy="all_samples retains uncertain/unmapped unchanged; decidable_only excludes both",
+        )
+    return output
+
+
+def render_restat(rows):
+    print("HOST_RESTAT：间隔=按需开始-预取结束；晚完成扣除=消费位置时间-预取结束。")
+    print("扣除的是等待计算推进的经过时间（含路由/依赖），不是累加算子busy时长；结果不是实测加速收益。")
+    print("方案2取已对齐边界区间中点；low/high仅是该区间敏感性结果，不含完整时钟校准误差。")
+    print(
+        "TABLE_RESTAT 判定 | 范围 | 原样本数 | 晚完成 | 不确定 | 无法识别 | 原均值 | "
+        "方案1 n/均值/P95 | 方案2 n/均值/P95"
+    )
+    for label, key in (("保守判定", "class"), ("对齐坐标直接判定", "zero_margin_class")):
+        results = restat_host_gaps(rows, key)
+        emit("HOST_RESTAT_RESULT", dict(classification=label, **results))
+        for scope, item in results.items():
+
+            def cell(name, group=item):
+                stat = group[name]
+                return f"{stat['count']}/{stat['mean_us']}/{stat['p95_us']}"
+
+            counts = item["counts"]
+            print(
+                f"{label} | {scope} | {item['selected']} | {counts.get('late', 0)} | "
+                f"{counts.get('uncertain', 0)} | {counts.get('unmapped', 0)} | "
+                f"{item['original']['mean_us']} | {cell('method1_drop_late')} | "
+                f"{cell('method2_subtract_remaining_compute')}"
+            )
+
+
 def load_annotations(hosts, stages, report):
     callbacks = [
         dict(
@@ -279,8 +356,24 @@ def analyze(path):
         # gate precedes both consumer join and the strict prefetch wait.
         upper = min(join["start"], prefetch_wait["start"])
         lower = compute["end"]
-        if lower > upper + ORDER_US or not span[0] <= lower <= upper <= span[1]:
-            reasons["boundary_order_or_calibration_span_invalid"] += 1
+        row["boundary_diagnostic_us"] = dict(
+            lower_minus_prefetch_end=lower - left["end"],
+            upper_minus_prefetch_end=upper - left["end"],
+            main_join_start_minus_prefetch_end=join["start"] - left["end"],
+            prefetch_wait_start_minus_prefetch_end=prefetch_wait["start"] - left["end"],
+            lower_minus_calibration_start=lower - span[0],
+            calibration_end_minus_upper=span[1] - upper,
+        )
+        failure = (
+            "inverted_readiness_bounds"
+            if lower > upper
+            else "outside_calibration_span"
+            if not span[0] <= lower <= upper <= span[1]
+            else None
+        )
+        if failure:
+            reasons[failure] += 1
+            row["reason"] = failure
             continue
         row.update(
             **{"class": classify(lower, upper, left["end"], margin)},
@@ -355,6 +448,7 @@ def analyze(path):
     )
     emit("LARGEST_GAPS", sorted(rows, key=lambda row: row["gap_us"], reverse=True)[:MAX_EXAMPLES])
     emit("UNMAPPED_EXAMPLES", [row for row in rows if row["class"] == "unmapped"][:MAX_EXAMPLES])
+    render_restat(rows)
     print("TABLE class | n | percent | mean_us | p50_us | p95_us | gap_sum_share_percent")
     for kind, values in summarize(rows).items():
         if "count" in values:

@@ -17,6 +17,7 @@ from analyze_prefetch_compute_overlap import (
     load_annotations,
     load_breakdown,
     load_pair,
+    restat_host_gaps,
     summarize,
 )
 
@@ -94,6 +95,44 @@ class OverlapTests(unittest.TestCase):
 
     def test_empty_group_has_no_invented_ratio(self):
         self.assertNotIn("late_vs_early", summarize([]))
+
+    def test_restat_keeps_unknown_visible_and_subtracts_only_post_prefetch_time(self):
+        rows = [
+            dict(gap_us=40, **{"class": "early"}),
+            dict(gap_us=300, readiness_minus_prefetch_end_bounds_us=[250, 260], **{"class": "late"}),
+            dict(gap_us=20, **{"class": "uncertain"}),
+            dict(gap_us=400, **{"class": "unmapped"}),
+        ]
+        result = restat_host_gaps(rows)
+        all_rows = result["all_samples"]
+        self.assertEqual(all_rows["method1_drop_late"]["count"], 3)
+        self.assertAlmostEqual(all_rows["method1_drop_late"]["mean_us"], 460 / 3)
+        self.assertEqual(all_rows["method2_subtract_remaining_compute"]["mean_us"], 126.25)
+        self.assertEqual(all_rows["subtracted_total_us"], 255)
+        known = result["decidable_only"]
+        self.assertEqual(known["excluded"], 2)
+        self.assertEqual(known["method2_subtract_remaining_compute"]["mean_us"], 42.5)
+        self.assertEqual(known["method2_aligned_boundary_low"]["mean_us"], 40)
+        self.assertEqual(known["method2_aligned_boundary_high"]["mean_us"], 45)
+
+    def test_restat_does_not_clamp_invalid_deduction_to_zero(self):
+        result = restat_host_gaps(
+            [dict(gap_us=10, readiness_minus_prefetch_end_bounds_us=[20, 30], **{"class": "late"})]
+        )["all_samples"]
+        self.assertEqual(result["method2_subtract_remaining_compute"]["mean_us"], 10)
+        self.assertEqual(result["counts"]["invalid_subtraction"], 1)
+
+    def test_restat_zero_margin_is_separate(self):
+        row = dict(
+            gap_us=50,
+            readiness_minus_prefetch_end_bounds_us=[10, 10],
+            zero_margin_class="late",
+            **{"class": "uncertain"},
+        )
+        self.assertEqual(restat_host_gaps([row])["all_samples"]["method2_subtract_remaining_compute"]["mean_us"], 50)
+        result = restat_host_gaps([row], "zero_margin_class")["all_samples"]
+        self.assertEqual(result["method1_drop_late"]["count"], 0)
+        self.assertEqual(result["method2_subtract_remaining_compute"]["mean_us"], 40)
 
     def test_load_pair_unknown_is_not_empty(self):
         self.assertEqual(load_pair(None, 0), "unknown")
