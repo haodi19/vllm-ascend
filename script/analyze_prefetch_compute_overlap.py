@@ -14,6 +14,8 @@ from inspect_moe_profile import _stats
 
 ORDER_US = 1.0
 MAX_EXAMPLES = 8
+# ID and log2phy staging, plus optional router-weight staging for LRC.
+SUPPORTED_STAGING_COPY_COUNTS = frozenset((2, 3))
 
 
 def emit(label, value):
@@ -54,8 +56,10 @@ def bind_streams(data):
 def consumer_boundary(segment):
     """Bracket readiness using the last compute and subsequent consumer join.
 
-    Require the baseline decode tail: Event wait, exactly two D2H task
-    records, reactive publish. Extra compute (e.g. substitution/pruning) or
+    Require the baseline decode tail: Event wait, two or three copy task
+    records, reactive publish. The third is compatible with optional LRC
+    router-weight D2H staging; task names alone do not prove tensor identity.
+    Extra compute (e.g. substitution/pruning) or
     absent task records make this boundary unavailable rather than guessed.
     The Event wait START is an upper bound, not its completion time.
     """
@@ -64,8 +68,8 @@ def consumer_boundary(segment):
         return None, "missing_consumer_event_wait"
     index = joins[-1]
     tail = [task_type(row["name"]) for row in segment[index + 1 :]]
-    if tail.count("copy") != 2 or any(kind not in ("copy", "control") for kind in tail):
-        return None, "consumer_tail_not_two_copies_and_controls"
+    if tail.count("copy") not in SUPPORTED_STAGING_COPY_COUNTS or any(kind not in ("copy", "control") for kind in tail):
+        return None, "unsupported_consumer_staging_tail"
     previous = [row for row in segment[:index] if task_type(row["name"]) == "compute"]
     if not previous:
         return None, "missing_prejoin_compute"
@@ -162,9 +166,10 @@ def load_breakdown(rows):
         cohort: dict(
             total_count=result["all"][cohort]["count"],
             late_count=result["late"][cohort]["count"],
+            unmapped_count=result["unmapped"][cohort]["count"],
             late_pct=(
                 100 * result["late"][cohort]["count"] / result["all"][cohort]["count"]
-                if result["all"][cohort]["count"]
+                if result["all"][cohort]["count"] and not result["unmapped"][cohort]["count"]
                 else None
             ),
         )
@@ -284,8 +289,19 @@ def analyze(path):
             last_compute_name=compute["name"],
             join_name=join["name"],
             join_ids=join["ids"],
+            staging_copy_count=sum(task_type(item["name"]) == "copy" for item in segment[segment.index(join) + 1 :]),
         )
     emit("TRACE", str(path))
+    mapped_count = sum(row["class"] != "unmapped" for row in rows)
+    emit(
+        "CLASSIFICATION_STATUS",
+        dict(
+            status="complete" if mapped_count == len(rows) and rows else "partial" if mapped_count else "unavailable",
+            mapped=mapped_count,
+            total=len(rows),
+            meaning="unmapped samples have no early/late decision; zero recognized late is not zero actual late",
+        ),
+    )
     emit(
         "BOUNDARY",
         dict(
@@ -365,7 +381,7 @@ def main():
         print("预取结束=外层host_callback结束；Host间隔=同层相邻按需开始-预取结束。")
         print("计算边界=消费者gate前主流推进（含真实路由及依赖），不是纯MoE+Attention算子耗时。")
         print("区间下界=join前最后计算任务结束；上界=min(主流join开始,预取严格wait开始)。")
-        print("主流join必须有两次copy后接按需publish；不符合则unmapped，不猜测。")
+        print("主流join后识别2/3次copy再接按需publish；第三次与LRC路由权重回传路径相容，不按名称猜张量身份。")
         print("early/late采用校准端点包络宽度加1us做敏感性余量；不是严格误差保证。")
         print("全部保留零加载和长尾，不做IQR、不设5ms上限；uncertain/unmapped均计入总数。")
         print("零加载按同次采集call ID的准备/scale标记及report加载总数核验，不按时长猜测；缺证据=unknown。")

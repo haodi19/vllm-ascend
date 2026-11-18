@@ -47,8 +47,21 @@ class OverlapTests(unittest.TestCase):
             self.segment() + [task("Transpose", 506, 507)],
             self.segment()[2:],
             self.segment()[:2] + self.segment()[3:],
+            self.segment() + [task("MEMCPY_ASYNC", 506, 507), task("MEMCPY_ASYNC", 508, 509)],
         ):
             self.assertIsNone(consumer_boundary(segment)[0])
+
+    def test_three_copy_lrc_tail_from_real_capture(self):
+        segment = self.segment() + [task("MEMCPY_ASYNC", 506, 507)]
+        (compute, join), reason = consumer_boundary(segment)
+        self.assertEqual(reason, "ok")
+        self.assertEqual(compute["end"], 30)
+        self.assertEqual(join["start"], 32)
+
+    def test_unmapped_is_not_reported_as_zero_late_rate(self):
+        result = load_breakdown([dict(gap_us=300, load_pair="both_zero", **{"class": "unmapped"})])
+        self.assertIsNone(result["late_rate_by_load_pair"]["both_zero"]["late_pct"])
+        self.assertEqual(result["late_rate_by_load_pair"]["both_zero"]["unmapped_count"], 1)
 
     def test_uncertainty_not_forced_into_early_or_late(self):
         self.assertEqual(classify(90, 110, 100, 0), "uncertain")
@@ -186,6 +199,7 @@ class OverlapTests(unittest.TestCase):
             add("DAVID_EVENT_WAIT", join, finish, "main")
             add("MEMCPY_ASYNC", finish + 1, finish + 2, "main")
             add("MEMCPY_ASYNC", finish + 3, finish + 4, "main")
+            add("MEMCPY_ASYNC", finish + 4.25, finish + 4.5, "main")
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "trace_view_aligned.json"
             path.write_text(json.dumps(dict(traceEvents=records)), encoding="utf-8")
