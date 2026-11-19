@@ -4,18 +4,56 @@
 import argparse
 import contextlib
 import json
+import sys
 from pathlib import Path
 
 from export_moe_aligned_profile import OUTPUT_NAME, publish_aligned_capture
 from inspect_moe_profiler_clocks import discover_roots
-from moe_experiment_tables import CASE_DESCRIPTIONS, write_tables
+from moe_experiment_tables import CASE_DESCRIPTIONS, bubble_records, number, table, write_tables
 from moe_overlap_report import overlap_summary
 from moe_tpot import print_tpot_comparison
 from run_cpp_mte_profile_compare import loading_bubble_summary, print_comparison
 from run_moe_host_sync import assess_profile_report
 
 
+def print_bubble_digest(bubbles, run, labels, stream, console):
+    """Show the requested full-window measurements without making users search files."""
+    records = bubble_records(bubbles)
+    rows = []
+    for label in labels:
+        matches = [
+            value
+            for case, kind, value in records
+            if case == label and kind == "TARGET_GAPS_US" and value.get("scope") == "full_capture"
+        ]
+        value = matches[0] if len(matches) == 1 else {}
+        kept = value.get("kept") or {}
+        rows.append(
+            [
+                label,
+                kept.get("n", "—"),
+                number(kept.get("mean")),
+                number(kept.get("p50")),
+                number(kept.get("p95")),
+                number(kept["total"] / 1000) if "total" in kept else "—",
+                value.get("excluded_short", "—"),
+                value.get("excluded_long", "—"),
+            ]
+        )
+    print(f"\n===== 可直接复制：{run.name} 加载流空泡 =====", file=console)
+    print(f"RUN={run}; stream={stream}; 对齐后全窗口（含Prefill）；10≤gap<5000μs，不做IQR。", file=console)
+    print(table(["配置", "样本数", "均值μs", "P50μs", "P95μs", "累计ms", "排除<10μs", "排除≥5ms"], rows), file=console)
+    case = ""
+    for line in bubbles.splitlines():
+        if line.startswith("CASE="):
+            case = line.split(";", 1)[0]
+        elif line.startswith(("BUBBLES_UNAVAILABLE", "BUBBLES_PARTIAL")):
+            print(f"{case}: {line}", file=console)
+    print("===== 复制到此处 =====\n", file=console, flush=True)
+
+
 def refresh(run, stream):
+    console = sys.stdout
     labels = [label for label in CASE_DESCRIPTIONS if (run / label / "profile_report.json").is_file()]
     if not labels:
         raise ValueError(f"no comparison reports: {run}")
@@ -56,6 +94,7 @@ def refresh(run, stream):
         print_comparison(reports, run, labels)
         bubbles = loading_bubble_summary(reports, run, labels, stream)
         print(bubbles)
+        print_bubble_digest(bubbles, run, labels, stream, console)
         if "BUBBLES_UNAVAILABLE" in bubbles:
             raise ValueError("aligned bubbles unavailable; original summary not replaced")
         print_tpot_comparison(reports, run, labels)
@@ -73,7 +112,11 @@ def main():
     run = args.run.resolve(strict=True)
     children = [run / name for name in ("token5", "token128") if (run / name).is_dir()]
     for child in children or [run]:
-        refresh(child, args.stream_name)
+        try:
+            refresh(child, args.stream_name)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"ALIGNED_REFRESH_FAILED {child.name}: {type(exc).__name__}: {exc}", flush=True)
+            return 1
     if children:
         with (run / "summary.txt").open("w", encoding="utf-8") as output:
             for child in children:
@@ -82,7 +125,8 @@ def main():
                     for line in source:
                         output.write(line)
         print(f"COMBINED SUMMARY: {run / 'summary.txt'}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

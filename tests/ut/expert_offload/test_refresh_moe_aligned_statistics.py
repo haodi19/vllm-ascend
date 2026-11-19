@@ -16,6 +16,33 @@ import run_cpp_mte_profile_compare as compare
 
 
 class RefreshTests(unittest.TestCase):
+    def test_console_digest_only_contains_full_window_and_preserves_missing_data(self):
+        text = "CASE=callback; traces=1\n"
+        for scope, mean in (("full_capture", 123), ("callback_window", 999)):
+            text += (
+                "TARGET_GAPS_US "
+                + json.dumps(
+                    dict(
+                        scope=scope,
+                        kept=dict(n=2, mean=mean, p50=mean, p95=mean, total=mean * 2),
+                        excluded_short=7,
+                        excluded_long=1,
+                    )
+                )
+                + "\n"
+            )
+        text += "CASE=mte_combined; traces=1\nBUBBLES_UNAVAILABLE: missing alignment\n"
+        console, hidden = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(hidden):
+            refresh.print_bubble_digest(text, Path("token128"), ["callback", "mte_combined"], "Stream 56", console)
+        output = console.getvalue()
+        self.assertIn("token128", output)
+        self.assertIn("| callback | 2 | 123.000 | 123.000 | 123.000 | 0.246 | 7 | 1 |", output)
+        self.assertNotIn("999", output)
+        self.assertIn("| mte_combined | — |", output)
+        self.assertIn("CASE=mte_combined: BUBBLES_UNAVAILABLE: missing alignment", output)
+        self.assertEqual(hidden.getvalue(), "")
+
     def test_bubbles_reject_raw_and_select_validated_corrected_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
