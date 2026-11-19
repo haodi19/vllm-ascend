@@ -12,6 +12,7 @@ import contextlib
 import csv
 import json
 import math
+import os
 import sqlite3
 import statistics
 import time
@@ -23,6 +24,9 @@ from moe_experiment_tables import number, table
 MAX_RECORDS = 1_000_000
 MAX_TABLE_ROWS = 24
 DB_TIMEOUT_SECONDS = 60
+MAX_INVENTORY_DATABASES = 12
+MAX_INVENTORY_ENTRIES = 20000
+MAX_INVENTORY_TABLES = 12
 EXPLICIT_BYTE_KEYS = frozenset(("bytes", "sizebytes", "copysizebytes", "datasizebytes"))
 DIRECTION_KEYS = frozenset(("direction", "copydirection", "memcpykind", "memcpytype", "memcpyoperation"))
 DIRECTIONS = {
@@ -65,6 +69,70 @@ def columns(db, name):
     return {row[1] for row in db.execute('PRAGMA table_info("' + name.replace('"', '""') + '")')}
 
 
+def duration_number(value):
+    """Aligned JSON serializes precise durations as decimal strings, in microseconds."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        value = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def check_sidecars(path):
+    for suffix in ("-wal", "-journal"):
+        sidecar = Path(str(path) + suffix)
+        if sidecar.exists() and sidecar.stat().st_size:
+            with sidecar.open("rb") as source:
+                prefix = source.read(16).hex()
+            raise ValueError(
+                f"nonempty sidecar {sidecar.name}; bytes={sidecar.stat().st_size}; header16={prefix}; "
+                "activity/consistency unknown, not proof of an active capture; original DB not opened"
+            )
+
+
+def inventory_capture(output):
+    """Bounded schema inventory, including raw CANN SQLite files; never parse raw binary data."""
+    root = output.parent
+    raw = sorted(p.name for p in root.glob("PROF_*") if p.is_dir())
+    print(f"RAW_PROF_DIRECTORIES={raw[:8]}; count={len(raw)}")
+    candidates, visited = [], 0
+    truncated = False
+    for folder, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not Path(folder, d).is_symlink())
+        visited += len(files) + len(dirs)
+        if visited > MAX_INVENTORY_ENTRIES:
+            truncated = True
+            break
+        for name in sorted(files):
+            path = Path(folder, name)
+            if path.suffix.lower() not in (".db", ".sqlite", ".sqlite3") or path.is_symlink():
+                continue
+            candidates.append(path)
+    # Prioritize raw runtime/task databases over unrelated analysis databases.
+    candidates.sort(key=lambda p: (not any(k in p.name.lower() for k in ("runtime", "task", "memcpy")), str(p)))
+    print(f"DB_INVENTORY found={len(candidates)}; scanned_entries={visited}; truncated={truncated}")
+    for path in candidates[:MAX_INVENTORY_DATABASES]:
+        print(f"DB_INVENTORY_FILE={path.relative_to(root)}")
+        try:
+            check_sidecars(path)
+            with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
+                deadline = time.monotonic() + DB_TIMEOUT_SECONDS
+                db.set_progress_handler(lambda deadline=deadline: int(time.monotonic() > deadline), 10000)
+                names = [
+                    r[0]
+                    for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name LIMIT 257")
+                ]
+                relevant = [n for n in names if any(k in n.lower() for k in ("memcpy", "memory", "task", "bandwidth"))]
+                print(f"DB_TABLES first40={names[:40]}; count_at_most257={len(names)}")
+                for name in relevant[:MAX_INVENTORY_TABLES]:
+                    print(f"CANDIDATE_SCHEMA {name}: {sorted(columns(db, name))[:40]}")
+        except (ValueError, OSError, sqlite3.Error) as error:
+            print(f"DB_INVENTORY_UNAVAILABLE: {error}")
+    print("以上仅目录/表结构，未将原始库中未知单位或未关联字段计入带宽；不启动离线解析。")
+
+
 def add_sample(groups, missing, device, stream, kind, size, duration_ns):
     valid_lane = device is not None and stream is not None
     if not valid_lane:
@@ -82,12 +150,9 @@ def add_sample(groups, missing, device, stream, kind, size, duration_ns):
 
 
 def read_database(path):
-    for suffix in ("-wal", "-journal"):
-        sidecar = Path(str(path) + suffix)
-        if sidecar.exists() and sidecar.stat().st_size:
-            raise ValueError("database has an active journal; use a completed capture")
+    check_sidecars(path)
     groups, missing = collections.defaultdict(list), collections.Counter()
-    with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+    with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
         deadline = time.monotonic() + DB_TIMEOUT_SECONDS
         db.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         required = {
@@ -173,14 +238,18 @@ def read_json_trace(path):
             raise ValueError("too many trace records; no partial statistics")
     groups, missing = collections.defaultdict(list), collections.Counter()
     count = 0
+    duration_types = collections.Counter()
     for pid, tid, kind, size, duration in copies:
         if "ascend hardware" not in processes.get(pid, "").lower():
             continue
         count += 1
+        duration_types[type(duration).__name__] += 1
         # Chrome trace durations are microseconds. Do not subtract epoch-sized float timestamps.
-        duration_ns = duration * 1000 if type(duration) in (int, float) else None
+        duration = duration_number(duration)
+        duration_ns = duration * 1000 if duration is not None else None
         add_sample(groups, missing, pid, lanes.get((pid, tid), f"tid={tid}"), kind, size, duration_ns)
     print(f"JSON_DEVICE_COPY_ROWS={count}; exclusions={dict(missing)}; arg_keys={sorted(keys)[:24]}", flush=True)
+    print(f"JSON_DURATION_TYPES={dict(duration_types)}; 数字字符串按JSON的us单位读取，不代表耗时无效。")
     print("JSON仅接受明确标为bytes的字段；无单位Size不猜测为字节，未知数字方向不猜测枚举。", flush=True)
     return groups
 
@@ -216,11 +285,15 @@ def inspect_capture(root, label):
     print(f"\n===== {label} =====\nCAPTURE={root}", flush=True)
     manifest_path = output.parent / "aligned_profile_manifest.json"
     published = False
+    manifest_status = "missing"
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         published = manifest.get("raw_capture_removed") is True
-    print(f"ALIGNED_DIRECTORY_PUBLISHED={published}; 仅报告已有状态，本脚本不校准或改写时间。")
+        manifest_status = manifest.get("status", "unknown")
+    print(f"ALIGNMENT_MANIFEST={manifest_status}; RAW_CAPTURE_REPLACED={published}; 缺少标记不能判定未对齐。")
     mapping_path = output / "clock_alignment.json"
+    if not mapping_path.is_file():
+        mapping_path = output.parent / "clock_alignment.json"
     if mapping_path.is_file():
         mapping = json.loads(mapping_path.read_text(encoding="utf-8"))
         print(
@@ -228,7 +301,7 @@ def inspect_capture(root, label):
             "元数据存在不等于DB已校正"
         )
     else:
-        print("CLOCK=无同次校准记录；只使用设备任务自身耗时，不做Host/设备配对，不套用其他采集校准。")
+        print("CLOCK=当前采集根目录未找到校准记录，状态未知；只用设备自身耗时，不做Host配对或跨采集校准。")
     groups = {}
     databases = sorted(output.glob("ascend_pytorch_profiler*.db"))
     if len(databases) == 1:
@@ -270,6 +343,7 @@ def inspect_capture(root, label):
             with path.open(encoding="utf-8-sig", newline="") as source:
                 header = next(csv.reader(source), [])
             print(f"CSV_HEADER {path.name}: {header[:24]}")
+        inventory_capture(output)
     return values
 
 

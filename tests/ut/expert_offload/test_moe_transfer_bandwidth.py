@@ -177,8 +177,42 @@ class TransferBandwidthTests(unittest.TestCase):
     def test_journal_not_opened(self):
         self.database()
         Path(str(self.path) + "-wal").write_bytes(b"active")
-        with self.assertRaisesRegex(ValueError, "active journal"):
+        with self.assertRaisesRegex(ValueError, "activity/consistency unknown"):
             self.module.read_database(self.path)
+
+    def test_aligned_string_duration_and_nonfinite_rejection(self):
+        path = self.trace()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["traceEvents"][0]["dur"] = "100.00000000000001"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        result = self.module.summarize(self.module.read_json_trace(path))
+        self.assertAlmostEqual(result[("5", "Stream 56", "H2D", 8388608)]["gbps"], 83.88608)
+        for invalid in (True, None, "NaN", "Infinity", "-1", "0", "wrong", []):
+            with self.subTest(value=invalid):
+                self.assertIsNone(self.module.duration_number(invalid))
+        self.assertIn("'str': 1", self.stdout.getvalue())
+
+    def test_root_mapping_and_exported_manifest_not_raw_replacement(self):
+        self.database()
+        (self.root / "clock_alignment.json").write_text(
+            json.dumps({"status": "calibration_validated", "device_scale": "0.99997"}), encoding="utf-8"
+        )
+        (self.root / "aligned_profile_manifest.json").write_text(json.dumps({"status": "exported"}), encoding="utf-8")
+        self.module.inspect_capture(self.output, "new")
+        self.assertIn("ALIGNMENT_MANIFEST=exported; RAW_CAPTURE_REPLACED=False", self.stdout.getvalue())
+        self.assertIn("status=calibration_validated", self.stdout.getvalue())
+
+    def test_raw_inventory_is_read_only_and_reports_schema(self):
+        raw = self.root / "PROF_example" / "device_0" / "sqlite"
+        raw.mkdir(parents=True)
+        db_path = raw / "runtime.db"
+        with contextlib.closing(sqlite3.connect(db_path)) as db:
+            db.executescript("CREATE TABLE MemcpyRecords (task_id INTEGER, size INTEGER, copy_kind INTEGER);")
+        before = {p.relative_to(self.root): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        self.module.inventory_capture(self.output)
+        after = {p.relative_to(self.root): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+        self.assertIn("CANDIDATE_SCHEMA MemcpyRecords", self.stdout.getvalue())
 
 
 if __name__ == "__main__":
