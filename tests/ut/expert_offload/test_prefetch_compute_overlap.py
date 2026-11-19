@@ -20,6 +20,7 @@ from analyze_prefetch_compute_overlap import (
     restat_host_gaps,
     summarize,
 )
+from moe_callback_compute_boundary import native_gate
 
 
 def task(name, start, end):
@@ -208,7 +209,7 @@ class OverlapTests(unittest.TestCase):
         self.assertFalse(issues)
         self.assertEqual(loads["1"], 1)
 
-    def test_saved_capture_end_to_end(self):
+    def test_saved_capture_end_to_end(self, backend="mte", gate_name="HOST_CPU"):
         records = [dict(ph="M", name="process_name", pid="device", args=dict(name="Ascend Hardware"))]
 
         def add(name, start, end, tid, pid="device"):
@@ -220,8 +221,11 @@ class OverlapTests(unittest.TestCase):
             add("moe_offload/synchronize" + suffix, start + 1, end - 1, "worker", "host")
 
         def handshake(tid, publish, wait, end):
-            add("host_sync_publish_1", publish, publish + 1, tid)
-            add("host_sync_wait_2", wait, end, tid)
+            if backend == "mte":
+                add("host_sync_publish_1", publish, publish + 1, tid)
+                add("host_sync_wait_2", wait, end, tid)
+            else:
+                add(gate_name, publish, end, tid)
 
         host("reactive", 0, 1, 10, 20)
         host("prefetch", 1, 2, 100, 200)
@@ -256,13 +260,30 @@ class OverlapTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with contextlib.redirect_stdout(io.StringIO()) as output:
-                analyze(path)
+                computed = analyze(path, backend=backend)
             result = next(line[7:] for line in output.getvalue().splitlines() if line.startswith("RESULT "))
             result = json.loads(result)
             self.assertEqual(result["all"]["count"], 2)
             self.assertEqual(result["early"]["mean_us"], 12)
             self.assertEqual(result["late"]["mean_us"], 55)
             self.assertEqual(result["unmapped"]["count"], 0)
+            self.assertEqual(computed["conservative"]["all_samples"]["method1_drop_late"]["mean_us"], 12)
+            self.assertEqual(
+                computed["conservative"]["all_samples"]["method2_subtract_remaining_compute"]["mean_us"], 17.25
+            )
+
+    def test_native_callback_uses_consumer_join_not_prefetch_callback_start(self):
+        self.test_saved_capture_end_to_end(backend="callback")
+
+    def test_notify_wait_is_not_automatically_a_callback(self):
+        with self.assertRaisesRegex(ValueError, "native callback device gates not uniquely identifiable"):
+            self.test_saved_capture_end_to_end(backend="callback", gate_name="NOTIFY_WAIT")
+
+    def test_only_explicit_native_task_names_or_types(self):
+        self.assertTrue(native_gate(dict(name="HOST_CPU")))
+        self.assertTrue(native_gate(dict(name="opaque", args={"Task Type": "HOST_FUNC"})))
+        for name in ("DAVID_EVENT_WAIT", "NOTIFY_WAIT", "aclnnHostFunc", "host_callback_mstx"):
+            self.assertFalse(native_gate(dict(name=name)))
 
 
 if __name__ == "__main__":

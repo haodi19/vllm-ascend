@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Include same-capture overlap diagnostics in the normal experiment summary."""
 
+import argparse
 import contextlib
 import json
+import os
+import time
 from pathlib import Path
 
 from analyze_prefetch_compute_overlap import analyze
@@ -15,7 +18,7 @@ def overlap_summary(reports, root, labels):
     results, classification_rows, restat_rows = {}, [], []
     lines = [
         "\n## 预取→按需 Host间隔与计算推进\n",
-        "仅对纯MTE消费者处严格等待的组识别计算边界；回调组保留原Host间隔，不套用MTE publish/wait配对规则。",
+        "MTE用publish/wait识别边界；回调组独立检查原生Host任务的数量、顺序和覆盖关系，不能识别则报告缺失。",
         "背景：从预取到同层按需的过程中，预取回调与按需之前的模型计算并行。"
         "可能是模型计算先结束，也可能是预取回调先结束。若预取回调先结束，"
         "还要等剩余计算，这段等待可能拉长预取→按需Host间隔、抬高均值。"
@@ -28,7 +31,8 @@ def overlap_summary(reports, root, labels):
     with (root / "overlap_details.log").open("w", encoding="utf-8") as details:
         for label in labels:
             report = reports.get(label, {})
-            if report.get("host_backend") != "mte":
+            backend = report.get("host_backend")
+            if backend not in ("mte", "callback"):
                 continue
             try:
                 traces = report.get("profile_trace_data", [])
@@ -41,7 +45,7 @@ def overlap_summary(reports, root, labels):
                 path = aligned_trace_path(Path(trace["file"]))
                 details.write(f"CASE={label}\n")
                 with progress(f"prefetch overlap {label}"), contextlib.redirect_stdout(details):
-                    result = analyze(path)
+                    result = analyze(path) if backend == "mte" else analyze(path, backend="callback")
                 results[label] = result
                 lines.append(
                     f"{label}：保守余量={number(result['sensitivity_margin_us'])}μs；"
@@ -160,3 +164,36 @@ def overlap_summary(reports, root, labels):
         "",
     ]
     return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Recompute callback and MTE overlap from saved aligned profiles only")
+    parser.add_argument("--run", type=Path, required=True, help="one comparison run or a token5/token128 batch")
+    args = parser.parse_args()
+    root = args.run.resolve(strict=True)
+    runs = [root / name for name in ("token5", "token128") if (root / name).is_dir()] or [root]
+    output = root / f"overlap_restat_{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+    output.mkdir(exist_ok=False)
+    summary = output / "summary.txt"
+    with summary.open("w", encoding="utf-8") as report:
+        intro = "只读已有对齐profile；不加载模型、不重新采集；原报告保持不变。\n"
+        print(intro, end="")
+        report.write(intro)
+        for run in runs:
+            labels = ["callback_legacy", "callback_python", "callback", "mte_default", "mte_combined"]
+            reports = {}
+            for label in labels:
+                path = run / label / "profile_report.json"
+                if path.is_file():
+                    reports[label] = json.loads(path.read_text(encoding="utf-8"))
+            destination = output / run.name
+            destination.mkdir(exist_ok=False)
+            text = f"\nRUN={run}\n" + overlap_summary(reports, destination, labels)
+            print(text, flush=True)
+            report.write(text)
+            report.flush()
+    print(f"SUMMARY_FILE={summary}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

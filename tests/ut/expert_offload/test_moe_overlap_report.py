@@ -16,6 +16,25 @@ with patch.object(sys, "path", [str(Path(__file__).resolve().parents[3] / "scrip
 
 
 class OverlapReportTests(unittest.TestCase):
+    def test_callback_report_is_analyzed_with_its_own_backend(self):
+        reports = {
+            "callback": dict(
+                host_backend="callback",
+                profile_status="complete",
+                profile_trace_data=[dict(file="capture/trace_view.json", usable=True, json_complete=True)],
+            )
+        }
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(report, "aligned_trace_path", return_value=Path("aligned.json")),
+            patch.object(report, "analyze", side_effect=ValueError("native gates missing")) as analyze,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            text = report.overlap_summary(reports, Path(directory), ["callback"])
+        analyze.assert_called_once_with(Path("aligned.json"), backend="callback")
+        self.assertIn("OVERLAP_UNAVAILABLE callback", text)
+        self.assertIn("native gates missing", text)
+
     def test_missing_capture_does_not_become_zero_or_use_raw(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(report, "analyze") as analyze:
             root = Path(directory)

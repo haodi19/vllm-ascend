@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Analyze saved, aligned MTE captures; never load Torch or run inference."""
+"""Analyze saved, aligned offload captures; never load Torch or run inference."""
 
 import argparse
 import collections
@@ -12,6 +12,7 @@ from diagnose_moe_empty_load_gaps import STAGES, annotate_callbacks, validate_re
 from diagnose_mte_wait_timeline import read_trace, record, task_pairs
 from export_moe_aligned_profile import aligned_trace_path
 from inspect_moe_profile import _stats
+from moe_callback_compute_boundary import bind_callback_streams
 
 ORDER_US = 1.0
 MAX_EXAMPLES = 8
@@ -256,7 +257,9 @@ def load_breakdown(rows):
     return result
 
 
-def analyze(path):
+def analyze(path, backend="mte"):
+    if backend not in ("mte", "callback"):
+        raise ValueError("unknown Host backend")
     mapping = json.loads(path.with_name("clock_alignment.json").read_text(encoding="utf-8"))
     if (
         mapping.get("status") != "calibration_validated"
@@ -266,7 +269,7 @@ def analyze(path):
     if Path(mapping["aligned_trace"]).resolve() != path.resolve():
         raise ValueError("alignment metadata refers to a different trace")
     data = read_trace(path)
-    bindings = bind_streams(data)
+    bindings = bind_streams(data) if backend == "mte" else bind_callback_streams(path, data)
     stream, reactive_pairs = bindings["reactive"]
     prefetch_pairs = bindings["prefetch"][1]
     tasks = []
@@ -354,14 +357,16 @@ def analyze(path):
             reasons["consumer_join_ends_before_prefetch_wait"] += 1
             row["reason"] = "consumer_join_ends_before_prefetch_wait"
             continue
-        # gate precedes both consumer join and the strict prefetch wait.
-        upper = min(join["start"], prefetch_wait["start"])
+        # Native callback begins on prefetch stream before its consumer is reached;
+        # its gate START cannot bound main-stream readiness. Only MTE late-wait can.
+        upper = min(join["start"], prefetch_wait["start"]) if backend == "mte" else join["start"]
         lower = compute["end"]
         row["boundary_diagnostic_us"] = dict(
             lower_minus_prefetch_end=lower - left["end"],
             upper_minus_prefetch_end=upper - left["end"],
             main_join_start_minus_prefetch_end=join["start"] - left["end"],
-            prefetch_wait_start_minus_prefetch_end=prefetch_wait["start"] - left["end"],
+            prefetch_device_gate_start_minus_prefetch_end=prefetch_wait["start"] - left["end"],
+            prefetch_wait_start_minus_prefetch_end=(prefetch_wait["start"] - left["end"] if backend == "mte" else None),
             lower_minus_calibration_start=lower - span[0],
             calibration_end_minus_upper=span[1] - upper,
         )
@@ -390,6 +395,7 @@ def analyze(path):
     emit(
         "CLASSIFICATION_STATUS",
         dict(
+            backend=backend,
             status="complete" if mapped_count == len(rows) and rows else "partial" if mapped_count else "unavailable",
             mapped=mapped_count,
             total=len(rows),
@@ -463,6 +469,7 @@ def analyze(path):
             )
 
     return dict(
+        backend=backend,
         trace=str(path),
         rows=rows,
         classification=summarize(rows),
