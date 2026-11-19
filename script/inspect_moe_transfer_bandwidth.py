@@ -10,11 +10,15 @@ import argparse
 import collections
 import contextlib
 import csv
+import hashlib
 import json
 import math
 import os
+import shutil
 import sqlite3
 import statistics
+import struct
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,6 +31,9 @@ DB_TIMEOUT_SECONDS = 60
 MAX_INVENTORY_DATABASES = 12
 MAX_INVENTORY_ENTRIES = 20000
 MAX_INVENTORY_TABLES = 12
+MAX_SNAPSHOT_BYTES = 2 * 1024**3
+SNAPSHOT_RESERVE_BYTES = 256 * 1024**2
+COPY_CHUNK_BYTES = 1024**2
 EXPLICIT_BYTE_KEYS = frozenset(("bytes", "sizebytes", "copysizebytes", "datasizebytes"))
 DIRECTION_KEYS = frozenset(("direction", "copydirection", "memcpykind", "memcpytype", "memcpyoperation"))
 DIRECTIONS = {
@@ -80,16 +87,103 @@ def duration_number(value):
     return value if math.isfinite(value) and value > 0 else None
 
 
-def check_sidecars(path):
-    for suffix in ("-wal", "-journal"):
-        sidecar = Path(str(path) + suffix)
-        if sidecar.exists() and sidecar.stat().st_size:
-            with sidecar.open("rb") as source:
-                prefix = source.read(16).hex()
-            raise ValueError(
-                f"nonempty sidecar {sidecar.name}; bytes={sidecar.stat().st_size}; header16={prefix}; "
-                "activity/consistency unknown, not proof of an active capture; original DB not opened"
-            )
+def file_signature(path):
+    if not path.exists():
+        return None
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino
+
+
+def copy_hash(source, destination=None):
+    digest = hashlib.sha256()
+    target = destination.open("wb") if destination is not None else contextlib.nullcontext()
+    with source.open("rb") as incoming, target as outgoing:
+        while chunk := incoming.read(COPY_CHUNK_BYTES):
+            digest.update(chunk)
+            if outgoing is not None:
+                outgoing.write(chunk)
+    return digest.digest()
+
+
+def wal_checksum(data, endian, state=(0, 0)):
+    first, second = state
+    for a, b in struct.iter_unpack(endian + "II", data):
+        first = (first + a + second) & 0xFFFFFFFF
+        second = (second + b + first) & 0xFFFFFFFF
+    return first, second
+
+
+def validate_wal(path):
+    """Validate a frozen WAL, refusing malformed/stale tails instead of silently losing frames.
+
+    Format: https://www.sqlite.org/fileformat2.html#wal_format
+    This conservative reader can reject a valid reused WAL with stale trailing frames.
+    """
+    deadline = time.monotonic() + DB_TIMEOUT_SECONDS
+    with path.open("rb") as source:
+        header = source.read(32)
+        if len(header) != 32:
+            raise ValueError("incomplete WAL header")
+        magic, version, page_size, _, salt1, salt2, c1, c2 = struct.unpack(">8I", header)
+        if magic not in (0x377F0682, 0x377F0683) or version != 3007000:
+            raise ValueError("unsupported WAL header")
+        if page_size < 512 or page_size > 65536 or page_size & (page_size - 1):
+            raise ValueError("invalid WAL page size")
+        endian = "<" if magic == 0x377F0682 else ">"
+        state = wal_checksum(header[:24], endian)
+        if state != (c1, c2):
+            raise ValueError("WAL header checksum mismatch")
+        frames, commits = 0, 0
+        while frame := source.read(24):
+            data = source.read(page_size)
+            if len(frame) != 24 or len(data) != page_size:
+                raise ValueError("incomplete WAL frame")
+            page, committed_pages, s1, s2, c1, c2 = struct.unpack(">6I", frame)
+            state = wal_checksum(data, endian, wal_checksum(frame[:8], endian, state))
+            if page == 0 or (s1, s2) != (salt1, salt2) or state != (c1, c2):
+                raise ValueError("invalid or stale WAL frame; no partial snapshot used")
+            frames += 1
+            commits += committed_pages > 0
+            if time.monotonic() > deadline:
+                raise ValueError("WAL validation timed out")
+    print(f"WAL_VALIDATED frames={frames}; commit_markers={commits}", flush=True)
+
+
+@contextlib.contextmanager
+def database_connection(path):
+    """Read stable archives; SQLite can write only in a disposable copy when WAL exists."""
+    wal, journal = Path(str(path) + "-wal"), Path(str(path) + "-journal")
+    signatures = {p: file_signature(p) for p in (path, wal, journal)}
+    if signatures[journal] and signatures[journal][0]:
+        raise ValueError("nonempty rollback journal; activity/consistency unknown; original DB not opened")
+    if not signatures[wal] or not signatures[wal][0]:
+        with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
+            yield db
+            if signatures != {p: file_signature(p) for p in signatures}:
+                raise ValueError("source DB changed during reading; results discarded")
+        return
+    total = signatures[path][0] + signatures[wal][0]
+    if total > MAX_SNAPSHOT_BYTES:
+        raise ValueError("DB+WAL exceeds 2 GiB temporary snapshot limit")
+    with tempfile.TemporaryDirectory(prefix="moe_profile_db_") as temporary:
+        directory = Path(temporary)
+        if shutil.disk_usage(directory).free < total + SNAPSHOT_RESERVE_BYTES:
+            raise ValueError("insufficient temporary disk space for DB+WAL snapshot")
+        copied = directory / path.name
+        hashes = {p: copy_hash(p, directory / p.name) for p in (path, wal)}
+        if signatures != {p: file_signature(p) for p in signatures} or any(
+            copy_hash(p) != digest for p, digest in hashes.items()
+        ):
+            raise ValueError("source DB/WAL changed while copying; snapshot discarded")
+        validate_wal(Path(str(copied) + "-wal"))
+        # Do not use immutable here: SQLite must consume the copied WAL and rebuild its SHM index.
+        with contextlib.closing(sqlite3.connect(str(copied), timeout=5)) as db:
+            deadline = time.monotonic() + DB_TIMEOUT_SECONDS
+            db.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+            if db.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise ValueError("copied DB+WAL failed quick_check")
+            print(f"DB_SNAPSHOT=PASS; source={path.name}; DB+WAL bytes={total}; 原文件未修改", flush=True)
+            yield db
 
 
 def inventory_capture(output):
@@ -97,7 +191,7 @@ def inventory_capture(output):
     root = output.parent
     raw = sorted(p.name for p in root.glob("PROF_*") if p.is_dir())
     print(f"RAW_PROF_DIRECTORIES={raw[:8]}; count={len(raw)}")
-    candidates, visited = [], 0
+    candidates, raw_files, visited = [], [], 0
     truncated = False
     for folder, dirs, files in os.walk(root, followlinks=False):
         dirs[:] = sorted(d for d in dirs if not Path(folder, d).is_symlink())
@@ -107,17 +201,19 @@ def inventory_capture(output):
             break
         for name in sorted(files):
             path = Path(folder, name)
+            if any(part.startswith("PROF_") for part in path.relative_to(root).parts) and len(raw_files) < 16:
+                raw_files.append(str(path.relative_to(root)))
             if path.suffix.lower() not in (".db", ".sqlite", ".sqlite3") or path.is_symlink():
                 continue
             candidates.append(path)
     # Prioritize raw runtime/task databases over unrelated analysis databases.
     candidates.sort(key=lambda p: (not any(k in p.name.lower() for k in ("runtime", "task", "memcpy")), str(p)))
     print(f"DB_INVENTORY found={len(candidates)}; scanned_entries={visited}; truncated={truncated}")
+    print(f"RAW_FILE_EXAMPLES={raw_files}")
     for path in candidates[:MAX_INVENTORY_DATABASES]:
         print(f"DB_INVENTORY_FILE={path.relative_to(root)}")
         try:
-            check_sidecars(path)
-            with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
+            with database_connection(path) as db:
                 deadline = time.monotonic() + DB_TIMEOUT_SECONDS
                 db.set_progress_handler(lambda deadline=deadline: int(time.monotonic() > deadline), 10000)
                 names = [
@@ -150,9 +246,8 @@ def add_sample(groups, missing, device, stream, kind, size, duration_ns):
 
 
 def read_database(path):
-    check_sidecars(path)
     groups, missing = collections.defaultdict(list), collections.Counter()
-    with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)) as db:
+    with database_connection(path) as db:
         deadline = time.monotonic() + DB_TIMEOUT_SECONDS
         db.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         required = {
@@ -277,7 +372,7 @@ def summarize(groups):
     return result
 
 
-def inspect_capture(root, label):
+def inspect_capture(root, label, *, follow_source=True):
     root = root.expanduser().resolve(strict=True)
     output = root if root.name == "ASCEND_PROFILER_OUTPUT" else root / "ASCEND_PROFILER_OUTPUT"
     if not output.is_dir():
@@ -286,6 +381,7 @@ def inspect_capture(root, label):
     manifest_path = output.parent / "aligned_profile_manifest.json"
     published = False
     manifest_status = "missing"
+    manifest = {}
     if manifest_path.is_file():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         published = manifest.get("raw_capture_removed") is True
@@ -344,6 +440,18 @@ def inspect_capture(root, label):
                 header = next(csv.reader(source), [])
             print(f"CSV_HEADER {path.name}: {header[:24]}")
         inventory_capture(output)
+        source_name = manifest.get("source_capture")
+        if follow_source and isinstance(source_name, str) and source_name:
+            source = Path(source_name)
+            print(f"RECORDED_SOURCE_CAPTURE={source}; exists={source.is_dir()}")
+            if (source / "ASCEND_PROFILER_OUTPUT").is_dir() and source.resolve() != output.parent.resolve():
+                if source.name != output.parent.name:
+                    print("SOURCE_NOT_FOLLOWED: capture directory identities differ")
+                else:
+                    print(
+                        "BANDWIDTH_SOURCE_FALLBACK=原始采集；仅比较设备拷贝自身速率，不做Host时间匹配，不合并重复数据。"
+                    )
+                    return inspect_capture(source, label + "/原始采集", follow_source=False)
     return values
 
 
@@ -377,7 +485,8 @@ def main():
     parser.add_argument("--old", type=Path, required=True, help="One saved 128G PR capture root")
     parser.add_argument("--new", type=Path, required=True, help="One saved 84G PR capture root")
     args = parser.parse_args()
-    print("只读已有profile：不导入Torch、不初始化NPU、不启动解析工具、不写文件。")
+    print("只读原始profile：不导入Torch、不初始化NPU、不启动解析工具。")
+    print("带WAL的数据库在临时副本中读取并校验，结束自动清理；不修改或删除任何原始采集文件。")
     print("统计全采集设备MEMCPY，按设备/流/方向/字节数分组；不含Host提交、等待、空泡或Transpose。")
     print("有效GB/s=总字节数/设备任务耗时之和；1GB=10^9字节。不是峰值带宽，不是跨流聚合吞吐，不做IQR。")
     values, failed = [], False

@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 class TransferBandwidthTests(unittest.TestCase):
@@ -174,11 +175,69 @@ class TransferBandwidthTests(unittest.TestCase):
         self.assertIn("H2D_PAIR_UNRESOLVED", self.stdout.getvalue())
         self.assertIn("COMPARE_UNAVAILABLE", self.stdout.getvalue())
 
-    def test_journal_not_opened(self):
+    def test_invalid_wal_is_not_ignored(self):
         self.database()
         Path(str(self.path) + "-wal").write_bytes(b"active")
-        with self.assertRaisesRegex(ValueError, "activity/consistency unknown"):
+        with self.assertRaisesRegex(ValueError, "incomplete WAL header"):
             self.module.read_database(self.path)
+
+    def test_wal_only_committed_update_read_without_source_changes(self):
+        self.database()
+        with contextlib.closing(sqlite3.connect(self.path)) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA wal_autocheckpoint=0")
+            db.execute("UPDATE MEMCPY_INFO SET size=4194304")
+            db.commit()
+            before = {p.name: p.read_bytes() for p in self.output.iterdir()}
+            result = self.module.summarize(self.module.read_database(self.path))
+            self.assertEqual({p.name: p.read_bytes() for p in self.output.iterdir()}, before)
+            self.assertEqual(result[("0", "56", "H2D", 4194304)]["gbps"], 20.97152)
+            self.assertIn("DB_SNAPSHOT=PASS", self.stdout.getvalue())
+
+    def test_corrupted_wal_checksum_rejected(self):
+        self.database()
+        with contextlib.closing(sqlite3.connect(self.path)) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("UPDATE MEMCPY_INFO SET size=4194304")
+            db.commit()
+            payload = bytearray(Path(str(self.path) + "-wal").read_bytes())
+            payload[-1] ^= 1
+            corrupt = self.root / "corrupt.wal"
+            corrupt.write_bytes(payload)
+            with self.assertRaisesRegex(ValueError, "invalid or stale WAL frame"):
+                self.module.validate_wal(corrupt)
+
+    def test_changed_source_snapshot_rejected(self):
+        self.database()
+        with contextlib.closing(sqlite3.connect(self.path)) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("UPDATE MEMCPY_INFO SET size=4194304")
+            db.commit()
+            original_copy_hash = self.module.copy_hash
+
+            def changed_hash(source, destination=None):
+                result = original_copy_hash(source, destination)
+                return result if destination is not None else b"changed"
+
+            with (
+                patch.object(self.module, "copy_hash", side_effect=changed_hash),
+                self.assertRaisesRegex(ValueError, "changed while copying"),
+            ):
+                self.module.read_database(self.path)
+
+    def test_manifest_source_fallback_without_merging(self):
+        self.database()
+        source = self.root / "raw" / self.root.name
+        source_output = source / "ASCEND_PROFILER_OUTPUT"
+        source_output.mkdir(parents=True)
+        self.path.rename(source_output / self.path.name)
+        self.mutate_database("CREATE TABLE TASK (placeholder INTEGER);")
+        (self.root / "aligned_profile_manifest.json").write_text(
+            json.dumps({"status": "exported", "source_capture": str(source)}), encoding="utf-8"
+        )
+        result = self.module.inspect_capture(self.root, "new")
+        self.assertEqual(result[("0", "56", "H2D", 8388608)]["n"], 2)
+        self.assertIn("BANDWIDTH_SOURCE_FALLBACK", self.stdout.getvalue())
 
     def test_aligned_string_duration_and_nonfinite_rejection(self):
         path = self.trace()
