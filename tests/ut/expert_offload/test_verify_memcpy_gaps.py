@@ -42,6 +42,19 @@ class VerifyMemcpyGapsTests(unittest.TestCase):
             return output.getvalue()
 
     @staticmethod
+    def aligned_metadata(path):
+        path.with_name("clock_alignment.json").write_text(
+            json.dumps(
+                dict(
+                    status="calibration_validated",
+                    aligned_trace=str(path.resolve()),
+                    held_out_after=dict(outside_bracket_1us_tolerance=0),
+                )
+            ),
+            encoding="utf-8",
+        )
+
+    @staticmethod
     def rows(output, label):
         prefix = label + " "
         return [json.loads(line[len(prefix) :]) for line in output.splitlines() if line.startswith(prefix)]
@@ -117,6 +130,7 @@ class VerifyMemcpyGapsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace.json"
             path.write_text(json.dumps([self.copy(0, 1), *self.metadata()])[:-1], encoding="utf-8")
+            self.aligned_metadata(path)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 result = self.module.main([str(path), "--stream-name", "Stream 56"])
@@ -133,12 +147,13 @@ class VerifyMemcpyGapsTests(unittest.TestCase):
                 target = root / "profile" / case / policy / "worker" / "ASCEND_PROFILER_OUTPUT" / "trace_view.json"
                 target.parent.mkdir(parents=True)
                 target.write_text(json.dumps([self.copy(0, 1), *self.metadata()]), encoding="utf-8")
+                self.aligned_metadata(target)
             before = sorted(str(path.relative_to(root)) for path in root.rglob("*"))
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 result = self.module.main([str(root), "--stream-name", "Stream 56"])
             self.assertEqual(result, 1)
-            self.assertEqual(len(self.rows(output.getvalue(), "SELECTED")), 3)
+            self.assertEqual(len(self.rows(output.getvalue(), "SELECTED")), len(self.module.CASES) - 1)
             self.assertIn("CASE=mte_combined", output.getvalue())
             self.assertEqual(before, sorted(str(path.relative_to(root)) for path in root.rglob("*")))
 
@@ -197,6 +212,7 @@ class VerifyMemcpyGapsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "trace_view.json"
             path.write_text(json.dumps(data), encoding="utf-8")
+            self.aligned_metadata(path)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 status = self.module.main([str(path), "--stream-name", "Stream 56", "--offload-bubbles", *extra_args])

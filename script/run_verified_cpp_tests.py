@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 
 from align_moe_profile_clock import align_capture
-from export_moe_aligned_profile import export_capture
+from export_moe_aligned_profile import publish_aligned_capture
 from inspect_moe_profiler_clocks import discover_roots
 from moe_expert_trace_report import write_trace
 from moe_tpot import streaming_completion
@@ -637,6 +637,7 @@ def _inference(args, source, backend, env, log):
                 profile_status = finish_profile(opener, args, profile_dir) if profile_enabled else "skipped"
         report["profile_status"] = profile_status
         if align_clocks:
+            report["profile_clock_required"] = True
             try:
                 roots = discover_roots([profile_dir])
                 if len(roots) != 1 or clock_samples is None or clock_samples.get("phase") != "after":
@@ -644,16 +645,16 @@ def _inference(args, source, backend, env, log):
                 report["clock_alignment"] = align_capture(roots[0], clock_samples["samples"])
             except Exception as error:
                 report["clock_alignment"] = {"status": "failed", "error": str(error)}
-            print("CLOCK_ALIGNMENT " + json.dumps(report["clock_alignment"], ensure_ascii=False), flush=True)
             if report["clock_alignment"].get("status") == "calibration_validated":
                 try:
-                    view_base = getattr(args, "aligned_profile_dir", args.output_dir / "profile_aligned")
-                    report["aligned_profile"] = export_capture(
-                        roots[0], report["clock_alignment"], view_base / backend / roots[0].name
+                    report["aligned_profile"] = publish_aligned_capture(roots[0], report["clock_alignment"])
+                    report["clock_alignment"]["aligned_trace"] = str(
+                        roots[0] / "ASCEND_PROFILER_OUTPUT" / "trace_view.json"
                     )
                 except Exception as error:
                     report["aligned_profile"] = {"status": "failed", "error": str(error)}
                 print("ALIGNED_PROFILE " + json.dumps(report["aligned_profile"], ensure_ascii=False), flush=True)
+            print("CLOCK_ALIGNMENT " + json.dumps(report["clock_alignment"], ensure_ascii=False), flush=True)
         report["request_specs"] = request_specs
         if getattr(args, "measure_tpot", False):
             report["stream_samples"] = stream_samples["measured"]

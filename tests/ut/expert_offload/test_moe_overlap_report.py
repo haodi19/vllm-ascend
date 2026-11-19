@@ -64,6 +64,7 @@ class OverlapReportTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(report, "analyze", return_value=result) as analyze,
+            patch.object(report, "aligned_trace_path", return_value=Path("capture/trace_view_aligned.json")),
         ):
             root = Path(directory)
             with contextlib.redirect_stdout(io.StringIO()):
@@ -76,7 +77,11 @@ class OverlapReportTests(unittest.TestCase):
                 saved["conservative"]["all_samples"]["method2_subtract_remaining_compute"]["mean_us"], 21.25
             )
             self.assertIn("1 / 100.000%", text)
-            self.assertIn("decidable_only", text)
+            self.assertNotIn("decidable_only", text)
+            self.assertNotIn("任一端零加载", text)
+            self.assertIn("计算早于预取结束", text)
+            self.assertIn("纳入晚完成的均值增量", text)
+            self.assertIn("不归类为早完成", text)
 
 
 if __name__ == "__main__":

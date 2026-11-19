@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from export_moe_aligned_profile import aligned_trace_path
 from inspect_moe_profile import positive_gap_us, scan_trace
 from inspect_mte_runtime_task import inspect_run
 from moe_outlier_stats import enrich_report
@@ -300,6 +301,10 @@ def assess_profile_report(
             errors.append("No exported trace_view.json despite completed export")
         for path in traces:
             try:
+                if report.get("profile_clock_required"):
+                    if report.get("aligned_profile", {}).get("status") != "exported":
+                        raise ValueError("corrected profile was not published; raw statistics disabled")
+                    path = aligned_trace_path(path)
                 before = path.stat()
                 options = {} if large_gap_us is None else {"large_gap_us": large_gap_us}
                 with progress(f"stream profile intervals: {path}") if retain_trace_data else contextlib.nullcontext():

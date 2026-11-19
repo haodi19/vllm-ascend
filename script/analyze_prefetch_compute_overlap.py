@@ -10,6 +10,7 @@ from pathlib import Path
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
 from diagnose_moe_empty_load_gaps import STAGES, annotate_callbacks, validate_report
 from diagnose_mte_wait_timeline import read_trace, record, task_pairs
+from export_moe_aligned_profile import aligned_trace_path
 from inspect_moe_profile import _stats
 
 ORDER_US = 1.0
@@ -482,7 +483,7 @@ def main():
     parser.add_argument("run", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    paths = sorted((args.run / "profile").glob("mte*/**/ASCEND_PROFILER_OUTPUT/trace_view_aligned.json"))
+    paths = sorted((args.run / "profile").glob("mte*/**/ASCEND_PROFILER_OUTPUT/trace_view.json"))
     if not paths:
         parser.error("no aligned MTE traces under RUN/profile; no model rerun was attempted")
     with args.output.open("x", encoding="utf-8") as output, contextlib.redirect_stdout(output):
@@ -501,7 +502,7 @@ def main():
         print("适用前提：单worker、纯MTE、消费者处延后严格等待；只统计MTE组，不套用回调组。")
         for path in paths:
             try:
-                analyze(path)
+                analyze(aligned_trace_path(path))
             except (ValueError, KeyError, OSError) as exc:
                 emit("FAILED", dict(path=str(path), error=str(exc)))
     print(args.output.read_text(encoding="utf-8"))

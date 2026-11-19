@@ -100,7 +100,10 @@ class CppMteProfileTests(unittest.TestCase):
             self.assertEqual(report["profile_trace_data"][0]["host_gaps"][0]["mean_us"], 20)
             report["aligned_profile"] = {"status": "exported", "directory": "profile_aligned/callback", "format": "db"}
             printed = io.StringIO()
-            with contextlib.redirect_stdout(printed):
+            with (
+                contextlib.redirect_stdout(printed),
+                patch.object(self.compare, "aligned_trace_path", return_value=trace),
+            ):
                 self.assertTrue(self.compare.print_profile("callback", report, root))
                 bubbles = self.compare.loading_bubble_summary({"callback": report}, root, ["callback"], "Stream 56")
             self.assertIn("IMPORT_ALIGNED_DIRECTORY callback: profile_aligned/callback; format=db", printed.getvalue())
@@ -331,7 +334,7 @@ class CppMteProfileTests(unittest.TestCase):
                 if not failed:
                     summary = (root / "summary.txt").read_text(encoding="utf-8")
                     self.assertIn("自动在同次采集请求前后校准设备时钟", summary)
-                    self.assertIn("profile_aligned修复版目录", summary)
+                    self.assertIn("profile目录只保留修复版", summary)
                     self.assertIn("NO_PROFILE_COMBINED_VS_DEFAULT", summary)
                     self.assertIn("PRIMARY_METRIC=decode_ms", summary)
                     self.assertIn('"decode_ms":', summary)
@@ -700,6 +703,16 @@ class CppMteProfileTests(unittest.TestCase):
                 )
             )
             path.write_text(json.dumps(rows), encoding="utf-8")
+            path.with_name("clock_alignment.json").write_text(
+                json.dumps(
+                    dict(
+                        status="calibration_validated",
+                        held_out_after=dict(outside_bracket_1us_tolerance=0),
+                        aligned_trace=str(path),
+                    )
+                ),
+                encoding="utf-8",
+            )
             report = dict(
                 count=170,
                 profile_status="complete",
@@ -764,6 +777,7 @@ class CppMteProfileTests(unittest.TestCase):
                     self.compare, "inspect_offload_trace", side_effect=[ValueError("missing Stream 56"), True]
                 ) as inspect,
                 contextlib.redirect_stdout(output),
+                patch.object(self.compare, "aligned_trace_path", return_value=Path("trace.json")),
             ):
                 result = self.compare.loading_bubble_summary(reports, root, tuple(reports), "Stream 56")
             self.assertEqual(inspect.call_count, 2)
@@ -840,7 +854,7 @@ class CppMteProfileTests(unittest.TestCase):
             patch.object(self.infer, "finish_profile", return_value="incomplete") as finish,
             patch.object(self.infer, "discover_roots", return_value=[]),
             patch.object(self.infer, "align_capture") as align,
-            patch.object(self.infer, "export_capture") as aligned_view,
+            patch.object(self.infer, "publish_aligned_capture") as aligned_view,
             patch.object(self.infer, "inspect_mstx_trace", side_effect=AssertionError("duplicate scan")),
             contextlib.redirect_stdout(io.StringIO()),
         ):

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from analyze_prefetch_compute_overlap import analyze
+from export_moe_aligned_profile import aligned_trace_path
 from moe_experiment_tables import VALID_INTERVAL_STATUSES, number, table
 from run_verified_cpp_tests import progress
 
@@ -15,6 +16,9 @@ def overlap_summary(reports, root, labels):
     lines = [
         "\n## 预取→按需 Host间隔与计算推进\n",
         "仅对纯MTE消费者处严格等待的组识别计算边界；回调组保留原Host间隔，不套用MTE publish/wait配对规则。",
+        "背景：预取Host工作与设备计算并行。计算若晚于预取回调结束才到达消费位置，"
+        "Host间隔还包含等待计算推进的时间；本分析区分这部分与剩余交接间隔。",
+        "早/晚均指计算到达消费位置相对于预取Host回调结束更早/更晚；"
         "计算边界包含路由和依赖推进；预取结束取外层Host回调结束。"
         "保守判定使用校准包络宽度加1μs，直接判定不加余量；两者均保留。",
         "占比以全部同层相邻预取→按需样本为分母；零加载占比以相应晚完成样本为分母。未知加载量不当作零加载。",
@@ -32,7 +36,7 @@ def overlap_summary(reports, root, labels):
                 if not trace.get("usable") or not trace.get("json_complete"):
                     raise ValueError("incomplete or unusable trace")
                 # This sibling belongs to the same capture. Never substitute raw timestamps.
-                path = Path(trace["file"]).with_name("trace_view_aligned.json")
+                path = aligned_trace_path(Path(trace["file"]))
                 details.write(f"CASE={label}\n")
                 with progress(f"prefetch overlap {label}"), contextlib.redirect_stdout(details):
                     result = analyze(path)
@@ -48,8 +52,11 @@ def overlap_summary(reports, root, labels):
                     groups = result["classification" if mode == "conservative" else "direct_classification"]
                     late = [r for r in result["rows"] if r.get(key) == "late"]
                     zero = sum(r["prefetch_loads"] == 0 for r in late)
-                    either = sum(r["prefetch_loads"] == 0 or r["reactive_loads"] == 0 for r in late)
+                    nonzero = sum(r["prefetch_loads"] is not None and r["prefetch_loads"] > 0 for r in late)
                     unknown = sum(r["prefetch_loads"] is None for r in late)
+                    all_values = result[mode]["all_samples"]
+                    original_mean = all_values["original"]["mean_us"]
+                    remaining_mean = all_values["method1_drop_late"]["mean_us"]
 
                     def count_pct(kind, groups=groups):
                         group = groups[kind]
@@ -68,11 +75,20 @@ def overlap_summary(reports, root, labels):
                             count_pct("uncertain"),
                             count_pct("unmapped"),
                             late_pct(zero),
-                            late_pct(either),
+                            late_pct(nonzero),
                             unknown,
+                            number(groups["early"]["mean_us"]),
+                            number(groups["late"]["mean_us"]),
+                            number(original_mean),
+                            number(remaining_mean),
+                            number(original_mean - remaining_mean)
+                            if original_mean is not None and remaining_mean is not None
+                            else "—",
                         ]
                     )
                     for scope, values in result[mode].items():
+                        if scope != "all_samples":
+                            continue
 
                         def metric(name, values=values):
                             stat = values[name]
@@ -102,20 +118,26 @@ def overlap_summary(reports, root, labels):
                 "组",
                 "判定",
                 "全部n",
-                "早完成n/%",
-                "晚完成n/%",
+                "计算早于预取结束n/%",
+                "计算晚于预取结束n/%",
                 "边界不确定n/%",
                 "无法识别n/%",
                 "晚完成中预取零加载n/%",
-                "晚完成中任一端零加载n/%",
+                "晚完成中预取非零加载n/%",
                 "晚完成中预取加载未知n",
+                "早完成间隔均值μs",
+                "晚完成间隔均值μs",
+                "全部均值μs",
+                "去掉晚完成后均值μs",
+                "纳入晚完成的均值增量μs",
             ],
             classification_rows,
         ),
         "",
         "以下每格为n / 均值μs / P95μs，不做IQR或长尾截断。方案1去掉晚完成样本；"
         "方案2扣除预取结束至计算到达消费位置的时间（边界区间中点），不是累加算子忙碌时长。",
-        "all_samples保留不确定/无法识别样本的原值；decidable_only只含确定早/晚样本。"
+        "只展示all_samples：不确定/无法识别样本保持原值，不归类为早完成；两方案均不删除或扣减它们。"
+        "均值增量为全部均值减去去掉晚完成后的均值，是样本构成差异，不是实测可消除的开销。"
         "方案2无法合法扣除的样本保留原值并计数。边界范围不包含完整时钟误差。",
         "",
         table(

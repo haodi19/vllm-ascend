@@ -28,7 +28,7 @@ class AlignedDirectoryTests(unittest.TestCase):
         self.epoch = Decimal("1794496000000000000")
 
     def database(self):
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             db.executescript(
                 "CREATE TABLE STRING_IDS(id INTEGER PRIMARY KEY,value TEXT);"
                 "CREATE TABLE MSTX_EVENTS(startNs INTEGER,endNs INTEGER,message INTEGER,globalTid INTEGER);"
@@ -68,7 +68,7 @@ class AlignedDirectoryTests(unittest.TestCase):
 
     def test_model_adds_on_other_streams_do_not_hide_calibration_lane(self):
         self.database()
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             probes = self.add_rows(db)
             # DB stream numbers need not be the JSON lane numbers. Another model
             # lane can even have exactly the probe count, but different timestamps.
@@ -93,7 +93,7 @@ class AlignedDirectoryTests(unittest.TestCase):
 
     def test_two_full_matching_lanes_are_not_guessed_even_if_one_has_json_tid(self):
         self.database()
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             for row in self.add_rows(db):
                 db.execute("INSERT INTO TASK VALUES(?,?,?,?,?,?,?,?)", (*row[:3], 19, *row[4:]))
         original = self.db_path.read_bytes()
@@ -104,12 +104,12 @@ class AlignedDirectoryTests(unittest.TestCase):
 
     def test_incomplete_or_duplicate_probe_lane_is_not_matched_as_a_subset(self):
         self.database()
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             row = self.add_rows(db)[0]
             db.execute("DELETE FROM TASK WHERE globalTaskId=?", (row[4],))
         with self.assertRaisesRegex(ValueError, '"count": 15'):
             export.export_capture(self.root, self.mapping, self.destination)
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             db.executemany("INSERT INTO TASK VALUES(?,?,?,?,?,?,?,?)", [row, row])
         with self.assertRaisesRegex(ValueError, '"count": 17'):
             export.export_capture(self.root, self.mapping, self.destination)
@@ -117,7 +117,7 @@ class AlignedDirectoryTests(unittest.TestCase):
 
     def test_missing_name_reports_available_add_names_without_guessing(self):
         self.database()
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             db.execute(
                 "UPDATE STRING_IDS SET value='different_Add_kernel' WHERE value=?",
                 (self.mapping["calibration_stream"][2],),
@@ -165,7 +165,7 @@ class AlignedDirectoryTests(unittest.TestCase):
 
     def test_device_units_mismatch_fails_without_publishing(self):
         self.database()
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             db.execute("UPDATE TASK SET startNs=startNs+100000,endNs=endNs+100000")
         original = self.db_path.read_bytes()
         with self.assertRaisesRegex(ValueError, "device timestamps differ"):
@@ -176,11 +176,11 @@ class AlignedDirectoryTests(unittest.TestCase):
 
     def test_host_mismatch_and_ambiguous_devices_rejected(self):
         self.database()
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             db.execute("UPDATE MSTX_EVENTS SET endNs=endNs+100000 WHERE rowid=1")
         with self.assertRaisesRegex(ValueError, "Host timestamps"):
             export.export_capture(self.root, self.mapping, self.destination)
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             db.execute("UPDATE MSTX_EVENTS SET endNs=endNs-100000 WHERE rowid=1")
             db.execute("UPDATE TASK SET deviceId=2 WHERE rowid=1")
         with self.assertRaisesRegex(ValueError, "single identified device"):
@@ -202,7 +202,7 @@ class AlignedDirectoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "active journal"):
             export.export_capture(self.root, self.mapping, self.destination)
         journal.unlink()
-        with sqlite3.connect(self.db_path) as db:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
             db.executescript("CREATE TABLE COMMUNICATION_OP(startNs INTEGER); INSERT INTO COMMUNICATION_OP VALUES(1)")
         with self.assertRaisesRegex(ValueError, "unsupported populated"):
             export.export_capture(self.root, self.mapping, self.destination)
@@ -214,8 +214,47 @@ class AlignedDirectoryTests(unittest.TestCase):
         self.root.rename(case / self.root.name)
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(export.main(["--run", str(run)]), 0)
-        target = run / "profile_aligned/mte_combined/cpp" / self.root.name
+        target = case / self.root.name
         self.assertTrue((target / export.OUTPUT_NAME / "trace_view.json").is_file())
+        self.assertFalse((target / export.OUTPUT_NAME / "trace_view_aligned.json").exists())
+        self.assertEqual(
+            export.aligned_trace_path(target / export.OUTPUT_NAME / "trace_view.json"),
+            target / export.OUTPUT_NAME / "trace_view.json",
+        )
+
+    def test_in_place_publication_removes_raw_and_is_idempotent(self):
+        self.database()
+        raw = self.fixture.trace.read_bytes()
+        corrected = Path(self.mapping["aligned_trace"]).read_bytes()
+        result = export.publish_aligned_capture(self.root, self.mapping)
+        self.assertTrue(result["raw_capture_removed"])
+        self.assertEqual(self.fixture.trace.read_bytes(), corrected)
+        self.assertNotEqual(raw, corrected)
+        self.assertFalse(Path(self.mapping["aligned_trace"]).exists())
+        self.assertEqual(export.publish_aligned_capture(self.root, self.mapping), result)
+        self.assertEqual(self.fixture.trace.read_bytes(), corrected)
+        self.assertEqual(list(self.root.parent.glob(".publish_aligned_*")), [])
+
+    def test_failed_publication_preserves_original(self):
+        self.database()
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db, db:
+            db.execute("UPDATE TASK SET startNs=startNs+100000,endNs=endNs+100000")
+        original = self.fixture.trace.read_bytes()
+        with self.assertRaises(ValueError):
+            export.publish_aligned_capture(self.root, self.mapping)
+        self.assertEqual(self.fixture.trace.read_bytes(), original)
+        self.assertFalse((self.root / "aligned_profile_manifest.json").exists())
+
+    def test_aligned_selector_rejects_missing_metadata_and_other_capture(self):
+        mapping_path = self.fixture.trace.with_name("clock_alignment.json")
+        mapping_path.unlink()
+        with self.assertRaises(FileNotFoundError):
+            export.aligned_trace_path(self.fixture.trace)
+        other = self.root.parent / "other.json"
+        other.write_text("[]", encoding="utf-8")
+        mapping_path.write_text(json.dumps(dict(self.mapping, aligned_trace=str(other))), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "different capture"):
+            export.aligned_trace_path(self.fixture.trace)
 
     def test_stale_aligned_json_is_not_packaged_as_corrected(self):
         aligned = Path(self.mapping["aligned_trace"])

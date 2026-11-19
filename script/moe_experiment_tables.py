@@ -122,9 +122,9 @@ def render_tables(reports, labels, *, bubbles="", settings=None, failure=None):
                     raw.get("n", "—"),
                     number(raw.get("mean")),
                     number(clean.get("mean")),
-                    number(raw.get("p50")),
-                    number(raw.get("p95")),
-                    stats.get("removed_count", "—"),
+                    number(summarize_streams(report.get("stream_samples", []))["tpot_ms"]["raw"].get("mean"))
+                    if name == "TPOT" and report.get("stream_samples")
+                    else "—",
                 ]
             )
     lines.extend(
@@ -132,11 +132,22 @@ def render_tables(reports, labels, *, bubbles="", settings=None, failure=None):
             "",
             "## 无profiler请求性能：Decode为主数据",
             "",
-            table(["组", "指标/ms", "n", "raw均值", "filtered均值", "raw P50", "raw P95", "剔除数"], rows),
+            table(
+                [
+                    "组",
+                    "指标/ms",
+                    "n",
+                    "raw均值",
+                    "filtered均值",
+                    "同次profile TPOT/ms",
+                ],
+                rows,
+            ),
             "",
             "Decode=最后非空文本块到达−首个非空文本块到达；排除首字前阶段（含Prefill）和HTTP收尾，保留调度/传输开销。",
             "它是客户端观测的后续生成总时延，不是纯NPU计算耗时；完整端到端仍含首字前阶段与HTTP收尾。",
             "TPOT=(最后文本块到达−首个文本块到达)/(实际输出token数−1)，MTP块数不等于token数。",
+            "同次profile TPOT来自独立采集请求的流式测量，含采集开销；Miracle只与这一列的MTE组合比较。",
             "缺少流式数据时Decode留空，不从独立筛选后的端到端与TTFT均值相减；单块输出不能反映设备内部Decode节奏。",
             "filtered使用3×IQR，各指标独立筛选，分项不可相加；统计长尾不等于已证实的外部干扰。",
         ]
@@ -187,7 +198,7 @@ def render_tables(reports, labels, *, bubbles="", settings=None, failure=None):
     records = bubble_records(bubbles)
     rows = []
     for label in labels:
-        for scope in ("full_capture", "callback_window"):
+        for scope in ("full_capture",):
             matches = [r for c, k, r in records if c == label and k == "TARGET_GAPS_US" and r["scope"] == scope]
             r = matches[0] if len(matches) == 1 else {}
             kept = r.get("kept") or {}
@@ -210,42 +221,9 @@ def render_tables(reports, labels, *, bubbles="", settings=None, failure=None):
             "## 加载流空泡",
             "",
             "选定流全部设备任务取占用并集（含MEMCPY、Transpose）。仅保留10≤gap<5000μs，不再IQR。",
-            "full_capture是全采集窗口（含Prefill）；callback_window是首末回调间连续范围。流空闲不等于整卡空闲。",
+            "仅展示对齐后的full_capture全采集窗口（含Prefill）；流空闲不等于整卡空闲。",
             "",
             table(["组", "范围", "保留n", "均值/μs", "P50/μs", "P95/μs", "累计/ms", "排除<10μs", "排除≥5ms"], rows),
-        ]
-    )
-    rows = []
-    for label in labels:
-        states = [r for c, k, r in records if c == label and k == "OFFLOAD_STATUS"]
-        state = (
-            "子集：存在跨边界/歧义任务"
-            if any(r.get("partial") for r in states)
-            else "关联检查通过"
-            if len(states) == 1
-            else "未验证"
-        )
-        for direction in ("prefetch->reactive", "reactive->prefetch"):
-            matches = [
-                r
-                for c, k, r in records
-                if c == label and k == "TARGET_DIRECTION_GAPS_US" and r["direction"] == direction
-            ]
-            r = matches[0] if len(matches) == 1 else {}
-            kept = r.get("kept") or {}
-            rows.append(
-                [label, direction, kept.get("n", "—"), number(kept.get("mean")), number(kept.get("p95")), state]
-            )
-    lines.extend(
-        [
-            "",
-            "## 设备空泡方向子集",
-            "",
-            table(["组", "方向", "保留n", "均值/μs", "P95/μs", "关联状态"], rows),
-            "",
-            "只统计唯一关联的相邻加载批次；即使关联检查通过，也不包含空载回调及阈值外间隔。",
-            "组间方向样本覆盖不同，不能把子集均值直接当成完整方向收益。均值减少也不保证累计空泡减少。",
-            "",
         ]
     )
     return "\n".join(lines)

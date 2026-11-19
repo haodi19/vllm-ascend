@@ -50,8 +50,11 @@ class ExperimentTableTests(unittest.TestCase):
         self.assertIn("| mte_combined | Decode（主数据） | 1 | 2.000", result)
         self.assertIn("| mte_combined | 端到端 | 1 | 4.000", result)
         self.assertLess(result.index("| Decode（主数据）"), result.index("| 端到端"))
+        report["stream_samples"] = [dict(sample, tpot_us=750, decode_us=3000)]
+        result = self.module.render_tables({"mte_combined": report}, ["mte_combined"])
+        self.assertIn("| mte_combined | TPOT | 1 | 0.500 | 0.500 | 0.750 |", result)
 
-    def test_bubbles_keep_scopes_counts_totals_and_partial_direction_warning(self):
+    def test_bubbles_only_show_full_window(self):
         bubbles = "CASE=mte_combined; traces=1\n"
         for scope, mean in (("full_capture", 100), ("callback_window", 80)):
             bubbles += (
@@ -70,9 +73,9 @@ class ExperimentTableTests(unittest.TestCase):
         bubbles += 'OFFLOAD_STATUS {"partial":true,"reasons":{"cross_boundary":12}}\n'
         result = self.module.render_tables({}, ["mte_combined"], bubbles=bubbles)
         self.assertIn("full_capture | 10 | 100.000 | 100.000 | 100.000 | 1.000 | 9 | 2", result)
-        self.assertIn("callback_window | 10 | 80.000", result)
-        self.assertIn("子集：存在跨边界/歧义任务", result)
-        self.assertIn("prefetch->reactive | 2 | 50.000", result)
+        self.assertNotIn("callback_window", result)
+        self.assertNotIn("设备空泡方向子集", result)
+        self.assertNotIn("prefetch->reactive | 2 | 50.000", result)
 
     def test_failure_still_creates_document_with_missing_cells(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -249,15 +249,6 @@ def export_capture(root, mapping, destination):
         for item in sorted(output.iterdir()):
             if item.name == "trace_view_aligned.json":
                 shutil.copy2(item, target / "trace_view.json")
-            elif (
-                item.is_file()
-                and item.suffix.lower() in (".csv", ".json")
-                and item.name not in ("trace_view.json", "clock_alignment.json")
-            ):
-                # Auxiliary reports retain their original statistical values. They
-                # are not advertised as recalculated cross-domain measurements.
-                shutil.copy2(item, target / item.name)
-                copied.append(item.name)
             else:
                 skipped.append(item.name)
         database = None
@@ -275,15 +266,68 @@ def export_capture(root, mapping, destination):
             "format": "db" if database else "text",
             "database": database,
             "copied_auxiliary_reports": copied,
-            "auxiliary_report_scope": "original statistics; not recalculated using corrected cross-domain overlap",
+            "auxiliary_report_scope": "uncorrected auxiliary reports omitted; regenerate from aligned trace",
             "excluded_files": skipped,
             "raw_framework_and_cann_data_copied": False,
             "gui_import_verified": False,
         }
         (stage / "aligned_profile_manifest.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-        (stage / "clock_alignment.json").write_text(json.dumps(mapping, indent=2), encoding="utf-8")
+        published_mapping = dict(mapping, aligned_trace=str(destination / OUTPUT_NAME / "trace_view.json"))
+        for metadata_path in (stage / "clock_alignment.json", target / "clock_alignment.json"):
+            metadata_path.write_text(json.dumps(published_mapping, indent=2), encoding="utf-8")
         stage.rename(destination)
     return report
+
+
+def aligned_trace_path(path):
+    """Resolve verified corrected data; never silently fall back to the raw trace."""
+    path = Path(path).resolve(strict=True)
+    mapping = json.loads(path.with_name("clock_alignment.json").read_text(encoding="utf-8"))
+    if (
+        mapping.get("status") != "calibration_validated"
+        or mapping.get("held_out_after", {}).get("outside_bracket_1us_tolerance") != 0
+    ):
+        raise ValueError("trace has no validated same-capture clock alignment")
+    corrected = Path(mapping["aligned_trace"]).resolve(strict=True)
+    if corrected.parent != path.parent:
+        raise ValueError("aligned trace belongs to a different capture")
+    return corrected
+
+
+def publish_aligned_capture(root, mapping):
+    """Replace this capture only after JSON and DB export succeeds; keep its standard path."""
+    root = root.resolve(strict=True)
+    manifest = root / "aligned_profile_manifest.json"
+    if manifest.is_file():
+        result = json.loads(manifest.read_text(encoding="utf-8"))
+        if result.get("raw_capture_removed") is not True:
+            raise ValueError("existing export is not an in-place published capture")
+        aligned_trace_path(root / OUTPUT_NAME / "trace_view.json")
+        return result
+    # Both rename targets are within this explicitly resolved capture's parent.
+    # Never delete the source on validation failure. Roll back a failed rename.
+    with tempfile.TemporaryDirectory(prefix=".publish_aligned_", dir=root.parent) as temporary:
+        temporary = Path(temporary).resolve()
+        target = temporary / root.name
+        # Keep the rollback copy outside automatic staging cleanup: even a failed
+        # restoration must leave the user's source available for recovery.
+        backup = root.parent / (temporary.name + "_raw_backup")
+        if backup.exists() or backup.resolve().parent != root.parent:
+            raise ValueError("unsafe capture backup path")
+        result = export_capture(root, mapping, target)
+        result.update(directory=str(root), raw_capture_removed=True)
+        published_mapping = dict(mapping, aligned_trace=str(root / OUTPUT_NAME / "trace_view.json"))
+        for item in (target / "clock_alignment.json", target / OUTPUT_NAME / "clock_alignment.json"):
+            item.write_text(json.dumps(published_mapping, indent=2), encoding="utf-8")
+        (target / "aligned_profile_manifest.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        root.rename(backup)
+        try:
+            target.rename(root)
+        except BaseException:
+            backup.rename(root)
+            raise
+        shutil.rmtree(backup)
+    return result
 
 
 def export_run(run):
@@ -294,8 +338,7 @@ def export_run(run):
     for root in roots:
         try:
             mapping = json.loads((root / OUTPUT_NAME / "clock_alignment.json").read_text(encoding="utf-8"))
-            target = run / "profile_aligned" / root.relative_to(run / "profile")
-            result = export_capture(root, mapping, target)
+            result = publish_aligned_capture(root, mapping)
             print("ALIGNED_PROFILE " + json.dumps(result, ensure_ascii=False), flush=True)
         except Exception as error:
             failed = True

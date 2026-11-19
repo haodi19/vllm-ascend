@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
+from export_moe_aligned_profile import aligned_trace_path
 from moe_experiment_tables import VALID_INTERVAL_STATUSES, write_tables
 from moe_outlier_stats import group_outliers, outlier_summary
 from moe_overlap_report import overlap_summary
@@ -86,8 +87,10 @@ def loading_bubble_summary(reports, root, labels, stream_name):
                 with progress(f"loading bubbles {label}: {stream_name}; 10<=gap<5000us"):
                     try:
                         with contextlib.redirect_stdout(capture):
+                            corrected = aligned_trace_path(Path(trace["file"]))
+                            print(f"ALIGNED_TRACE={corrected}")
                             complete = inspect_offload_trace(
-                                Path(trace["file"]), stream_name, TARGET_BUBBLE_MIN_US, TARGET_BUBBLE_MAX_US
+                                corrected, stream_name, TARGET_BUBBLE_MIN_US, TARGET_BUBBLE_MAX_US
                             )
                     except (OSError, ValueError, TypeError) as exc:
                         error = f"{type(exc).__name__}: {exc}"
@@ -639,7 +642,7 @@ def main(argv=None, *, stream_compare=False, three_way=False, worker_compare=Fal
             print("两组均为MTE晚等待＋cpp LRC；只改变加载流：sync_launch → ordinary。")
             print("普通流若请求超时则终止本轮，不跳过设备完成检查，不继续推理。")
         print(f"SUMMARY FILE: {root / 'summary.txt'}", flush=True)
-        print("自动在同次采集请求前后校准设备时钟；成功后导入profile_aligned修复版目录，原profile保留。")
+        print("自动在同次采集请求前后校准设备时钟并验证JSON与DB；成功后profile目录只保留修复版，空泡统计使用对齐图。")
         print(f"表格文档：{root / 'experiment_tables.md'}；同样附在summary.txt末尾。", flush=True)
         if args.measure_tpot:
             print("默认流式测量：以无profiler Decode总时延为主，完整端到端/TTFT/TPOT为对照；统一写入summary.txt。")

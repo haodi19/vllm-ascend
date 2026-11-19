@@ -7,11 +7,13 @@ import json
 from pathlib import Path
 
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
+from export_moe_aligned_profile import aligned_trace_path
 from inspect_moe_profile import MAX_TRACE_FILES, _gap_stats, _interval, copy_gap_boundaries, positive_gap_us
 from offload_bubble_stats import activity_window_gaps, analyze_offload_batches, bounded_gap_stats
 
 CASES = (
     ("callback_legacy", "python"),
+    ("callback_python", "python"),
     ("callback", "cpp"),
     ("mte_default", "cpp"),
     ("mte_combined", "cpp"),
@@ -500,6 +502,8 @@ def main(argv=None):
     if not groups:
         for case, policy in CASES:
             directory = root / "profile" / case / policy
+            if case == "callback_python" and not directory.exists():
+                continue  # Optional fifth configuration; older four-way runs have no such service.
             traces = []
             for path in directory.rglob("trace_view.json"):
                 traces.append(path)
@@ -514,6 +518,7 @@ def main(argv=None):
             continue
         for path in traces:
             try:
+                path = aligned_trace_path(path)
                 if args.offload_bubbles:
                     complete = inspect_offload_trace(
                         path, args.stream_name, args.large_gap_us, args.long_gap_us, args.pid, args.host_pid
