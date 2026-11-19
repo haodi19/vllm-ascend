@@ -8,8 +8,40 @@ import re
 from analyze_callback_gaps import MAX_INTERVALS, events
 from diagnose_mte_wait_timeline import record
 
-NATIVE_GATE = re.compile(r"(?:DAVID_)?(?:HOST_FUNC|HOST_CPU|HOST_CALLBACK)(?:_\d+)?", re.IGNORECASE)
+NATIVE_GATE = re.compile(r"(?:DAVID_)?(?:HOST_FUNC|HOST_CPU|HOST_CALLBACK|HOSTFUNC_CALLBACK)(?:_\d+)?", re.IGNORECASE)
 ORDER_US = 1.0
+MAX_CHECK_EXAMPLES = 2
+
+
+def gate_check(tasks, hosts):
+    """Keep failed ordinal matches inspectable without guessing another pairing."""
+    result = dict(device_count=len(tasks), host_count=len(hosts))
+    if not hosts or len(tasks) != len(hosts):
+        return dict(result, reason="count_mismatch")
+    if any(left["end"] > right["start"] + ORDER_US for left, right in zip(tasks, tasks[1:])):
+        return dict(result, reason="overlapping_device_gates")
+    failures = []
+    failed_count = 0
+    for index, (task, host) in enumerate(zip(tasks, hosts)):
+        start_delta = task["start"] - host["start"]
+        end_delta = task["end"] - host["end"]
+        if start_delta > ORDER_US or end_delta < -ORDER_US:
+            failed_count += 1
+            if len(failures) < MAX_CHECK_EXAMPLES:
+                failures.append(
+                    dict(
+                        ordinal=index,
+                        name=task["name"],
+                        device_start_minus_host_start_us=round(start_delta, 3),
+                        device_end_minus_host_end_us=round(end_delta, 3),
+                    )
+                )
+    return dict(
+        result,
+        reason="host_not_contained" if failed_count else "ok",
+        failed_count=failed_count,
+        examples=failures,
+    )
 
 
 def native_gate(event):
@@ -52,18 +84,14 @@ def bind_callback_streams(path, data):
         flush=True,
     )
     bindings = {}
+    checks = []
     for stream, tasks in gates.items():
         tasks.sort(key=lambda item: (item["start"], item["index"]))
         kinds = []
         for kind, hosts in data["groups"].items():
-            if len(tasks) != len(hosts) or not hosts:
-                continue
-            if any(left["end"] > right["start"] + ORDER_US for left, right in zip(tasks, tasks[1:])):
-                continue
-            if all(
-                task["start"] <= host["start"] + ORDER_US and task["end"] >= host["end"] - ORDER_US
-                for task, host in zip(tasks, hosts)
-            ):
+            check = dict(pid=stream[0], tid=stream[1], kind=kind, **gate_check(tasks, hosts))
+            checks.append(check)
+            if check["reason"] == "ok":
                 kinds.append(kind)
         if not kinds:
             continue
@@ -74,8 +102,9 @@ def bind_callback_streams(path, data):
     if set(bindings) != {"prefetch", "reactive"}:
         raise ValueError(
             "native callback device gates not uniquely identifiable; "
-            "need explicit HOST_FUNC/HOST_CPU/HOST_CALLBACK tasks with complete count/order/containment; "
+            "need explicit native callback tasks (including HOSTFUNC_CALLBACK) with complete count/order/containment; "
             "EVENT_WAIT or nearest timestamps alone are not callback identity evidence; "
+            "checks=" + json.dumps(checks, ensure_ascii=False) + "; "
             "observed="
             + json.dumps(
                 [{"tid": tid, "name": name, "n": count} for (tid, name), count in names.most_common(12)],

@@ -20,7 +20,7 @@ from analyze_prefetch_compute_overlap import (
     restat_host_gaps,
     summarize,
 )
-from moe_callback_compute_boundary import native_gate
+from moe_callback_compute_boundary import gate_check, native_gate
 
 
 def task(name, start, end):
@@ -275,14 +275,36 @@ class OverlapTests(unittest.TestCase):
     def test_native_callback_uses_consumer_join_not_prefetch_callback_start(self):
         self.test_saved_capture_end_to_end(backend="callback")
 
+    def test_real_pr_hostfunc_callback_name_end_to_end(self):
+        self.test_saved_capture_end_to_end(backend="callback", gate_name="HOSTFUNC_CALLBACK")
+
+    def test_native_gate_diagnostics_preserve_failed_coverage(self):
+        gates = [task("HOSTFUNC_CALLBACK", 5, 12), task("HOSTFUNC_CALLBACK", 40, 60)]
+        hosts = [task("host", 10, 20), task("host", 35, 50)]
+        result = gate_check(gates, hosts)
+        self.assertEqual(result["reason"], "host_not_contained")
+        self.assertEqual(result["failed_count"], 2)
+        self.assertEqual(result["examples"][0]["device_end_minus_host_end_us"], -8)
+        self.assertEqual(result["examples"][1]["device_start_minus_host_start_us"], 5)
+        self.assertEqual(gate_check(gates, hosts[:1])["reason"], "count_mismatch")
+        gates[0]["end"] = 45
+        self.assertEqual(gate_check(gates, hosts)["reason"], "overlapping_device_gates")
+
     def test_notify_wait_is_not_automatically_a_callback(self):
         with self.assertRaisesRegex(ValueError, "native callback device gates not uniquely identifiable"):
             self.test_saved_capture_end_to_end(backend="callback", gate_name="NOTIFY_WAIT")
 
     def test_only_explicit_native_task_names_or_types(self):
         self.assertTrue(native_gate(dict(name="HOST_CPU")))
+        self.assertTrue(native_gate(dict(name="HOSTFUNC_CALLBACK")))
         self.assertTrue(native_gate(dict(name="opaque", args={"Task Type": "HOST_FUNC"})))
-        for name in ("DAVID_EVENT_WAIT", "NOTIFY_WAIT", "aclnnHostFunc", "host_callback_mstx"):
+        for name in (
+            "DAVID_EVENT_WAIT",
+            "NOTIFY_WAIT",
+            "aclnnHostFunc",
+            "host_callback_mstx",
+            "HOSTFUNC_CALLBACK_MSTX",
+        ):
             self.assertFalse(native_gate(dict(name=name)))
 
 
