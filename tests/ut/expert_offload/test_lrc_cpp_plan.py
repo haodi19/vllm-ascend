@@ -28,6 +28,7 @@ def make_manager(backend, experts=256, capacity=24, stats_enabled=True):
     namespace = {
         "torch_npu": types.SimpleNamespace(npu=types.SimpleNamespace(stream=lambda _: contextlib.nullcontext())),
         "logger": logging.getLogger("plan_test"),
+        "callback_stage": lambda *_args: contextlib.nullcontext(),
     }
     exec(compile(ast.Module(body=[cls], type_ignores=[]), str(path), "exec"), namespace)
     manager = namespace["ExpertOffloadManager"]()

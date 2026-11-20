@@ -25,6 +25,10 @@ class Session:
         self._check_slot(slot)
         self._native.register_task(slot, callback)
 
+    def install_native_task(self, slot, capsule):
+        self._check_slot(slot)
+        self._native.install_native_task(slot, capsule)
+
     def start(self, timeout_ms=5000):
         self._native.start(timeout_ms)
 

@@ -1,1 +1,4 @@
 include load_submit.h
+
+include native_task.h
+include native_update.h

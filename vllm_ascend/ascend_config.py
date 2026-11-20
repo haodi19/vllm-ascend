@@ -21,6 +21,7 @@ from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.expert_offload.host_sync import validate_host_sync_config
+from vllm_ascend.expert_offload.native_update import validate_native_update_config
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -1015,6 +1016,8 @@ class ExpertOffloadConfig:
         "callback_mstx_enabled": False,
         # Opt-in single-card graph handoff. Default preserves ACL callbacks.
         "host_sync_backend": "callback",
+        # Experimental GIL-free MTE graph callbacks; default preserves Python.
+        "host_update_backend": "python",  # python / native
         # MTE load submission; ordinary is the validated late-wait experiment baseline.
         # ordinary selects torch_npu.npu.Stream; completion waits remain mandatory.
         "host_sync_load_stream": "ordinary",  # ordinary / sync_launch; MTE only
@@ -1206,6 +1209,7 @@ class ExpertOffloadConfig:
         if self.config["cache_policy_backend"] not in ("python", "cpp", "cpp_fused"):
             raise ValueError("cache_policy_backend must be 'python', 'cpp' or 'cpp_fused'")
         validate_host_sync_config(self.config)
+        validate_native_update_config(self.config)
         if self.config["cache_policy_backend"] == "cpp_fused" and self.config["enable_multi_card"]:
             raise ValueError("cpp_fused currently supports single-card expert offload only")
         port = self.config["callback_timing_port"]

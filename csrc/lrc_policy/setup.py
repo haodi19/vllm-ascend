@@ -1,6 +1,7 @@
 """Build only the optional CPU LRC extension, without Torch/CANN."""
 
 import os
+import sys
 
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 from setuptools import setup
@@ -13,9 +14,11 @@ setup(
         Pybind11Extension(
             "_vllm_ascend_lrc",
             ["lrc.cpp"],
-            depends=["load_submit.h"],
+            depends=["load_submit.h", "native_update.h", "native_task.h"],
+            libraries=["dl"] if sys.platform.startswith("linux") else [],
             cxx_std=17,
-            extra_compile_args=["/O2", "/fp:strict"] if os.name == "nt" else ["-O3", "-ffp-contract=off"],
+            extra_compile_args=["/O2", "/fp:strict"] if os.name == "nt" else ["-O3", "-ffp-contract=off", "-pthread"],
+            extra_link_args=[] if os.name == "nt" else ["-pthread"],
         )
     ],
     cmdclass={"build_ext": build_ext},

@@ -22,6 +22,7 @@
 
 #include "host_memory.h"
 #include "protocol.h"
+#include "native_task.h"
 
 namespace py = pybind11;
 
@@ -44,6 +45,8 @@ class Session {
     signals_ = static_cast<Slot*>(memory_->data());
     for (size_t i = 0; i < slots_; ++i) new (&signals_[i]) Slot();
     callbacks_.resize(slots_);
+    native_tasks_.resize(slots_, nullptr);
+    native_owners_.resize(slots_);
     errors_.resize(slots_);
     scan_limit_.store(slots_, std::memory_order_relaxed);
   }
@@ -172,6 +175,22 @@ class Session {
     callbacks_[slot] = std::move(callback);
   }
 
+  void install_native_task(size_t slot, py::capsule owner) {
+    auto* task = static_cast<MoeNativeTask*>(owner.get_pointer());
+    if (!owner.name() || std::string(owner.name()) != MoeNativeTask::capsule_name ||
+        !task || task->abi != 1 || !task->run)
+      throw std::invalid_argument("invalid native task capsule");
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    check_slot(slot);
+    // Only install into an unused slot BEFORE its first device publication.
+    if (stop_requested_.load() || native_tasks_[slot] ||
+        signals_[slot].request.generation.load(std::memory_order_acquire) != 0)
+      throw std::runtime_error("native task slot already used or stopping");
+    native_owners_[slot] = std::move(owner);
+    native_tasks_[slot] = task;
+  }
+
   void start(int64_t timeout_ms) {
     validate_timeout(timeout_ms);
     {
@@ -297,6 +316,7 @@ class Session {
     result["error_offset"] = offsetof(Slot, completion) + offsetof(CompletionSignal, error_generation);
     result["status_offset"] = offsetof(Slot, completion) + offsetof(CompletionSignal, status);
     result["allocation_bytes"] = allocation_bytes_;
+    result["native_completed"] = native_completed_;
     result["host_address"] = reinterpret_cast<uintptr_t>(memory_->data());
     result["device_address"] = memory_->device_address();
     result["worker_thread_id"] = worker_id_ == std::thread::id() ? size_t(0) : std::hash<std::thread::id>{}(worker_id_);
@@ -378,6 +398,9 @@ class Session {
     // Decref outside the mutex; Python destructors may re-enter the facade.
     std::vector<py::function> retired;
     retired.swap(callbacks_);
+    std::vector<py::object> native_retired;
+    native_retired.swap(native_owners_);
+    native_tasks_.clear();
     changed_.notify_all();
   }
 
@@ -491,6 +514,7 @@ class Session {
           if (observed == 0 || terminal(slot, observed)) continue;
         }
         uint64_t generation;
+        MoeNativeTask* native_task = nullptr;
         const uint64_t claim_begin = poll_timing_ ? clock_ns() : 0;
         uint64_t claim_acquired = 0;
         {
@@ -499,6 +523,7 @@ class Session {
           if (sample_idle) scan_lock_wait += claim_acquired - claim_begin;
           if (stop_requested_.load(std::memory_order_acquire)) return;
           generation = signals_[slot].request.generation.load(std::memory_order_acquire);
+          native_task = native_tasks_[slot];
           if (generation == 0 || terminal(slot, generation)) continue;
           signals_[slot].completion.status.store(static_cast<uint64_t>(TaskStatus::Running), std::memory_order_release);
         }
@@ -507,7 +532,13 @@ class Session {
         std::string failure;
         const uint64_t gil_begin = poll_timing_ ? clock_ns() : 0;
         uint64_t gil_acquired = 0, callback_end = 0;
-        {
+        if (native_task) {
+          gil_acquired = gil_begin;  // No GIL is acquired by a native task.
+          try { native_task->run(native_task->context); }
+          catch (const std::exception& error) { failure = error.what(); }
+          catch (...) { failure = "unknown native task failure"; }
+          if (poll_timing_) callback_end = clock_ns();
+        } else {
           py::gil_scoped_acquire acquire;
           if (poll_timing_) gil_acquired = clock_ns();
           try {
@@ -528,6 +559,8 @@ class Session {
           std::lock_guard<std::mutex> lock(mutex_);
           if (poll_timing_) completion_acquired = clock_ns();
           if (failure.empty()) {
+            if (native_task && ++native_completed_ == 1 && backend_ == "acl")
+              std::fprintf(stderr, "[MOE-NATIVE] first native graph task completed without Python\n");
             signals_[slot].completion.status.store(static_cast<uint64_t>(TaskStatus::Success),
                                                    std::memory_order_relaxed);
             signals_[slot].completion.done_generation.store(generation, std::memory_order_release);
@@ -588,6 +621,9 @@ class Session {
   std::unique_ptr<HostMemory> memory_;
   Slot* signals_ = nullptr;
   std::vector<py::function> callbacks_;
+  uint64_t native_completed_ = 0;
+  std::vector<MoeNativeTask*> native_tasks_;
+  std::vector<py::object> native_owners_;
   std::vector<std::string> errors_;
   std::mutex mutex_;
   std::mutex join_mutex_;
@@ -611,6 +647,7 @@ PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
       .def(py::init<size_t, const std::string&, int, const std::string&>(), py::arg("slots"), py::arg("backend"),
            py::arg("device_id"), py::arg("acl_library"))
       .def("register_task", &host_sync::Session::register_task)
+      .def("install_native_task", &host_sync::Session::install_native_task)
       .def("configure_scan_slots", &host_sync::Session::configure_scan_slots)
       .def("configure_idle_probe", &host_sync::Session::configure_idle_probe)
       .def("configure_worker_cpu", &host_sync::Session::configure_worker_cpu)

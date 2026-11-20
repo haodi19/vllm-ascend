@@ -14,7 +14,7 @@ setup(
         Pybind11Extension(
             "_vllm_ascend_host_sync",
             ["host_sync.cpp"],
-            depends=["host_memory.h", "protocol.h"],
+            depends=["host_memory.h", "protocol.h", "native_task.h"],
             cxx_std=17,
             extra_compile_args=["/O2"] if os.name == "nt" else ["-O2", "-pthread"],
             extra_link_args=[] if os.name == "nt" else ["-pthread"],

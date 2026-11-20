@@ -812,6 +812,9 @@ class ExpertOffloadManager:
             "hot_preload=%.1fs prefill_pool=%.1fs gate=%.1fs | total=%.1fs",
             t2 - t1, t3 - t2, t4 - t3, t5 - t4, t_hot - t5, t6 - t_hot,
             t7 - t6, t7 - t0)
+        if getattr(self.offload_config, "host_update_backend", "python") == "native":
+            from vllm_ascend.expert_offload.native_update import NativeUpdateRuntime
+            self._native_update = NativeUpdateRuntime(self, _expert_weight)
         if self.offload_config.callback_timing_port:
             # Diagnostic-only lazy import; disabled production has no wrappers.
             from vllm_ascend.expert_offload.callback_timing import install_callback_timing

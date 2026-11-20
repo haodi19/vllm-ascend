@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// CPU-only LRC state. Keep GIL held: callbacks must not concurrently mutate it.
+// CPU-only LRC state. A mutex also protects native graph execution without GIL.
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -10,6 +10,8 @@
 #include <cstring>
 #include <deque>
 #include <numeric>
+#include <mutex>
+#include <memory>
 #include <limits>
 #include <tuple>
 #include <unordered_set>
@@ -43,6 +45,7 @@ class Policy {
   std::vector<Layer> layers_;
 
   Layer& layer(Id i) {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     if (i < 0) i += static_cast<Id>(layers_.size());
     if (i < 0 || i >= static_cast<Id>(layers_.size())) throw py::index_error("layer index out of range");
     return layers_[i];
@@ -72,6 +75,8 @@ class Policy {
   }
 
  public:
+  std::recursive_mutex mutex;
+  Id num_experts() const { return experts_; }
   Policy(Id layers, Id experts, Id window, double beta, double recent, double ema_weight, double router_weight,
          double age_weight, bool scalar_f32)
       : experts_(experts),
@@ -87,14 +92,16 @@ class Policy {
     for (Id i = 0; i < layers; ++i) layers_.emplace_back(experts);
   }
   Id add_layer() {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     layers_.emplace_back(experts_);
     return static_cast<Id>(layers_.size()) - 1;
   }
-  Id num_layers() const { return layers_.size(); }
-  Id step(Id idx) { return layer(idx).step; }
+  Id num_layers() { std::lock_guard<std::recursive_mutex> guard(mutex); return layers_.size(); }
+  Id step(Id idx) { std::lock_guard<std::recursive_mutex> guard(mutex); return layer(idx).step; }
 
   std::unordered_set<Id> observe_values(Id idx, const std::vector<std::vector<Id>>& rows,
                                         const std::vector<std::vector<double>>& scores, bool has_scores) {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     auto& s = layer(idx);
     std::unordered_set<Id> unique;
     for (size_t r = 0; r < rows.size(); ++r) {
@@ -138,6 +145,7 @@ class Policy {
 
   py::dict plan(Id idx, const py::array& ids, const py::object& scores_obj, py::array mapping, bool prefetch, Id cap,
                 bool measure) {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     // No forcecast: mapping must remain a writable view of the pinned CPU buffer.
     layer(idx);
     auto id_info = ids.request();
@@ -270,6 +278,7 @@ class Policy {
   }
 
   std::unordered_set<Id> observe_global(Id idx, const std::vector<Id>& counts, const py::object& score_obj) {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     if (static_cast<Id>(counts.size()) != experts_) throw py::value_error("global_counts has wrong shape");
     for (auto v : counts)
       if (v < 0) throw py::value_error("global_counts must be non-negative");
@@ -302,6 +311,7 @@ class Policy {
 
   std::vector<Id> choose(Id idx, const std::vector<Id>& residents, const std::unordered_set<Id>& protected_ids,
                          Id count) {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     if (count < 0) throw py::value_error("victim count must be >= 0");
     if (!count) return {};
     const auto& s = layer(idx);
@@ -314,8 +324,9 @@ class Policy {
     for (Id i = 0; i < std::min(count, static_cast<Id>(keys.size())); ++i) result.push_back(std::get<2>(keys[i]));
     return result;
   }
-  double hotness(Id idx, Id e) { return score(layer(idx), expert(e)); }
+  double hotness(Id idx, Id e) { std::lock_guard<std::recursive_mutex> guard(mutex); return score(layer(idx), expert(e)); }
   std::vector<float> hotness_array(Id idx) {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     const auto& s = layer(idx);
     std::vector<float> result(experts_);
     for (Id e = 0; e < experts_; ++e) {
@@ -329,6 +340,7 @@ class Policy {
     return result;
   }
   void seed(Id idx, Id eid, Id freq, double weight) {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     auto& s = layer(idx);
     Id e = expert(eid);
     s.freq[e] = freq;
@@ -336,6 +348,7 @@ class Policy {
     s.last[e] = s.step;
   }
   py::dict snapshot(Id idx) {
+    std::lock_guard<std::recursive_mutex> guard(mutex);
     const auto& s = layer(idx);
     py::dict d;
     d["freq"] = s.freq;
@@ -348,7 +361,10 @@ class Policy {
   }
 };
 
+#include "native_update.h"
+
 PYBIND11_MODULE(_vllm_ascend_lrc, m) {
+  bind_native_update(m);
   m.attr("api_version") = 3;
   py::class_<LoadSubmitMigration>(m, "LoadSubmitMigration")
       .def(py::init<py::object, py::object, py::object>())
@@ -356,7 +372,7 @@ PYBIND11_MODULE(_vllm_ascend_lrc, m) {
       .def("refresh_scale", &LoadSubmitMigration::refresh_scale)
       .def("copy_batch", &LoadSubmitMigration::copy_batch)
       .def("load", &LoadSubmitMigration::load);
-  py::class_<Policy>(m, "Policy")
+  py::class_<Policy, std::shared_ptr<Policy>>(m, "Policy")
       .def(py::init<Id, Id, Id, double, double, double, double, double, bool>())
       .def("add_layer", &Policy::add_layer)
       .def("num_layers", &Policy::num_layers)

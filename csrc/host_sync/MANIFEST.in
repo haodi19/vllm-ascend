@@ -1,1 +1,3 @@
 include host_sync.cpp host_memory.h protocol.h
+
+include native_task.h

@@ -422,6 +422,8 @@ class MteHostDispatcher:
             self.wait_states_h = torch.empty((self.SLOT_CAPACITY, 4), dtype=torch.int64, pin_memory=True)
         torch.npu.synchronize()
         self.state_base = self.states.data_ptr()
+        if getattr(manager, "_native_update", None) is not None and not hasattr(hs.Session, "install_native_task"):
+            raise RuntimeError("rebuild csrc/host_sync for native updates")
         self.session = hs.Session(slots=self.SLOT_CAPACITY, backend="acl", device_id=torch.npu.current_device())
         info = self.session.info()
         if info["protocol_version"] != 1 or info["slot_stride"] != 1024 or info["done_offset"] != 512:
@@ -692,6 +694,9 @@ class MteHostDispatcher:
             raise RuntimeError("MTE dispatcher closed or graph callback slot capacity exceeded")
         slot = self.next_slot
         self.entries[slot] = (callback, args)
+        native = getattr(getattr(self, "manager", None), "_native_update", None)
+        if native is not None:
+            self.session.install_native_task(slot, native.task(args))
         if self.allocated_scan:
             # Publish the initialized entry's range before any device request.
             # Older captured graphs keep their slots inside the growing prefix.
