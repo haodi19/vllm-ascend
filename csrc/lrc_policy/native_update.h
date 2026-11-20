@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -30,7 +31,11 @@ class NativeTransfers {
     for (const auto* table : {&sources, &destinations})
       for (const auto& row : *table) {
         if (row.size() != sizes.size()) throw std::invalid_argument("copy component count mismatch");
-        for (auto ptr : row) if (!ptr) throw std::invalid_argument("null copy address");
+        for (size_t part = 0; part < row.size(); ++part) {
+          if (!row[part]) throw std::invalid_argument("null copy address");
+          if (sizes[part] > std::numeric_limits<uintptr_t>::max() - row[part])
+            throw std::invalid_argument("copy address range overflow");
+        }
       }
     if (cpu) return;
     if (!stream) throw std::invalid_argument("null ACL stream");

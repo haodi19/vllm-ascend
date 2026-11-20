@@ -593,14 +593,20 @@ class ExpertOffloadManager:
                 continue
             dev_tensor = getattr(layer, attr_name)
             dtype = dev_tensor.dtype
+            per_expert_strides = None
             if "scale_bias" in attr_name:
                 per_expert_shape = tuple(dev_tensor.shape[1:])
             elif dtype.itemsize == 1:
                 from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
                     apply_mxfp4_weight_scale_layout)
                 dtype = torch.uint8
-                per_expert_shape = tuple(
-                    apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8)).shape)
+                target_layout = apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8))
+                per_expert_shape = tuple(target_layout.shape)
+                if (getattr(self.offload_config, "host_update_backend", "python") == "native"
+                        and self.ep_size == 1):
+                    # Preserve logical values for eager/prefill Tensor copies,
+                    # but load final physical strides for native graph DMA.
+                    per_expert_strides = tuple(target_layout.stride())
             else:
                 per_expert_shape = (dev_tensor[0].numel(),)
             buffer_dict: dict = getattr(self, buffer_dict_name)
@@ -610,9 +616,16 @@ class ExpertOffloadManager:
             while len(buffers) <= layer_moe_idx:
                 buffers.append([])
             for _ in range(nalloc):
-                buffers[layer_moe_idx].append(
-                    self._allocate_expert_host_tensor(
-                        per_expert_shape, dtype))
+                buffer = self._allocate_expert_host_tensor(per_expert_shape, dtype)
+                if per_expert_strides is not None:
+                    buffer = buffer.as_strided(per_expert_shape, per_expert_strides)
+                buffers[layer_moe_idx].append(buffer)
+
+    def _assert_native_reload_safe(self, layer_idx=None):
+        """Registered native descriptors retain immutable source addresses."""
+        native = getattr(self, "_native_update", None)
+        if native is not None and (layer_idx is None or layer_idx < len(native.tables)):
+            raise RuntimeError("native expert buffers are registered; restart before reloading or repacking weights")
 
     def _finalize_offload(self, model):
         """Post-weight-loading finalization.
@@ -622,6 +635,7 @@ class ExpertOffloadManager:
         init, fp32 scale refresh, prefill pool creation, and gate weight
         registration.
         """
+        self._assert_native_reload_safe()
         if not self.moe_layers:
             return
         # Barrier: ensure all deferred load_w13/load_w2/_load_scale_shard
@@ -843,6 +857,7 @@ class ExpertOffloadManager:
         Touch it only via untyped_storage() slicing, never through the tensor
         view. No-op for non-quantized (other dtype) models.
         """
+        self._assert_native_reload_safe()
         first_w13 = self.w13_weights_cpu[0][0]
         first_layer = self.moe_layers[0]
         # Detect W4A8_DYNAMIC by scale dtype: process_scale converts float32
@@ -1182,9 +1197,8 @@ class ExpertOffloadManager:
                               w1: torch.Tensor, w3: torch.Tensor) -> None:
         assembled = torch.cat([w1, w3], dim=0)
         if target.dtype == torch.uint8:
-            # W4A8_MXFP: store the post-layout bytes so the 1D buffer matches
-            # the post-process device slot element order (the device path
-            # applies reshape(...,k//2,2).transpose to the e8m0 scale).
+            # Match device logical values. Native buffers also preserve the
+            # device strides, so these same values have DMA-ready bytes.
             from vllm_ascend.quantization.methods.w4a8_mxfp4 import (
                 apply_mxfp4_weight_scale_layout)
             assembled = apply_mxfp4_weight_scale_layout(assembled.view(torch.uint8))
@@ -1266,6 +1280,7 @@ class ExpertOffloadManager:
     def load_w13(self, layer_moe_idx: int, expert_id: int,
                  loaded_weight: torch.Tensor, shard_id: str):
         """Store w1/w3 shard to CPU buffer (transposed) via the load pool."""
+        self._assert_native_reload_safe(layer_moe_idx)
         self._weight_load_calls += 1
         idx = self._shard_local(expert_id)
         if idx is None:
@@ -1285,6 +1300,7 @@ class ExpertOffloadManager:
     def load_w2(self, layer_moe_idx: int, expert_id: int,
                 loaded_weight: torch.Tensor):
         """Store w2 weight to CPU buffer (transposed) via the load pool."""
+        self._assert_native_reload_safe(layer_moe_idx)
         self._weight_load_calls += 1
         idx = self._shard_local(expert_id)
         if idx is None:
@@ -1308,6 +1324,7 @@ class ExpertOffloadManager:
         _scale_shard_temp and assemble when the second shard arrives.
         w2 scale/offset is a single shard — clone and defer directly.
         """
+        self._assert_native_reload_safe(layer_moe_idx)
         self._weight_load_calls += 1
         assert shard_id in ("w1", "w2", "w3"), f"unexpected shard_id: {shard_id}"
         if "scale_bias" in attr_name:

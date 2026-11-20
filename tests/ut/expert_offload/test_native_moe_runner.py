@@ -31,6 +31,24 @@ class NativeRunnerTests(unittest.TestCase):
             self.assertEqual(actual["host_update_backend"], case)
             self.assertTrue(actual["host_sync_diagnose_prefetch_wait_at_join"])
             self.assertEqual(actual["callback_timing_port"], 0)
+            self.assertFalse(actual["callback_mstx_enabled"])
+
+    def test_streaming_timing_excludes_ttft_and_handles_single_token(self):
+        sample = dict(
+            decode_us=6000,
+            ttft_us=10000,
+            tpot_us=2000,
+            output_latency_us=16000,
+            http_wall_us=16100,
+            completion_tokens=4,
+            content_chunks=2,
+        )
+        timing = runner.summarize_streams([sample])
+        # Two SSE chunks do not divide the three output-token intervals.
+        self.assertEqual(runner.timing_row("native", timing, 16.1), "| native | 6.000 | 10.000 | 2.000 | 16.100 |")
+        sample.update(decode_us=0, tpot_us=None, completion_tokens=1, content_chunks=1)
+        timing = runner.summarize_streams([sample])
+        self.assertEqual(runner.timing_row("native", timing, 16.1), "| native | 0.000 | 10.000 | undefined | 16.100 |")
 
     def test_refuses_missing_serve(self):
         with self.assertRaises(ValueError):

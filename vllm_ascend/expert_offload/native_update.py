@@ -70,6 +70,8 @@ def dense_span(shape, strides):
 def pack_scale(torch, source, destination):
     """Pack logical values into the exact dense physical order of an NPU slot."""
     dense_span(destination.shape, destination.stride())
+    if source.device.type != "cpu" or source.numel() != destination.numel():
+        raise ValueError("native scale source must be an equal-sized CPU tensor")
     packed = torch.empty_strided(
         tuple(destination.shape),
         tuple(destination.stride()),
@@ -81,6 +83,36 @@ def pack_scale(torch, source, destination):
     return packed
 
 
+def prepare_scale(torch, source, destination):
+    """Reuse pinned physical bytes when safe; otherwise pack once at startup."""
+    elements = dense_span(destination.shape, destination.stride())
+    if source.device.type != "cpu" or source.numel() != elements:
+        raise ValueError("native scale source must be an equal-sized CPU tensor")
+    same_layout = tuple(source.shape) == tuple(destination.shape) and all(
+        size == 1 or src_stride == dst_stride
+        for size, src_stride, dst_stride in zip(destination.shape, source.stride(), destination.stride())
+    )
+    compatible = same_layout or (source.is_contiguous() and destination.is_contiguous())
+    if source.dtype == destination.dtype and source.is_pinned() and compatible:
+        # data_ptr includes storage_offset. A source may be a view of a slab.
+        nbytes = elements * source.element_size()
+        offset = source.storage_offset() * source.element_size()
+        if offset < 0 or offset + nbytes > source.untyped_storage().nbytes():
+            raise ValueError("native scale source range exceeds storage")
+        return source, True
+    return pack_scale(torch, source, destination), False
+
+
+def tensor_layout(tensor):
+    return (
+        tensor.data_ptr(),
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        tensor.dtype,
+        tensor.untyped_storage().nbytes(),
+    )
+
+
 class NativeUpdateRuntime:
     def __init__(self, manager, expert_weight):
         # Optional imports: default paths require neither new extension APIs nor ACL.
@@ -90,9 +122,12 @@ class NativeUpdateRuntime:
         if not hasattr(self.native, "native_update_task"):
             raise RuntimeError("rebuild csrc/lrc_policy for native weight updates")
         self.manager = manager
+        self.expert_weight = expert_weight
         self.owners = []
         self.tables = []
         self.packed_bytes = 0
+        self.reused_bytes = 0
+        self.targets = []
         # Drain Torch submissions before switching this load stream to direct ACL
         # on graph replay. Eager warmups still synchronize their Torch copies.
         manager.load_stream.synchronize()
@@ -100,7 +135,8 @@ class NativeUpdateRuntime:
         for layer_idx, layer in enumerate(manager.moe_layers):
             self.tables.append(self._prepare_layer(layer_idx, layer, expert_weight))
         print(
-            f"[MOE-NATIVE] prepared layers={len(self.tables)} scale_buffer_bytes={self.packed_bytes}; "
+            f"[MOE-NATIVE] prepared layers={len(self.tables)} scale_buffer_bytes={self.packed_bytes} "
+            f"scale_reused_bytes={self.reused_bytes}; "
             "graph callbacks=GIL-free; eager/prefill=original; Python callback timers disabled",
             flush=True,
         )
@@ -112,15 +148,19 @@ class NativeUpdateRuntime:
         sources = [[] for _ in range(experts)]
         destinations = [[] for _ in range(slots)]
         sizes = []
+        targets = {}
         for name in ("w13", "w2"):
             size = getattr(m, f"{name}_expert_size_bytes")
-            dst = expert_weight(layer, f"{name}_weight").data.untyped_storage()
-            if dst.nbytes() < slots * size:
+            tensor = expert_weight(layer, f"{name}_weight")
+            targets[f"{name}_weight"] = (tensor, tensor_layout(tensor))
+            dst = tensor.data.untyped_storage()
+            offset = tensor.storage_offset() * tensor.element_size()
+            if offset + slots * size > dst.nbytes():
                 raise ValueError("native weight destination too small")
             self.owners.append(dst)
             sizes.append(size)
             for slot in range(slots):
-                destinations[slot].append(dst.data_ptr() + slot * size)
+                destinations[slot].append(dst.data_ptr() + offset + slot * size)
             for eid in range(experts):
                 src = m._expert_src_storage(index, eid, name)
                 if src.nbytes() < size:
@@ -136,6 +176,7 @@ class NativeUpdateRuntime:
                 if any(eid is None for eid in local_ids):
                     raise ValueError("native updates require all experts in local CPU buffers")
                 cpu_sources = [layers[index][eid] for eid in local_ids]
+                targets[name] = (target, tensor_layout(target))
                 self._add_scale(target, cpu_sources, sources, destinations, sizes)
         if hasattr(layer, "w13_weight_scale_fp32"):
             # Match the old runtime .to(float32) on the logical scale values.
@@ -144,6 +185,8 @@ class NativeUpdateRuntime:
                 for eid in range(experts)
             ]
             self._add_scale(layer.w13_weight_scale_fp32, cpu_sources, sources, destinations, sizes)
+            targets["w13_weight_scale_fp32"] = (layer.w13_weight_scale_fp32, tensor_layout(layer.w13_weight_scale_fp32))
+        self.targets.append(targets)
         return self.native.NativeTransfers(sources, destinations, sizes, self.stream, "", False)
 
     def _add_scale(self, target, cpu_sources, sources, destinations, sizes):
@@ -165,19 +208,26 @@ class NativeUpdateRuntime:
         sizes.append(size)
         self.owners.append(target)
         for eid, src in enumerate(cpu_sources):
-            packed = pack_scale(self.torch, src, template)
-            if packed.untyped_storage().nbytes() != size:
-                raise ValueError("packed scale storage contains unexpected padding")
+            packed, reused = prepare_scale(self.torch, src, template)
             self.owners.append(packed)
-            self.packed_bytes += size
+            if reused:
+                self.reused_bytes += size
+            else:
+                self.packed_bytes += size
             sources[eid].append(packed.data_ptr())
 
     def task(self, args):
         if len(args) not in (6, 9) or (len(args) == 9 and (args[6] or args[8] is not None)):
             raise ValueError("unsupported native callback arguments")
         ids, mapping, layer, index, scores, prefetch = args[:6]
+        if not 0 <= index < len(self.tables):
+            raise ValueError("native layer was not prepared at finalization; cannot capture unregistered buffers")
         if layer is not self.manager.moe_layers[index]:
             raise ValueError("native layer identity mismatch")
+        for name, (original, layout) in self.targets[index].items():
+            current = self.expert_weight(layer, name) if name in ("w13_weight", "w2_weight") else getattr(layer, name)
+            if current is not original or tensor_layout(current) != layout:
+                raise RuntimeError("native destination changed after registration; restart with rebuilt descriptors")
         for tensor in (ids, scores):
             if tensor is not None and (tensor.device.type != "cpu" or not tensor.is_pinned()):
                 raise ValueError("native request buffers must be pinned CPU tensors")

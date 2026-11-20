@@ -18,14 +18,17 @@ spec.loader.exec_module(module)
 def main():
     torch.npu.set_device(0)
     for dtype in (torch.uint8, torch.float32):
-        for shape, stride in (((7, 8), (8, 1)), ((7, 8), (1, 7))):
+        for shape, stride in (((7, 8), (8, 1)), ((7, 8), (1, 7)), ((16, 64, 2), (2, 32, 1))):
             stream = torch.npu.Stream()
             target = torch.empty_strided(shape, stride, dtype=dtype, device="npu")
             reference = torch.empty_strided(shape, stride, dtype=dtype, device="npu")
             if tuple(target.stride()) != stride or tuple(reference.stride()) != stride:
                 raise RuntimeError("NPU did not preserve requested scale test strides")
-            source = torch.arange(56).reshape(shape).to(dtype)
+            source = torch.arange(target.numel()).reshape(shape).to(dtype)
             packed = module.pack_scale(torch, source, target)
+            reused, did_reuse = module.prepare_scale(torch, packed, target)
+            if not did_reuse or reused is not packed:
+                raise RuntimeError("matching pinned scale layout was not reused")
             reference.copy_(source)
             torch.npu.synchronize()
             # Use a second expert/slot to exercise a miss without an empty slot.

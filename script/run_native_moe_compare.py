@@ -22,9 +22,18 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from moe_tpot import streaming_completion, summarize_streams
 from run_host_sync_stage2 import target_cmake_args
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def timing_row(case, timing, e2e_mean_ms):
+    values = []
+    for metric in ("decode_ms", "ttft_ms", "tpot_ms"):
+        raw = timing[metric]["raw"]
+        values.append("undefined" if raw is None else f"{raw['mean']:.3f}")
+    return f"| {case} | {' | '.join(values)} | {e2e_mean_ms:.3f} |"
 
 
 def stop_process_group(proc):
@@ -129,6 +138,10 @@ def main():
             "MTE Python update -> MTE native update; same cache/config; no profiler/MSTX. "
             "Native graph replay only; original eager/prefill. This is initial correctness/performance validation."
         )
+        report(
+            "PRIMARY=decode_ms (first to last content); TPOT=decode/(actual output tokens-1); "
+            "HTTP E2E and TTFT retained. Five warmups by default; all samples in this summary."
+        )
         if not args.skip_build:
             for extension in ("lrc_policy", "host_sync"):
                 step(
@@ -188,8 +201,14 @@ def main():
         step("native CPU regression", [sys.executable, "-B", "tests/ut/expert_offload/test_native_update.py"])
         step("original worker regression", [sys.executable, "-B", "tests/ut/expert_offload/test_worker_polling.py"])
         step("NPU scale byte-layout parity", [sys.executable, "-B", "script/test_native_scale_copy.py"])
+        step(
+            "NPU native strict graph and GIL independence",
+            [sys.executable, "-B", "script/test_native_update_graph.py", "--library", str(library)],
+            timeout=180,
+        )
         reference = None
         means = {}
+        timings = {}
         source = args.test_script.read_text(encoding="utf-8")
         for case in ("python", "native"):
             with socket.socket() as sock:
@@ -226,15 +245,17 @@ def main():
                         ignore_eos=True,
                     )
                     for i in range(args.warmup_requests + args.requests):
-                        start = time.perf_counter()
-                        result = request("/v1/completions", body, args.request_timeout)
-                        elapsed = (time.perf_counter() - start) * 1000
+                        result = streaming_completion(opener, args.port, body, timeout=args.request_timeout)
+                        elapsed = result["http_wall_us"] / 1000
                         if result["usage"]["completion_tokens"] != args.max_tokens:
                             raise RuntimeError("unexpected completion count")
                         if i >= args.warmup_requests:
-                            samples.append(elapsed)
-                            outputs.append((result["choices"][0]["text"], result["usage"]))
-                        report(f"REQUEST {case} {i + 1}/{args.warmup_requests + args.requests}; ms={elapsed:.3f}")
+                            samples.append(result)
+                            outputs.append((result["digest"], result["usage"]))
+                        report(
+                            f"REQUEST {case} {i + 1}/{args.warmup_requests + args.requests}; "
+                            f"e2e_ms={elapsed:.3f}; decode_ms={result['decode_us'] / 1000:.3f}"
+                        )
                     if (
                         case == "native"
                         and "first native graph task completed without Python"
@@ -245,7 +266,11 @@ def main():
                         reference = outputs
                     elif outputs != reference:
                         raise RuntimeError("native outputs/usage differ from original MTE; no speedup claim")
-                    means[case] = statistics.mean(samples)
+                    means[case] = statistics.mean(sample["http_wall_us"] / 1000 for sample in samples)
+                    timings[case] = summarize_streams(samples)
+                    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+                        if "[MOE-NATIVE]" in line:
+                            report(line)
                     report(
                         "RESULT "
                         + json.dumps(
@@ -253,7 +278,8 @@ def main():
                                 case=case,
                                 requests=len(samples),
                                 mean_ms=means[case],
-                                samples_ms=samples,
+                                stream_samples=samples,
+                                timing=timings[case],
                                 output_match=True,
                                 digest=hashlib.sha256(json.dumps(outputs).encode()).hexdigest(),
                             )
@@ -262,9 +288,17 @@ def main():
                 finally:
                     stop_process_group(proc)
             report(f"STOP service={case}")
+        report("| Version | Decode mean ms (primary) | TTFT mean ms | TPOT mean ms/token | HTTP E2E mean ms |")
+        report("| --- | ---: | ---: | ---: | ---: |")
+        for case in ("python", "native"):
+            report(timing_row(case, timings[case], means[case]))
+        before = timings["python"]["decode_ms"]["raw"]["mean"]
+        after = timings["native"]["decode_ms"]["raw"]["mean"]
+        change = f"{(after / before - 1) * 100:.3f}%" if before > 0 else "undefined (single content chunk)"
         report(
-            f"PASS finite output parity; E2E mean change={(means['native'] / means['python'] - 1) * 100:.3f}%; "
-            "includes prefill, not decode-only TPOT; single service pair, not stability acceptance"
+            f"PASS finite output parity; decode mean change={change}; "
+            f"E2E mean change={(means['native'] / means['python'] - 1) * 100:.3f}%; "
+            "single service pair, not stability acceptance or bubble measurement"
         )
     except Exception as exc:
         report(f"FAILED {type(exc).__name__}: {exc}")
