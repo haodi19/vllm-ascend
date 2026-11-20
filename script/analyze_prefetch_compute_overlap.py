@@ -342,6 +342,17 @@ def analyze(path, backend="mte"):
         row["load_pair"] = load_pair(row["prefetch_loads"], row["reactive_loads"])
         rows.append(row)
         rindex = reactive[right["index"]]
+        pindex = prefetch[left["index"]]
+        if backend == "callback":
+            required = [("prefetch", prefetch_pairs[pindex]), ("reactive", reactive_pairs[rindex])]
+            if rindex:
+                required.append(("previous_reactive", reactive_pairs[rindex - 1]))
+            invalid = [role for role, pair in required if not pair[0]["host_coverage_valid"]]
+            if invalid:
+                row["reason"] = "callback_gate_host_order_mismatch"
+                row["invalid_gate_roles"] = invalid
+                reasons[row["reason"]] += 1
+                continue
         pub = reactive_pairs[rindex][0]
         start = positions[reactive_pairs[rindex - 1][1]["index"]] + 1 if rindex else 0
         segment = tasks[start : positions[pub["index"]]]
@@ -352,7 +363,7 @@ def analyze(path, backend="mte"):
             row["tail_names"] = [item["name"] for item in segment[-8:]]
             continue
         compute, join = boundary
-        prefetch_wait = prefetch_pairs[prefetch[left["index"]]][1]
+        prefetch_wait = prefetch_pairs[pindex][1]
         if join["end"] < prefetch_wait["end"] - ORDER_US:
             reasons["consumer_join_ends_before_prefetch_wait"] += 1
             row["reason"] = "consumer_join_ends_before_prefetch_wait"

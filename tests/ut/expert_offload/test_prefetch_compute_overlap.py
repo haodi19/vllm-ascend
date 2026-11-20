@@ -209,7 +209,7 @@ class OverlapTests(unittest.TestCase):
         self.assertFalse(issues)
         self.assertEqual(loads["1"], 1)
 
-    def test_saved_capture_end_to_end(self, backend="mte", gate_name="HOST_CPU", split_notify=False):
+    def test_saved_capture_end_to_end(self, backend="mte", gate_name="HOST_CPU", split_notify=False, invalid_gate=None):
         records = [dict(ph="M", name="process_name", pid="device", args=dict(name="Ascend Hardware"))]
 
         def add(name, start, end, tid, pid="device"):
@@ -221,6 +221,14 @@ class OverlapTests(unittest.TestCase):
             add("moe_offload/synchronize" + suffix, start + 1, end - 1, "worker", "host")
 
         def handshake(tid, publish, wait, end):
+            if (invalid_gate == "first_prefetch" and tid == "prefetch" and publish == 80) or (
+                invalid_gate == "all_prefetch" and tid == "prefetch"
+            ):
+                publish += 22
+            elif invalid_gate == "first_reactive" and tid == "main" and publish == 5:
+                publish = 12
+            elif invalid_gate == "middle_reactive" and tid == "main" and publish == 211:
+                publish = 214
             if backend == "mte":
                 add("host_sync_publish_1", publish, publish + 1, tid)
                 add("host_sync_wait_2", wait, end, tid)
@@ -267,6 +275,28 @@ class OverlapTests(unittest.TestCase):
             result = next(line[7:] for line in output.getvalue().splitlines() if line.startswith("RESULT "))
             result = json.loads(result)
             self.assertEqual(result["all"]["count"], 2)
+            if invalid_gate:
+                expected_invalid = 2 if invalid_gate == "middle_reactive" else 1
+                self.assertEqual(result["unmapped"]["count"], expected_invalid)
+                self.assertEqual(result["early"]["count"], 0)
+                self.assertEqual(result["late"]["count"], 2 - expected_invalid)
+                self.assertEqual(result["all"]["mean_us"], 33.5)
+                rows = computed["rows"]
+                self.assertEqual(rows[0]["reason"], "callback_gate_host_order_mismatch")
+                self.assertEqual(rows[0]["gap_us"], 12)
+                if invalid_gate == "middle_reactive":
+                    self.assertIn("reactive", rows[0]["invalid_gate_roles"])
+                    self.assertIn("previous_reactive", rows[1]["invalid_gate_roles"])
+                    self.assertEqual(computed["conservative"]["all_samples"]["method1_drop_late"]["mean_us"], 33.5)
+                    self.assertEqual(
+                        computed["conservative"]["all_samples"]["method2_subtract_remaining_compute"]["mean_us"], 33.5
+                    )
+                else:
+                    self.assertEqual(rows[1]["class"], "late")
+                    self.assertEqual(
+                        computed["conservative"]["all_samples"]["method2_subtract_remaining_compute"]["mean_us"], 17.25
+                    )
+                return
             self.assertEqual(result["early"]["mean_us"], 12)
             self.assertEqual(result["late"]["mean_us"], 55)
             self.assertEqual(result["unmapped"]["count"], 0)
@@ -283,6 +313,27 @@ class OverlapTests(unittest.TestCase):
 
     def test_short_hostfunc_and_notify_wait_end_to_end(self):
         self.test_saved_capture_end_to_end(backend="callback", gate_name="HOSTFUNC_CALLBACK", split_notify=True)
+
+    def test_partial_prefetch_coverage_keeps_original_and_other_samples(self):
+        self.test_saved_capture_end_to_end(
+            backend="callback", gate_name="HOSTFUNC_CALLBACK", split_notify=True, invalid_gate="first_prefetch"
+        )
+
+    def test_invalid_previous_reactive_excludes_dependent_boundary(self):
+        self.test_saved_capture_end_to_end(
+            backend="callback", gate_name="HOSTFUNC_CALLBACK", split_notify=True, invalid_gate="first_reactive"
+        )
+
+    def test_invalid_reactive_affects_both_adjacent_compute_segments(self):
+        self.test_saved_capture_end_to_end(
+            backend="callback", gate_name="HOSTFUNC_CALLBACK", split_notify=True, invalid_gate="middle_reactive"
+        )
+
+    def test_no_covered_prefetch_callbacks_still_rejects_stream(self):
+        with self.assertRaisesRegex(ValueError, "native callback device gates not uniquely identifiable"):
+            self.test_saved_capture_end_to_end(
+                backend="callback", gate_name="HOSTFUNC_CALLBACK", split_notify=True, invalid_gate="all_prefetch"
+            )
 
     def test_split_native_gate_pairing_requires_actual_stream_adjacency(self):
         launch = dict(task("HOSTFUNC_CALLBACK", 5, 6), native=True, notify=False)

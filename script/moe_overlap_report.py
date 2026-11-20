@@ -20,7 +20,8 @@ def overlap_summary(reports, root, labels):
         "\n## 预取→按需 Host间隔与计算推进\n",
         "MTE用publish/wait识别边界；回调组检查同流原生Host任务及紧随其后的NOTIFY_WAIT，"
         "以发起到等待结束的区间核对Host回调覆盖关系；不把短HOSTFUNC_CALLBACK当作完整Host工作。"
-        "数量、顺序或覆盖检查不通过则报告缺失。",
+        "数量或结构无法唯一对应则整组报告缺失；个别回调覆盖检查失败时，"
+        "涉及它的间隔（含依赖前一按需结束位置的样本）标为无法识别，保留原值，不用于早/晚判定。",
         "背景：从预取到同层按需的过程中，预取回调与按需之前的模型计算并行。"
         "可能是模型计算先结束，也可能是预取回调先结束。若预取回调先结束，"
         "还要等剩余计算，这段等待可能拉长预取→按需Host间隔、抬高均值。"
@@ -50,7 +51,11 @@ def overlap_summary(reports, root, labels):
                     result = analyze(path) if backend == "mte" else analyze(path, backend="callback")
                 results[label] = result
                 if backend == "callback":
-                    accepted = [item for item in result.get("callback_gate_checks", []) if item["reason"] == "ok"]
+                    accepted = [
+                        item
+                        for item in result.get("callback_gate_checks", [])
+                        if item["reason"] in ("ok", "partial_host_containment")
+                    ]
                     lines.append(f"CALLBACK_MAPPING {label}: " + json.dumps(accepted, ensure_ascii=False))
                 lines.append(
                     f"{label}：保守余量={number(result['sensitivity_margin_us'])}μs；"

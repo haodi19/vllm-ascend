@@ -14,6 +14,10 @@ ORDER_US = 1.0
 MAX_CHECK_EXAMPLES = 2
 
 
+def host_covered(task, host):
+    return task["start"] <= host["start"] + ORDER_US and task["end"] >= host["end"] - ORDER_US
+
+
 def gate_check(tasks, hosts):
     """Keep failed ordinal matches inspectable without guessing another pairing."""
     result = dict(device_count=len(tasks), host_count=len(hosts))
@@ -26,7 +30,7 @@ def gate_check(tasks, hosts):
     for index, (task, host) in enumerate(zip(tasks, hosts)):
         start_delta = task["start"] - host["start"]
         end_delta = task["end"] - host["end"]
-        if start_delta > ORDER_US or end_delta < -ORDER_US:
+        if not host_covered(task, host):
             failed_count += 1
             if len(failures) < MAX_CHECK_EXAMPLES:
                 failures.append(
@@ -41,6 +45,7 @@ def gate_check(tasks, hosts):
         result,
         reason="host_not_contained" if failed_count else "ok",
         failed_count=failed_count,
+        passed_count=len(hosts) - failed_count,
         examples=failures,
     )
 
@@ -143,16 +148,26 @@ def bind_callback_streams(path, data):
             checks.append(dict(pid=stream[0], tid=stream[1], reason=layout, examples=examples))
             continue
         envelopes = [dict(launch, end=wait["end"]) for launch, wait in pairs]
+        count_kinds = [kind for kind, hosts in data["groups"].items() if len(hosts) == len(pairs) and hosts]
+        if len(count_kinds) > 1:
+            raise ValueError("ambiguous native callback counts; refuse timestamp-based reassignment")
         kinds = []
         for kind, hosts in data["groups"].items():
             check = dict(pid=stream[0], tid=stream[1], kind=kind, layout=layout, **gate_check(envelopes, hosts))
             checks.append(check)
-            if check["reason"] == "ok":
+            # Equal complete counts and unique stream kind establish ordinal
+            # candidates. Coverage remains a per-callback validity requirement;
+            # keep failed ordinals in place, never shift/reassign their neighbors.
+            if check["reason"] in ("ok", "host_not_contained") and check["passed_count"]:
+                if check["failed_count"]:
+                    check["reason"] = "partial_host_containment"
                 kinds.append(kind)
         if not kinds:
             continue
         if len(kinds) != 1 or kinds[0] in bindings:
             raise ValueError("ambiguous native callback gate mapping")
+        for (launch, wait), envelope, host in zip(pairs, envelopes, data["groups"][kinds[0]]):
+            launch["host_coverage_valid"] = wait["host_coverage_valid"] = host_covered(envelope, host)
         bindings[kinds[0]] = (stream, pairs)
     print("CALLBACK_GATE_CHECKS " + json.dumps(checks, ensure_ascii=False), flush=True)
     data["callback_gate_checks"] = checks
