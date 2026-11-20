@@ -470,6 +470,7 @@ def analyze(path, backend="mte"):
 
     return dict(
         backend=backend,
+        callback_gate_checks=data.get("callback_gate_checks", []),
         trace=str(path),
         rows=rows,
         classification=summarize(rows),

@@ -9,6 +9,7 @@ from analyze_callback_gaps import MAX_INTERVALS, events
 from diagnose_mte_wait_timeline import record
 
 NATIVE_GATE = re.compile(r"(?:DAVID_)?(?:HOST_FUNC|HOST_CPU|HOST_CALLBACK|HOSTFUNC_CALLBACK)(?:_\d+)?", re.IGNORECASE)
+NOTIFY_GATE = re.compile(r"(?:DAVID_)?NOTIFY_WAIT(?:_\d+)?", re.IGNORECASE)
 ORDER_US = 1.0
 MAX_CHECK_EXAMPLES = 2
 
@@ -45,11 +46,42 @@ def gate_check(tasks, hosts):
 
 
 def native_gate(event):
+    return task_matches(event, NATIVE_GATE)
+
+
+def task_matches(event, pattern):
     args = event.get("args") or {}
     names = [str(event.get("name", ""))]
     if isinstance(args, dict):
         names.extend(str(args[key]) for key in ("Task Type", "task_type") if key in args)
-    return any(NATIVE_GATE.fullmatch(name) for name in names)
+    return any(pattern.fullmatch(name) for name in names)
+
+
+def callback_pairs(tasks):
+    """Use adjacent launch/notify tasks, never a nearest-time notify match.
+
+    Tasks include every device interval on this stream, in execution order.
+    Some exports instead have one native task spanning the entire callback;
+    that layout still requires full Host containment in the caller.
+    """
+    launches = [i for i, task in enumerate(tasks) if task["native"]]
+    waits = {i for i, task in enumerate(tasks) if task["notify"]}
+    if not waits:
+        return [(tasks[i], tasks[i]) for i in launches], "single_native_task"
+    pairs, used = [], set()
+    for i in launches:
+        if i + 1 not in waits:
+            return [], "native_task_not_followed_by_notify_wait"
+        launch, wait = tasks[i], tasks[i + 1]
+        if launch["end"] > wait["start"] + ORDER_US:
+            return [], "overlapping_launch_and_notify_wait"
+        if i + 2 < len(tasks) and wait["end"] > tasks[i + 2]["start"] + ORDER_US:
+            return [], "notify_wait_overlaps_following_task"
+        pairs.append((launch, wait))
+        used.add(i + 1)
+    if used != waits:
+        return [], "unpaired_notify_wait"
+    return pairs, "native_task_then_notify_wait"
 
 
 def bind_callback_streams(path, data):
@@ -85,11 +117,35 @@ def bind_callback_streams(path, data):
     )
     bindings = {}
     checks = []
-    for stream, tasks in gates.items():
+    # A HOSTFUNC_CALLBACK record can end before the Host work. Read its real
+    # successor on the same stream; filtering out other task types here could
+    # silently associate a later, unrelated NOTIFY_WAIT.
+    stream_tasks = {stream: [] for stream in gates}
+    retained = 0
+    for index, event in enumerate(events(path)):
+        stream = (str(event.get("pid")), str(event.get("tid")))
+        if event.get("ph") != "X" or stream not in stream_tasks:
+            continue
+        item = record(event, index)
+        item.update(native=native_gate(event), notify=task_matches(event, NOTIFY_GATE))
+        stream_tasks[stream].append(item)
+        retained += 1
+        if retained > MAX_INTERVALS:
+            raise ValueError("too many native callback stream tasks; refuse partial mapping")
+    for stream, tasks in stream_tasks.items():
         tasks.sort(key=lambda item: (item["start"], item["index"]))
+        pairs, layout = callback_pairs(tasks)
+        if not pairs:
+            examples = []
+            for i, item in enumerate(tasks):
+                if item["native"] and len(examples) < MAX_CHECK_EXAMPLES:
+                    examples.append([{key: row[key] for key in ("name", "start", "end")} for row in tasks[i : i + 3]])
+            checks.append(dict(pid=stream[0], tid=stream[1], reason=layout, examples=examples))
+            continue
+        envelopes = [dict(launch, end=wait["end"]) for launch, wait in pairs]
         kinds = []
         for kind, hosts in data["groups"].items():
-            check = dict(pid=stream[0], tid=stream[1], kind=kind, **gate_check(tasks, hosts))
+            check = dict(pid=stream[0], tid=stream[1], kind=kind, layout=layout, **gate_check(envelopes, hosts))
             checks.append(check)
             if check["reason"] == "ok":
                 kinds.append(kind)
@@ -97,8 +153,9 @@ def bind_callback_streams(path, data):
             continue
         if len(kinds) != 1 or kinds[0] in bindings:
             raise ValueError("ambiguous native callback gate mapping")
-        # One native gate corresponds to a Host callback, not two handshake tasks.
-        bindings[kinds[0]] = (stream, [(gate, gate) for gate in tasks])
+        bindings[kinds[0]] = (stream, pairs)
+    print("CALLBACK_GATE_CHECKS " + json.dumps(checks, ensure_ascii=False), flush=True)
+    data["callback_gate_checks"] = checks
     if set(bindings) != {"prefetch", "reactive"}:
         raise ValueError(
             "native callback device gates not uniquely identifiable; "

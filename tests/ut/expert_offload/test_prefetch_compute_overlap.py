@@ -20,7 +20,7 @@ from analyze_prefetch_compute_overlap import (
     restat_host_gaps,
     summarize,
 )
-from moe_callback_compute_boundary import gate_check, native_gate
+from moe_callback_compute_boundary import callback_pairs, gate_check, native_gate
 
 
 def task(name, start, end):
@@ -209,7 +209,7 @@ class OverlapTests(unittest.TestCase):
         self.assertFalse(issues)
         self.assertEqual(loads["1"], 1)
 
-    def test_saved_capture_end_to_end(self, backend="mte", gate_name="HOST_CPU"):
+    def test_saved_capture_end_to_end(self, backend="mte", gate_name="HOST_CPU", split_notify=False):
         records = [dict(ph="M", name="process_name", pid="device", args=dict(name="Ascend Hardware"))]
 
         def add(name, start, end, tid, pid="device"):
@@ -224,6 +224,9 @@ class OverlapTests(unittest.TestCase):
             if backend == "mte":
                 add("host_sync_publish_1", publish, publish + 1, tid)
                 add("host_sync_wait_2", wait, end, tid)
+            elif split_notify:
+                add(gate_name, publish, publish + 0.1, tid)
+                add("NOTIFY_WAIT", publish + 0.1, end, tid)
             else:
                 add(gate_name, publish, end, tid)
 
@@ -277,6 +280,29 @@ class OverlapTests(unittest.TestCase):
 
     def test_real_pr_hostfunc_callback_name_end_to_end(self):
         self.test_saved_capture_end_to_end(backend="callback", gate_name="HOSTFUNC_CALLBACK")
+
+    def test_short_hostfunc_and_notify_wait_end_to_end(self):
+        self.test_saved_capture_end_to_end(backend="callback", gate_name="HOSTFUNC_CALLBACK", split_notify=True)
+
+    def test_split_native_gate_pairing_requires_actual_stream_adjacency(self):
+        launch = dict(task("HOSTFUNC_CALLBACK", 5, 6), native=True, notify=False)
+        wait = dict(task("NOTIFY_WAIT", 6, 25), native=False, notify=True)
+        copy = dict(task("MEMCPY_ASYNC", 26, 27), native=False, notify=False)
+        pairs, layout = callback_pairs([launch, wait, copy])
+        self.assertEqual(layout, "native_task_then_notify_wait")
+        self.assertEqual(pairs, [(launch, wait)])
+        self.assertEqual(callback_pairs([launch, copy, wait])[1], "native_task_not_followed_by_notify_wait")
+        self.assertEqual(callback_pairs([launch, wait, copy, dict(wait, start=28, end=30)])[1], "unpaired_notify_wait")
+        self.assertEqual(callback_pairs([launch, dict(wait, start=4), copy])[1], "overlapping_launch_and_notify_wait")
+        self.assertEqual(callback_pairs([launch, dict(wait, end=28), copy])[1], "notify_wait_overlaps_following_task")
+        self.assertEqual(callback_pairs([wait])[1], "unpaired_notify_wait")
+
+    def test_split_gate_still_rejects_wait_ending_before_host(self):
+        launch = dict(task("HOSTFUNC_CALLBACK", 5, 6), native=True, notify=False)
+        wait = dict(task("NOTIFY_WAIT", 6, 19), native=False, notify=True)
+        pairs, _ = callback_pairs([launch, wait])
+        envelopes = [dict(first, end=last["end"]) for first, last in pairs]
+        self.assertEqual(gate_check(envelopes, [task("host", 10, 22)])["reason"], "host_not_contained")
 
     def test_native_gate_diagnostics_preserve_failed_coverage(self):
         gates = [task("HOSTFUNC_CALLBACK", 5, 12), task("HOSTFUNC_CALLBACK", 40, 60)]
