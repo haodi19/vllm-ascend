@@ -31,7 +31,7 @@ python -u -B script/run_native_moe_compare.py \
   --output-dir "/data/w00919836/moeoffload/bench_results/native_update_$(date +%Y%m%d_%H%M%S)"
 ```
 
-脚本继承当前环境，只读取 `test_graph2.sh` 的 `vllm serve` 参数，不执行其清日志、sysctl 等前置命令，不修改原脚本。模型路径、MTP、图捕获尺寸、缓存容量等继续使用该文件的设置。输出目录必须是新目录。
+脚本继承当前环境，只读取 `test_graph2.sh` 的 `vllm serve` 参数，不执行其清日志、sysctl 等前置命令，不修改原脚本。模型路径、MTP、图捕获尺寸、缓存容量等继续使用该文件的设置。输出目录必须是新目录。命令解析在构建和 NPU 检查前完成，兼容末尾续行符后没有换行的脚本；仍拒绝未闭合引号等语法错误。
 
 握手核显式使用 `CMAKE_BUILD_TYPE=Release`，CMake 工程也为未指定构建类型的调用提供 Release 默认值。构建开启 verbose；失败时，本步骤最后至多 60 行/32 KiB 日志自动进入 `summary.txt`，保留失败命令，完整日志仍在 `build.log`。
 
@@ -49,4 +49,6 @@ python -u -B script/run_native_moe_compare.py \
 
 2026-11-20：重编译 C++ LRC 扩展，8 组本地测试共 150 项通过、2 项平台相关跳过。新增验证覆盖真实 MXFP4 布局函数、单缓冲加载、旧 eager/prefill 数值一致性、dtype 转换回退、带 storage offset 的视图、重载保护及地址溢出。改动文件的定向 Ruff 检查通过；manager 原有 12 条 lint 问题未扩大。完整 `format.sh ci` 因本地缺少 pre-commit 未执行成功。
 
-本地没有 Ascend NPU，尚未完成真实 ACL 拷贝、模型输出和性能验证；上述绿区脚本负责这些检查。仅在检查通过后才能报告收益。
+绿区 Ascend950PR_957c 已通过：握手核构建、16 项原生 CPU 测试、30 项原工作线程测试、6 种 uint8/float32 连续与转置/MXFP4 布局的真实 NPU scale 拷贝检查。严格握手图重放 8 次，权重/scale/映射一致；其中 7 次在 Python 持有 GIL 的观测范围内由未完成推进到完成。
+
+该轮随后在解析 `test_graph2.sh` 末尾续行符时失败，尚未启动完整模型。解析器已按原测试脚本的处理补齐输入末尾换行，并通过 8 项脚本回归。本地没有 Ascend NPU；完整模型输出、性能和空泡收益仍待绿区模型对照，不能从小图通过推断。

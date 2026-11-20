@@ -76,7 +76,9 @@ def service_command(source, case, library, port):
     match = re.search(r"(?m)^vllm\s+serve\s+", source)
     if match is None:
         raise ValueError("test script must contain vllm serve")
-    words = [word for word in shlex.split(source[match.start() :], comments=True) if word.strip()]
+    # Match the established runner: test_graph2.sh may end in a continuation
+    # backslash without a final newline. Keep quoted values/escapes intact.
+    words = [word for word in shlex.split(source[match.start() :] + "\n", comments=True) if word.strip()]
     index = words.index("--additional-config") + 1
     config = json.loads(words[index])
     offload = config["expert_offload_config"]
@@ -172,6 +174,17 @@ def main():
             "PRIMARY=decode_ms (first to last content); TPOT=decode/(actual output tokens-1); "
             "HTTP E2E and TTFT retained. Five warmups by default; all samples in this summary."
         )
+        build = root / "device_build"
+        library = build / "lib/libhost_sync_device.so"
+        if args.skip_build:
+            if args.library is None:
+                raise ValueError("--skip-build requires --library")
+            library = args.library.resolve()
+        # Parse both commands before compiling or touching the NPU. A syntax
+        # error in the local launch script must not waste the hardware checks.
+        source = args.test_script.read_text(encoding="utf-8")
+        commands = {case: service_command(source, case, library, args.port) for case in ("python", "native")}
+        report(f"PASS launch command parsing: {args.test_script}")
         if not args.skip_build:
             for extension in ("lrc_policy", "host_sync"):
                 step(
@@ -196,17 +209,11 @@ def main():
                 check=True,
             )
             soc = next(line[4:] for line in result.stdout.splitlines() if line.startswith("SOC="))
-            build = root / "device_build"
             step(
                 "configure handshake",
                 handshake_configure_command(build, args.cann_root, soc),
             )
             step("build handshake", ["cmake", "--build", str(build), "--verbose", "-j", "2"])
-            library = build / "lib/libhost_sync_device.so"
-        else:
-            if args.library is None:
-                raise ValueError("--skip-build requires --library")
-            library = args.library.resolve()
         if not library.is_file():
             raise FileNotFoundError(library)
         # Missing extensions/APIs are fatal, not unittest skips.
@@ -231,11 +238,10 @@ def main():
         reference = None
         means = {}
         timings = {}
-        source = args.test_script.read_text(encoding="utf-8")
         for case in ("python", "native"):
             with socket.socket() as sock:
                 sock.bind(("127.0.0.1", args.port))
-            command = service_command(source, case, library, args.port)
+            command = commands[case]
             # This exact argv preserves the original model and MTP settings.
             (root / f"{case}_command.json").write_text(
                 json.dumps(command, ensure_ascii=False, indent=2), encoding="utf-8"

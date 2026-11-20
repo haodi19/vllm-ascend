@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
+import contextlib
 import importlib.util
+import io
 import json
 import shlex
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "script"))
@@ -15,6 +18,45 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
+    def test_repository_launch_script_with_and_without_final_newline(self):
+        source = (ROOT / "script/test_graph2.sh").read_text(encoding="utf-8").rstrip("\n")
+        for case in ("python", "native"):
+            expected = runner.service_command(source + "\n", case, "/lib/handshake.so", 8156)
+            self.assertEqual(runner.service_command(source, case, "/lib/handshake.so", 8156), expected)
+            self.assertEqual(expected[:4], [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve"])
+            config = json.loads(expected[expected.index("--additional-config") + 1])
+            self.assertEqual(config["expert_offload_config"]["host_update_backend"], case)
+            self.assertNotIn("--profiler-config", expected)
+            self.assertTrue(all(word.strip() for word in expected))
+
+    def test_eof_continuation_preserves_quoted_backslashes(self):
+        config = {"expert_offload_config": {"hot_experts_file": "path\\with\\escapes.json"}}
+        source = 'vllm serve "/model with spaces" --port 8155 --additional-config '
+        source += shlex.quote(json.dumps(config))
+        expected = runner.service_command(source, "native", "/lib/test.so", 8156)
+        for ending in (" \\", " \\\n", " \\\n# comment at EOF"):
+            self.assertEqual(runner.service_command(source + ending, "native", "/lib/test.so", 8156), expected)
+        with self.assertRaisesRegex(ValueError, "No closing quotation"):
+            runner.service_command(source + " 'unfinished", "native", "/lib/test.so", 8156)
+
+    def test_bad_launch_script_fails_before_build_or_npu_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "invalid.sh"
+            source.write_text("vllm serve '/unfinished", encoding="utf-8")
+            output = Path(directory) / "result"
+            argv = ["runner", "--npu", "1", "--test-script", str(source), "--output-dir", str(output)]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(sys, "platform", "linux"),
+                patch.object(runner.subprocess, "Popen") as popen,
+                patch.object(runner.subprocess, "run") as run,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(runner.main(), 1)
+            popen.assert_not_called()
+            run.assert_not_called()
+            self.assertIn("No closing quotation", (output / "summary.txt").read_text(encoding="utf-8"))
+
     def test_handshake_configure_preserves_soc_and_sets_build_type(self):
         for soc in ("ascend950pr_957c", "ascend950dt_9582"):
             command = runner.handshake_configure_command(Path("build with spaces"), Path("cann root"), soc)
