@@ -1,5 +1,10 @@
 cmake_minimum_required(VERSION 3.16)
 project(host_sync_device LANGUAGES CXX)
+# AscendC forwards this value to its object-merging scripts as --build-type.
+# An empty value is not a usable default for that toolchain.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type for AscendC tools" FORCE)
+endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(RUN_MODE "npu" CACHE STRING "Kernel execution mode")

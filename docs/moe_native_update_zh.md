@@ -33,6 +33,8 @@ python -u -B script/run_native_moe_compare.py \
 
 脚本继承当前环境，只读取 `test_graph2.sh` 的 `vllm serve` 参数，不执行其清日志、sysctl 等前置命令，不修改原脚本。模型路径、MTP、图捕获尺寸、缓存容量等继续使用该文件的设置。输出目录必须是新目录。
 
+握手核显式使用 `CMAKE_BUILD_TYPE=Release`，CMake 工程也为未指定构建类型的调用提供 Release 默认值。构建开启 verbose；失败时，本步骤最后至多 60 行/32 KiB 日志自动进入 `summary.txt`，保留失败命令，完整日志仍在 `build.log`。
+
 依次执行：构建两个 CPU 扩展；读取当前逻辑卡 0 的实际型号并构建匹配的 MTE 核；运行 CPU 回归；用小张量验证连续/转置/MXFP4 布局 scale 的字节拷贝和 pinned 复用；运行真实 NPU 图的 D2H→publish→原生搬运→严格 wait→映射 H2D 测试；原 MTE 组合配置与原生更新配置各启动一个服务，5 次预热、20 次正式请求。两组只有 `host_update_backend` 不同。不会启动 profiler/MSTX。
 
 小图使用禁止调用的 Python 回调作为兜底哨兵，验证重复输入、miss、淘汰后的权重/scale/映射内容；Python 持有 GIL 忙等期间，必须观察到至少一次尚未完成的原生任务完成。无法形成该观测则报验证不充分，不假报通过。该测试在独立子进程运行，严格等待失败后终止子进程，不继续模型测试。

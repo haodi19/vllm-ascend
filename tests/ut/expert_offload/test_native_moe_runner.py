@@ -3,6 +3,7 @@ import importlib.util
 import json
 import shlex
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -14,6 +15,32 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
+    def test_handshake_configure_preserves_soc_and_sets_build_type(self):
+        for soc in ("ascend950pr_957c", "ascend950dt_9582"):
+            command = runner.handshake_configure_command(Path("build with spaces"), Path("cann root"), soc)
+            self.assertIn("-DCMAKE_BUILD_TYPE=Release", command)
+            self.assertIn(f"-DSOC_VERSION={soc}", command)
+            self.assertIn("-DASCEND_COMPUTE_UNIT=ascend950", command)
+            self.assertEqual(command[command.index("-B") + 1], "build with spaces")
+            self.assertIn(f"-DASCEND_CANN_PACKAGE_PATH={Path('cann root').resolve()}", command)
+
+    def test_failed_step_summary_contains_failing_command_not_earlier_steps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "build.log"
+            earlier = b"previous successful build\n" * 500
+            failure = b"COMMAND bash merge_mix_obj.sh --build-type\nError 1\n"
+            log.write_bytes(earlier + failure)
+            lines = []
+            runner.report_failed_step(log, len(earlier), lines.append)
+            self.assertIn("COMMAND bash merge_mix_obj.sh --build-type", lines)
+            self.assertIn("Error 1", lines)
+            self.assertNotIn("previous successful build", "\n".join(lines))
+            log.write_bytes(b"x" * 40000 + b"\nlast error\n")
+            lines.clear()
+            runner.report_failed_step(log, 0, lines.append)
+            self.assertIn("last error", lines)
+            self.assertLess(len("\n".join(lines)), 33000)
+
     def test_preserves_workload_and_separates_case(self):
         config = {"expert_offload_config": {"num_device_experts": 24, "expert_prefetch_enabled": True}}
         source = "rm -rf do-not-run\nvllm serve /model --port 8155 --speculative-config "

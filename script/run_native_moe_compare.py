@@ -28,6 +28,31 @@ from run_host_sync_stage2 import target_cmake_args
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def handshake_configure_command(build, cann_root, soc):
+    return [
+        "cmake",
+        "-S",
+        str(ROOT / "csrc/host_sync_device"),
+        "-B",
+        str(build),
+        f"-DASCEND_CANN_PACKAGE_PATH={cann_root.resolve()}",
+        *target_cmake_args(soc),
+        "-DCMAKE_BUILD_TYPE=Release",
+    ]
+
+
+def report_failed_step(log_path, start_offset, report):
+    """Keep the last failing command visible without copying a whole build log."""
+    with log_path.open("rb") as log:
+        log.seek(0, os.SEEK_END)
+        log.seek(max(start_offset, log.tell() - 32768))
+        tail = log.read().decode("utf-8", errors="replace").splitlines()[-60:]
+    report("FAILED_STEP_LOG_BEGIN (last at most 60 lines / 32 KiB of this step)")
+    for line in tail:
+        report(line)
+    report("FAILED_STEP_LOG_END")
+
+
 def timing_row(case, timing, e2e_mean_ms):
     values = []
     for metric in ("decode_ms", "ttft_ms", "tpot_ms"):
@@ -111,7 +136,11 @@ def main():
 
     def step(label, command, timeout=600):
         report(f"START {label}")
-        with (root / "build.log").open("a", encoding="utf-8") as out:
+        log_path = root / "build.log"
+        start_offset = log_path.stat().st_size if log_path.exists() else 0
+        with log_path.open("a", encoding="utf-8") as out:
+            out.write("STEP_COMMAND " + json.dumps(command) + "\n")
+            out.flush()
             proc = subprocess.Popen(
                 command, cwd=ROOT, env=env, stdout=out, stderr=subprocess.STDOUT, start_new_session=True
             )
@@ -121,6 +150,7 @@ def main():
                     raise RuntimeError(f"{label} exit={code}; see {root / 'build.log'}")
             except BaseException:
                 stop_process_group(proc)
+                report_failed_step(log_path, start_offset, report)
                 raise
         report(f"PASS {label}")
 
@@ -169,17 +199,9 @@ def main():
             build = root / "device_build"
             step(
                 "configure handshake",
-                [
-                    "cmake",
-                    "-S",
-                    str(ROOT / "csrc/host_sync_device"),
-                    "-B",
-                    str(build),
-                    f"-DASCEND_CANN_PACKAGE_PATH={args.cann_root.resolve()}",
-                    *target_cmake_args(soc),
-                ],
+                handshake_configure_command(build, args.cann_root, soc),
             )
-            step("build handshake", ["cmake", "--build", str(build), "-j", "2"])
+            step("build handshake", ["cmake", "--build", str(build), "--verbose", "-j", "2"])
             library = build / "lib/libhost_sync_device.so"
         else:
             if args.library is None:
