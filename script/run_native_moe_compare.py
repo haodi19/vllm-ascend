@@ -61,6 +61,23 @@ def timing_row(case, timing, e2e_mean_ms):
     return f"| {case} | {' | '.join(values)} | {e2e_mean_ms:.3f} |"
 
 
+def report_service_failure(case, log_path, samples, completed, proc, exc, report):
+    """Preserve failure evidence before cleanup adds secondary shutdown errors."""
+    report(
+        f"SERVICE_FAILURE case={case}; completed_requests_including_warmup={completed}; "
+        f"completed_timed_requests={len(samples)}; service_exit={proc.poll()}; "
+        f"error={type(exc).__name__}: {exc}"
+    )
+    partial = log_path.with_name(f"{case}_partial.json")
+    partial.write_text(
+        json.dumps(dict(case=case, status="incomplete", stream_samples=samples), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    report(f"PARTIAL_SAMPLES={partial}; incomplete comparison, no speedup claim")
+    report(f"SERVICE_LOG_BEFORE_CLEANUP={log_path}")
+    report_failed_step(log_path, 0, report)
+
+
 def stop_process_group(proc):
     with contextlib.suppress(ProcessLookupError):
         os.killpg(proc.pid, signal.SIGTERM)
@@ -252,6 +269,7 @@ def main():
                 proc = subprocess.Popen(
                     command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
                 )
+                samples, completed = [], 0
                 try:
                     deadline = time.monotonic() + args.startup_timeout
                     while True:
@@ -280,6 +298,7 @@ def main():
                         if i >= args.warmup_requests:
                             samples.append(result)
                             outputs.append((result["digest"], result["usage"]))
+                        completed += 1
                         report(
                             f"REQUEST {case} {i + 1}/{args.warmup_requests + args.requests}; "
                             f"e2e_ms={elapsed:.3f}; decode_ms={result['decode_us'] / 1000:.3f}"
@@ -313,6 +332,12 @@ def main():
                             )
                         )
                     )
+                except Exception as exc:
+                    try:
+                        report_service_failure(case, log_path, samples, completed, proc, exc, report)
+                    except Exception as diagnostic_error:
+                        report(f"FAILURE_DIAGNOSTICS_UNAVAILABLE {type(diagnostic_error).__name__}: {diagnostic_error}")
+                    raise
                 finally:
                     stop_process_group(proc)
             report(f"STOP service={case}")

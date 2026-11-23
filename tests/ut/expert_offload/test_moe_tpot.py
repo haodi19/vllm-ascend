@@ -130,6 +130,17 @@ class TpotTests(unittest.TestCase):
         with patch.object(self.module, "MAX_SSE_LINE_BYTES", 8), self.assertRaises(ValueError):
             self.module.decode_sse(self.response(), 0, clock=lambda: 0)
 
+    def test_stream_error_preserves_bounded_server_reason(self):
+        for error in ("EngineDeadError", {"type": "EngineDeadError", "message": "device timeout", "extra": "omit"}):
+            response = io.BytesIO(("data: " + json.dumps(dict(error=error)) + "\n\n").encode())
+            with self.assertRaisesRegex(ValueError, "EngineDeadError") as caught:
+                self.module.decode_sse(response, 0, clock=lambda: 0)
+            self.assertNotIn("omit", str(caught.exception))
+        response = io.BytesIO(("data: " + json.dumps(dict(error="x" * 5000)) + "\n\n").encode())
+        with self.assertRaisesRegex(ValueError, "truncated") as caught:
+            self.module.decode_sse(response, 0, clock=lambda: 0)
+        self.assertLess(len(str(caught.exception)), 2200)
+
     def test_stream_request_uses_usage_and_separates_http_tail(self):
         opener = Mock()
         opener.open.return_value = self.response()

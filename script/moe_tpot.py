@@ -14,6 +14,7 @@ from inspect_moe_profile import _interval, copy_gap_boundaries
 from moe_outlier_stats import outlier_summary
 
 MAX_SSE_LINE_BYTES = 1024 * 1024
+MAX_SSE_ERROR_CHARS = 2048
 MAX_CLOCK_DRIFT_US = 10000
 
 
@@ -46,7 +47,13 @@ def decode_sse(response, started_ns, *, clock=time.perf_counter_ns, timeout=300)
                 break
             record = json.loads(payload)
             if record.get("error"):
-                raise ValueError("server returned an SSE error")
+                error = record["error"]
+                if isinstance(error, dict):
+                    error = {key: error[key] for key in ("type", "code", "message") if key in error}
+                detail = json.dumps(error, ensure_ascii=False)
+                if len(detail) > MAX_SSE_ERROR_CHARS:
+                    detail = detail[:MAX_SSE_ERROR_CHARS] + "... [truncated]"
+                raise ValueError("server returned an SSE error: " + detail)
             if record.get("usage") is not None:
                 usage = record["usage"]
             for choice in record.get("choices", []):

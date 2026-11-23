@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "script"))
@@ -18,6 +18,22 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
+    def test_service_failure_keeps_partial_samples_and_engine_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "python.log"
+            log.write_text("EngineCore root cause: device error\n", encoding="utf-8")
+            lines = []
+            sample = {"decode_us": 1000, "completion_tokens": 5}
+            runner.report_service_failure(
+                "python", log, [sample], 6, Mock(poll=lambda: None), ValueError("SSE error"), lines.append
+            )
+            partial = json.loads((Path(directory) / "python_partial.json").read_text(encoding="utf-8"))
+            self.assertEqual(partial["status"], "incomplete")
+            self.assertEqual(partial["stream_samples"], [sample])
+            self.assertIn("completed_timed_requests=1", lines[0])
+            self.assertIn("EngineCore root cause: device error", lines)
+            self.assertIn("SERVICE_LOG_BEFORE_CLEANUP=", "\n".join(lines))
+
     def test_repository_launch_script_with_and_without_final_newline(self):
         source = (ROOT / "script/test_graph2.sh").read_text(encoding="utf-8").rstrip("\n")
         for case in ("python", "native"):
