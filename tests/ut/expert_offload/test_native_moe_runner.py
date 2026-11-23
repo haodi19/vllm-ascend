@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import contextlib
+import errno
 import importlib.util
 import io
 import json
 import shlex
+import socket
 import sys
 import tempfile
 import unittest
@@ -18,6 +20,73 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
+    def test_port_check_rejects_live_listener_and_accepts_released_port(self):
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen()
+            port = server.getsockname()[1]
+            with self.assertRaisesRegex(RuntimeError, f"Port {port} is unavailable"):
+                runner.wait_port_free(port)
+        runner.wait_port_free(port)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux TCP TIME_WAIT semantics")
+    def test_port_check_accepts_server_time_wait_without_live_listener(self):
+        with socket.socket() as server, socket.socket() as client:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            server.listen()
+            port = server.getsockname()[1]
+            client.connect(("127.0.0.1", port))
+            accepted, _ = server.accept()
+            # Server actively closes, leaving its local port in TIME_WAIT.
+            accepted.shutdown(socket.SHUT_WR)
+            self.assertEqual(client.recv(1), b"")
+            client.shutdown(socket.SHUT_WR)
+            self.assertEqual(accepted.recv(1), b"")
+            accepted.close()
+        with socket.socket() as old_probe:
+            with self.assertRaises(OSError) as raised:
+                old_probe.bind(("127.0.0.1", port))
+            self.assertEqual(raised.exception.errno, errno.EADDRINUSE)
+        runner.wait_port_free(port)
+
+    def test_port_check_waits_for_listener_but_has_deadline(self):
+        probe = Mock()
+        probe.connect_ex.side_effect = [0, 1]
+        sock = Mock()
+        sock.__enter__ = Mock(return_value=probe)
+        sock.__exit__ = Mock(return_value=False)
+        with patch.object(runner.socket, "socket", return_value=sock), patch.object(runner.time, "sleep") as sleep:
+            runner.wait_port_free(8156, timeout=10)
+            sleep.assert_called_once()
+        probe.connect_ex.side_effect = None
+        probe.connect_ex.return_value = 0
+        with (
+            patch.object(runner.socket, "socket", return_value=sock),
+            patch.object(runner.time, "monotonic", side_effect=[0, 1, 11]),
+            patch.object(runner.time, "sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "after 10s"):
+                runner.wait_port_free(8156, timeout=10)
+            sleep.assert_called_once()
+
+    def test_busy_port_fails_before_build_or_npu_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "result"
+            argv = ["runner", "--npu", "1", "--output-dir", str(output)]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(sys, "platform", "linux"),
+                patch.object(runner, "wait_port_free", side_effect=RuntimeError("Port 8156 is unavailable")),
+                patch.object(runner.subprocess, "Popen") as popen,
+                patch.object(runner.subprocess, "run") as run,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(runner.main(), 1)
+            popen.assert_not_called()
+            run.assert_not_called()
+            self.assertIn("Port 8156 is unavailable", (output / "summary.txt").read_text(encoding="utf-8"))
+
     def test_service_failure_keeps_partial_samples_and_engine_error(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "python.log"

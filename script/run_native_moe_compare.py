@@ -7,6 +7,7 @@ not executed. Uses the caller's activated environment. No original file edits.
 
 import argparse
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -26,6 +27,32 @@ from moe_tpot import streaming_completion, summarize_streams
 from run_host_sync_stage2 import target_cmake_args
 
 ROOT = Path(__file__).resolve().parents[1]
+PORT_RELEASE_TIMEOUT = 10
+PORT_POLL_INTERVAL = 0.2
+
+
+def wait_port_free(port, timeout=0):
+    """Allow closed TCP connections while rejecting a live listener/bound port."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with socket.socket() as probe:
+                probe.settimeout(0.5)
+                if probe.connect_ex(("127.0.0.1", port)) == 0:
+                    raise OSError(errno.EADDRINUSE, "listener is still accepting connections")
+            with socket.socket() as sock:
+                # Match the server's bind policy: TIME_WAIT alone is not a
+                # live service. SO_REUSEPORT is deliberately not enabled.
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind(("0.0.0.0", port))
+            return
+        except OSError as exc:
+            if exc.errno != errno.EADDRINUSE or time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Port {port} is unavailable after {timeout}s: {exc}; "
+                    "next service not started. Check the listener or choose --port; no unrelated process was stopped"
+                ) from exc
+            time.sleep(PORT_POLL_INTERVAL)
 
 
 def handshake_configure_command(build, cann_root, soc):
@@ -142,6 +169,8 @@ def main():
     args = parser.parse_args()
     if sys.platform != "linux" or args.npu < 0 or min(args.max_tokens, args.requests, args.warmup_requests) < 1:
         parser.error("requires Linux, a non-negative NPU and positive request/token counts")
+    if not 1 <= args.port <= 65535:
+        parser.error("--port must be between 1 and 65535")
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(args.npu))
@@ -202,6 +231,8 @@ def main():
         source = args.test_script.read_text(encoding="utf-8")
         commands = {case: service_command(source, case, library, args.port) for case in ("python", "native")}
         report(f"PASS launch command parsing: {args.test_script}")
+        wait_port_free(args.port)
+        report(f"PASS initial port check: {args.port}")
         if not args.skip_build:
             for extension in ("lrc_policy", "host_sync"):
                 step(
@@ -256,8 +287,7 @@ def main():
         means = {}
         timings = {}
         for case in ("python", "native"):
-            with socket.socket() as sock:
-                sock.bind(("127.0.0.1", args.port))
+            wait_port_free(args.port)
             command = commands[case]
             # This exact argv preserves the original model and MTP settings.
             (root / f"{case}_command.json").write_text(
@@ -340,7 +370,9 @@ def main():
                     raise
                 finally:
                     stop_process_group(proc)
-            report(f"STOP service={case}")
+            report(f"WAIT port release after service={case}; port={args.port}; timeout={PORT_RELEASE_TIMEOUT}s")
+            wait_port_free(args.port, timeout=PORT_RELEASE_TIMEOUT)
+            report(f"STOP service={case}; port={args.port} reusable")
         report("| Version | Decode mean ms (primary) | TTFT mean ms | TPOT mean ms/token | HTTP E2E mean ms |")
         report("| --- | ---: | ---: | ---: | ---: |")
         for case in ("python", "native"):
