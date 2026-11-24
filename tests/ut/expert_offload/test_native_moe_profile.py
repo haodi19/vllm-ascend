@@ -44,6 +44,30 @@ def fixture():
 
 
 class NativeProfileTests(unittest.TestCase):
+    def test_profile_failure_summary_contains_engine_oom_before_api_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "native_profile.log"
+            log.write_text(
+                "old startup message\n" * 5000
+                + "pack_scale: torch.empty_strided\ntorch.OutOfMemoryError: aclrtMallocHostWithCfg 207001\n"
+                + "API stack frame\n" * 100
+                + "RuntimeError: Engine core initialization failed\n",
+                encoding="utf-8",
+            )
+            lines = []
+            profile.report_profile_failure("native", log, RuntimeError("service exited"), lines.append)
+        self.assertIn("pack_scale: torch.empty_strided", lines)
+        self.assertIn("torch.OutOfMemoryError: aclrtMallocHostWithCfg 207001", lines)
+        self.assertIn("RuntimeError: Engine core initialization failed", lines)
+        # Adjacent startup lines may appear as context, but not the large prefix.
+        self.assertLessEqual(lines.count("old startup message"), profile.FAILURE_LOG_CONTEXT)
+        self.assertLessEqual(
+            len(lines),
+            3
+            + profile.FAILURE_LOG_TAIL_LINES
+            + profile.FAILURE_LOG_MAX_MATCHES * (2 * profile.FAILURE_LOG_CONTEXT + 1),
+        )
+
     def test_profile_request_failure_stops_owned_service(self):
         args = SimpleNamespace(
             port=8156,

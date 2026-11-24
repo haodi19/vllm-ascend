@@ -20,6 +20,43 @@ from verify_memcpy_gaps import inspect_offload_trace
 
 MIN_BUBBLE_US = 10.0
 MAX_BUBBLE_US = 5000.0
+FAILURE_LOG_BYTES = 65536
+FAILURE_LOG_TAIL_LINES = 20
+FAILURE_LOG_CONTEXT = 2
+FAILURE_LOG_MAX_MATCHES = 8
+
+
+def report_profile_failure(case, log_path, error, report):
+    """Keep the engine failure visible in summary.txt before cleanup adds noise."""
+    report(f"PROFILE_SERVICE_FAILURE case={case}; error={type(error).__name__}: {error}; service_log={log_path}")
+    with log_path.open("rb") as source:
+        source.seek(0, 2)
+        source.seek(max(0, source.tell() - FAILURE_LOG_BYTES))
+        lines = source.read().decode("utf-8", errors="replace").splitlines()
+    selected = set(range(max(0, len(lines) - FAILURE_LOG_TAIL_LINES), len(lines)))
+    matches = 0
+    for index, line in enumerate(lines):
+        if any(
+            token in line
+            for token in (
+                "OutOfMemoryError",
+                "Memory_Allocation_Failure",
+                "RuntimeError:",
+                "ValueError:",
+                "ImportError:",
+                "error code is",
+            )
+        ):
+            selected.update(
+                range(max(0, index - FAILURE_LOG_CONTEXT), min(len(lines), index + FAILURE_LOG_CONTEXT + 1))
+            )
+            matches += 1
+            if matches >= FAILURE_LOG_MAX_MATCHES:
+                break
+    report("PROFILE_SERVICE_LOG_EXCERPT_BEGIN (bounded tail and error context; full log retained)")
+    for index in sorted(selected):
+        report(lines[index])
+    report("PROFILE_SERVICE_LOG_EXCERPT_END")
 
 
 def profile_command(command, directory, timing_port):
@@ -159,7 +196,11 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                     encoding="utf-8", errors="replace"
                 ):
                     raise RuntimeError("Native profile did not execute native graph tasks")
-            except Exception:
+            except Exception as error:
+                try:
+                    report_profile_failure(case, log_path, error, report)
+                except Exception as exc:
+                    report(f"PROFILE_FAILURE_EXCERPT_UNAVAILABLE {type(exc).__name__}: {exc}")
                 try:
                     log_memory(f"failure profile/{case}/before_cleanup", report)
                 except Exception as exc:
@@ -192,7 +233,8 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
         ]
         profiles[case] = dict(scan=scan, mapping=mapping, aligned_profile=published, bubble_stats=bubble_stats)
         (root / f"{case}_profile_report.json").write_text(json.dumps(profiles[case]), encoding="utf-8")
-    report("PROFILE_COMPARISON: Host gap = next task entry - previous task return; includes zero-load tasks.")
+    report(f"PROFILE_COMPLETE cases={','.join(profiles)}; each profile output matched the saved timing reference")
+    report("PROFILE_MEASUREMENT: Host gap = next task entry - previous task return; includes zero-load tasks.")
     report("Loading bubbles: exact named stream, union of all tasks including Transpose, 10<=gap<5000us.")
     report_gap_table(profiles, report)
     return profiles

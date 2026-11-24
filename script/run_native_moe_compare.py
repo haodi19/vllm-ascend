@@ -163,17 +163,19 @@ def continue_profile(args, root, env, report):
 
     source = args.profile_only_from.resolve(strict=True)
     records, commands, reference, args.max_tokens = load_completed_timing_run(source, args.port)
+    if args.profile_case != "both":
+        commands = {args.profile_case: commands[args.profile_case]}
     report(f"TIMING_SOURCE={source}; completed earlier; timing requests and builds are NOT repeated")
     report(
         f"PROFILE_ONLY: max_tokens={args.max_tokens} from saved samples; physical_npu={args.npu}; "
-        f"warmups={args.warmup_requests}; profile_requests={args.profile_requests}"
+        f"warmups={args.warmup_requests}; profile_requests={args.profile_requests}; cases={','.join(commands)}"
     )
-    for case in ("python", "native"):
+    for case in commands:
         report("RESULT " + json.dumps(records[case]))
         (root / f"{case}_command.json").write_text(json.dumps(commands[case]), encoding="utf-8")
     report("| Version | Decode mean ms (primary) | TTFT mean ms | TPOT mean ms/token | HTTP E2E mean ms |")
     report("| --- | ---: | ---: | ---: | ---: |")
-    for case in ("python", "native"):
+    for case in commands:
         samples = records[case]["stream_samples"]
         report(timing_row(case, summarize_streams(samples), statistics.mean(s["http_wall_us"] / 1000 for s in samples)))
     ensure_profile_storage(
@@ -267,6 +269,12 @@ def main():
         type=Path,
         help="Continue profiling from completed saved timing results; no build or retiming",
     )
+    parser.add_argument(
+        "--profile-case",
+        choices=("both", "python", "native"),
+        default="both",
+        help="With --profile-only-from, collect just one case or both sequentially (default)",
+    )
     parser.add_argument("--timing-port", type=int, default=18156)
     parser.add_argument("--profile-timeout", type=int, default=180)
     parser.add_argument(
@@ -285,6 +293,8 @@ def main():
         help="Persistent parent for fresh numbered handshake builds, independent of results",
     )
     args = parser.parse_args()
+    if args.profile_case != "both" and not args.profile_only_from:
+        parser.error("--profile-case python/native requires --profile-only-from")
     if not 0 < args.min_profile_free_gib < float("inf"):
         parser.error("--min-profile-free-gib must be positive and finite")
     if args.profile_only_from and (args.skip_profile or args.skip_build or args.library):

@@ -112,6 +112,54 @@ class NativeRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "outputs/usage"):
                 runner.load_completed_timing_run(directory, 8156)
 
+    def test_profile_continuation_runs_only_selected_case(self):
+        for case in ("python", "native"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary) / "timing"
+                source.mkdir()
+                self.saved_timing_fixture(source, tokens=5)
+                output = Path(temporary) / "single"
+                argv = [
+                    "runner",
+                    "--npu",
+                    "7",
+                    "--profile-only-from",
+                    str(source),
+                    "--profile-case",
+                    case,
+                    "--output-dir",
+                    str(output),
+                ]
+                with (
+                    patch.object(sys, "argv", argv),
+                    patch.object(sys, "platform", "linux"),
+                    patch("run_verified_cpp_tests.ensure_profile_storage"),
+                    patch("native_moe_profile.profile_cases") as profiles,
+                    patch.object(runner.subprocess, "Popen") as popen,
+                    patch.object(runner.subprocess, "run") as run,
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(runner.main(), 0)
+                popen.assert_not_called()
+                run.assert_not_called()
+                args, commands = profiles.call_args.args[:2]
+                self.assertEqual(list(commands), [case])
+                self.assertEqual(args.max_tokens, 5)
+                summary = (output / "summary.txt").read_text(encoding="utf-8")
+                rows = [json.loads(line[7:]) for line in summary.splitlines() if line.startswith("RESULT ")]
+                self.assertEqual([row["case"] for row in rows], [case])
+                self.assertIn(f"cases={case}", summary)
+                self.assertIn("TIMING_SOURCE=", summary)
+
+    def test_single_case_selector_requires_profile_continuation(self):
+        with (
+            patch.object(sys, "argv", ["runner", "--npu", "7", "--profile-case", "native", "--output-dir", "unused"]),
+            contextlib.redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit) as error,
+        ):
+            runner.main()
+        self.assertEqual(error.exception.code, 2)
+
     def test_profile_continuation_rejects_missing_library(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
@@ -128,6 +176,7 @@ class NativeRunnerTests(unittest.TestCase):
             output.mkdir()
             args = SimpleNamespace(
                 profile_only_from=directory,
+                profile_case="both",
                 port=8156,
                 npu=7,
                 warmup_requests=5,
