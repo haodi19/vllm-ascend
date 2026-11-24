@@ -18,7 +18,11 @@ class NativeReanalysisTests(unittest.TestCase):
     def saved(self, root, case):
         trace = root / f"profile/{case}/capture/ASCEND_PROFILER_OUTPUT/trace_view.json"
         trace.parent.mkdir(parents=True)
-        trace.write_text(json.dumps(fixture()), encoding="utf-8")
+        data = fixture()
+        data["traceEvents"].append(
+            dict(ph="X", name="moe_offload/loading_stream|schema=1|stream_id=56|device=0", pid=1, tid=8, ts=0, dur=1)
+        )
+        trace.write_text(json.dumps(data), encoding="utf-8")
         trace.with_name("clock_alignment.json").write_text(
             json.dumps(
                 dict(

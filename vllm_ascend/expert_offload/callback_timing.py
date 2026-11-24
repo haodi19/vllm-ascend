@@ -81,6 +81,7 @@ class CallbackTimings:
         self.samples = []
         self.errors = self.dropped = 0
         self.server = None
+        self.loading_stream = None
 
     def start(self):
         with self.condition:
@@ -90,6 +91,18 @@ class CallbackTimings:
             self.errors = self.dropped = 0
             self.marker_errors = 0
             self.active = True
+        self.mark_loading_stream()
+
+    def mark_loading_stream(self):
+        if self.mstx is None or not self.loading_stream or self.loading_stream.get("status") != "ok":
+            return
+        from vllm_ascend.expert_offload.profile_loading_stream import mark_loading_stream
+
+        self.marker_attempts += 1
+        try:
+            mark_loading_stream(self.loading_stream)
+        except Exception:
+            self.marker_errors += 1
 
     def range_start(self, name):
         if self.mstx is None:
@@ -276,6 +289,7 @@ class CallbackTimings:
             units="us",
             mstx_enabled=self.mstx is not None,
             mstx_errors=self.marker_errors,
+            loading_stream=self.loading_stream,
         )
 
     def serve(self, port, expert_trace=None, clock_device=None):
@@ -311,6 +325,7 @@ class CallbackTimings:
                         mstx_active=collector.active and collector.mstx is not None,
                         mstx_marker_attempts=collector.marker_attempts,
                         inflight=collector.inflight,
+                        loading_stream=collector.loading_stream,
                     ),
                 )
 
@@ -412,6 +427,9 @@ def install_callback_timing(manager, port):
     if mstx is not None:
         from torch_npu.npu import current_device
 
+        from vllm_ascend.expert_offload.profile_loading_stream import loading_stream_identity
+
         clock_device = current_device()
+        collector.loading_stream = loading_stream_identity(manager.load_stream, clock_device)
     collector.serve(port, expert_trace, clock_device=clock_device)
     manager._callback_timing = collector

@@ -48,13 +48,15 @@ TARGET_BUBBLE_MAX_US = 5000.0
 
 
 def loading_bubble_summary(reports, root, labels, stream_name):
-    """Reuse the verified explicit-track analyzer; never infer the stream by copy count."""
+    """Use recorded loading-stream identity or an explicit legacy name, not copy counts."""
     lines = [
-        f"加载流空泡：精确选择thread_name={stream_name!r}，全部设备任务区间取并集（含MEMCPY、Transpose）。",
+        f"加载流空泡：选择方式={stream_name!r}（auto=同次采集记录的实际加载流），全部设备任务取并集（含MEMCPY、Transpose）。",
         "仅统计10≤gap<5000μs，不再叠加IQR；full_capture含Prefill，callback_window为首末回调间连续范围。",
         "方向仅统计能唯一关联层号的子集；Host间隔独立列出，不使用设备空泡的10～5000μs筛选。",
     ]
     retained = (
+        "COPY_TRACK ",
+        "LOADING_STREAM_SELECTION ",
         "TARGET_GAPS_US ",
         "TARGET_DIRECTION_GAPS_US ",
         "SELECTED_OFFLOAD_TRACK ",

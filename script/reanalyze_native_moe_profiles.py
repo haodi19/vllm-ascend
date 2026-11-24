@@ -95,7 +95,7 @@ def saved_case(root, case):
     return counters["count"], next(iter(physical_npus), None), (reference[0]["digest"], reference[0]["usage"])
 
 
-def reanalyze(runs, output, report, stream_name="Stream 56"):
+def reanalyze(runs, output, report, stream_name="auto"):
     profiles, devices = {}, {}
     expected_output = None
     for root, case, trace in saved_traces(runs):
@@ -152,7 +152,9 @@ def main(argv=None):
         "--list-streams", action="store_true", help="Print saved hardware copy tracks without writing files"
     )
     parser.add_argument(
-        "--bubble-stream-name", default="Stream 56", help="Exact visualization name; never guessed from tid/count"
+        "--bubble-stream-name",
+        default="auto",
+        help="Actual loading-stream marker; explicit name required for legacy profiles without markers",
     )
     args = parser.parse_args(argv)
     if args.list_streams:

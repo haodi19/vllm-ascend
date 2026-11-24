@@ -284,7 +284,9 @@ def main():
         help="Minimum free GiB before each profile service (default: 20); not a profile size limit",
     )
     parser.add_argument(
-        "--bubble-stream-name", default="Stream 56", help="Exact visualization stream name, never guessed"
+        "--bubble-stream-name",
+        default="auto",
+        help="Default: actual loading stream recorded in this capture; explicit name for legacy profiles",
     )
     parser.add_argument(
         "--build-dir",

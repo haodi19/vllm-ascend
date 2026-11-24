@@ -215,7 +215,7 @@ def _nonnegative_int(value):
     return None
 
 
-def read_offload_header(path):
+def read_offload_header(path, *, loading_streams=None):
     """First streaming pass retains metadata/Host markers and copy counts only."""
     processes, names, callbacks, compilers = {}, {}, [], []
     copies = collections.Counter()
@@ -236,6 +236,8 @@ def read_offload_header(path):
                     raise ValueError("同一pid/tid存在冲突的thread_name元数据")
                 names[pid, tid] = value
         elif phase == "X":
+            if loading_streams is not None and name.startswith("moe_offload/loading_stream|"):
+                loading_streams.append(dict(pid=pid, **fields(event)))
             if "MEMCPY_ASYNC" in name.upper():
                 copies[pid, tid] += 1
             if name.startswith("moe_offload/host_callback|"):
@@ -258,10 +260,56 @@ def read_offload_header(path):
                 compilers.append(dict(pid=pid, tid=tid, event_index=number, start=start, end=end))
         if len(processes) + len(names) + len(copies) + len(callbacks) + len(compilers) > MAX_INTERVALS:
             raise ValueError("Host标记或元数据超过读取上限")
+        if loading_streams is not None and len(loading_streams) > MAX_INTERVALS:
+            raise ValueError("加载流标记超过读取上限")
     hardware = {pid for pid, name in processes.items() if "ascend hardware" in name.lower()}
     for marker in compilers:
         marker["process_name"] = processes.get(marker["pid"], "")
     return {key: value for key, value in copies.items() if key[0] in hardware}, names, callbacks, compilers
+
+
+def select_loading_track(counts, names, callbacks, records, stream_name, pid=None, host_pid=None):
+    """Select by same-capture ACL identity, never by copy count or numeric tid."""
+    if stream_name != "auto" and not records:
+        key = select_track(counts, names, stream_name, pid)
+        emit("LOADING_STREAM_SELECTION", dict(method="explicit_legacy", name=names[key], pid=key[0], tid=key[1]))
+        return key
+    _, callback_pid = select_host_callbacks(callbacks, host_pid)
+    identities = set()
+    for record in records:
+        if record["pid"] != callback_pid:
+            continue
+        stream_id, device = _nonnegative_int(record.get("stream_id")), _nonnegative_int(record.get("device"))
+        if record.get("schema") != "1" or stream_id is None or device is None:
+            raise ValueError("加载流身份标记格式无效；拒绝按拷贝数猜测")
+        identities.add((stream_id, device))
+    if not identities:
+        raise ValueError(
+            "当前Host进程缺少同次采集的加载流ID标记；旧profile请显式指定流名，"
+            "新采集请查看loading_stream查询结果；不按tid或拷贝数猜测"
+        )
+    if len(identities) != 1:
+        raise ValueError("同次采集的加载流ID不唯一；不合并不同加载流")
+    if pid is None and len({key[0] for key in counts}) != 1:
+        raise ValueError("设备进程不唯一，加载流ID不能跨设备比较；请对单独trace使用--pid消歧")
+    stream_id, device = identities.pop()
+    runtime_name = f"Stream {stream_id}"
+    if stream_name not in ("auto", runtime_name):
+        raise ValueError(f"指定流{stream_name!r}与本次实际加载流{runtime_name!r}冲突；删除手动流名使用auto")
+    key = select_track(counts, names, runtime_name, pid)
+    emit(
+        "LOADING_STREAM_SELECTION",
+        dict(
+            method="runtime_acl_id",
+            stream_id=stream_id,
+            logical_device=device,
+            host_pid=callback_pid,
+            pid=key[0],
+            tid=key[1],
+            name=names[key],
+        ),
+    )
+    return key
 
 
 def read_device_tasks(path, key, retained_host_markers=0):
@@ -345,10 +393,11 @@ def offload_pair_example(pair, origin):
 def inspect_offload_trace(path, stream_name, threshold, long_threshold, pid=None, host_pid=None):
     print(f"TRACE={path}\nREAD 1/2：元数据、回调窗口、编译推理标记及拷贝轨道计数", flush=True)
     before = path.stat()
-    counts, names, callbacks, compilers = read_offload_header(path)
+    loading_streams = []
+    counts, names, callbacks, compilers = read_offload_header(path, loading_streams=loading_streams)
     for key in sorted(counts):
         emit("COPY_TRACK", dict(pid=key[0], tid=key[1], name=names.get(key, ""), copies=counts[key]))
-    key = select_track(counts, names, stream_name, pid)
+    key = select_loading_track(counts, names, callbacks, loading_streams, stream_name, pid, host_pid)
     print("READ 2/2：仅选中设备流的全部X任务，包含MEMCPY、Transpose及其他任务", flush=True)
     tasks = read_device_tasks(path, key, len(callbacks) + len(compilers))
     after = path.stat()

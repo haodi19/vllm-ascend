@@ -20,6 +20,10 @@
 
 ## 运行初次验证
 
+加载流现在默认自动识别，Python/native 对照、原四/五组对照和五组夜间脚本均不再固定 54/56。采集服务初始化时，对 `manager.load_stream` 调用 [CANN 的 aclrtStreamGetId](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/910/API/runtimeapi/aclpythondevg_01_1038.html) 取得实际流 ID；每个采集窗口开始时，由控制线程将该 ID 写入一个 `moe_offload/loading_stream` Host 标记。分析器读取同次采集、同一 Host 进程的标记，再匹配设备轨道的 `thread_name`，不按 tid 或最多拷贝数选流。查询、标记均在计时请求和权重更新热路径之外；不创建新设备流、不向加载流提交额外任务、不改变 GIL-free 更新路径。`summary.txt` 的 `LOADING_STREAM_RUNTIME` 和 `LOADING_STREAM_SELECTION` 会记录查询结果、所选轨道及依据。
+
+新测试删除旧命令中的 `--bubble-stream-name "Stream 54"` 或 `"Stream 56"` 即可，默认值为 `auto`，无需增加其他参数。手动流名与运行时记录冲突时会明确报错；缺少记录或存在多条同名候选时保留采集，不猜测。此前生成的旧 profile 没有这个标记，离线重统计仍需指定实际流名；自动识别不能凭空补出旧采集未记录的身份。
+
 在原来能够跑通实验的容器、已激活原环境、项目根目录执行：
 
 ```bash
@@ -72,6 +76,7 @@ python -u -B script/run_native_moe_compare.py \
 python -B script/reanalyze_native_moe_profiles.py \
   /data/w00919836/moeoffload/bench_results/native_profile_python_01 \
   /data/w00919836/moeoffload/bench_results/native_profile_native_02 \
+  --bubble-stream-name "Stream 56" \
   --output-dir /data/w00919836/moeoffload/bench_results/native_profile_analysis_01
 ```
 

@@ -372,7 +372,7 @@ def main(argv=None):
         "--cache-policy-backend",
         "cpp",
         "--bubble-stream-name",
-        "Stream 56",
+        "auto",
         "--profile-timeout",
         str(DEFAULT_PROFILE_TIMEOUT),
         *remaining,

@@ -603,7 +603,8 @@ def parse_args(
         parser.add_argument("--large-gap-us", type=positive_gap_us, default=100.0)
         parser.add_argument(
             "--bubble-stream-name",
-            help="Exact MindStudio loading stream name; automatically summarize 10<=gap<5000us after export",
+            default="auto" if handoff_compare else None,
+            help="auto uses the same-capture loading-stream ID; explicit MindStudio name for legacy captures",
         )
         parser.add_argument(
             "--measure-tpot",

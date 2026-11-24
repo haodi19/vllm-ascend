@@ -536,7 +536,15 @@ class TestVerifiedRunner(unittest.TestCase):
             def request(opener, port, path, payload=None, timeout=None):
                 sequence.append(path)
                 if path == "/status":
-                    return dict(backend="cpp", load_backend="python", mstx_enabled=True, active=False)
+                    return dict(
+                        backend="cpp",
+                        load_backend="python",
+                        mstx_enabled=True,
+                        active=False,
+                        mstx_active=False,
+                        inflight=0,
+                        mstx_marker_attempts=0,
+                    )
                 if path == "/v1/completions":
                     return dict(choices=[{"text": "synthetic"}], usage={"completion_tokens": 5})
                 if path == "/stop":
@@ -562,7 +570,7 @@ class TestVerifiedRunner(unittest.TestCase):
                         "ensure_profile_storage": Mock(),
                         "discover_roots": Mock(return_value=[Path(directory)]),
                         "align_capture": align,
-                        "export_capture": view,
+                        "publish_aligned_capture": view,
                         "write_trace": Mock(),
                     },
                 ),
@@ -594,11 +602,7 @@ class TestVerifiedRunner(unittest.TestCase):
             )
             align.assert_called_once_with(Path(directory), [{"sample": 0}])
             self.assertEqual(result["clock_alignment"]["status"], "calibration_validated")
-            view.assert_called_once_with(
-                Path(directory),
-                align.return_value,
-                Path(directory) / "profile_aligned/cpp" / Path(directory).name,
-            )
+            view.assert_called_once_with(Path(directory), align.return_value)
             self.assertEqual(result["aligned_profile"], view.return_value)
             self.assertEqual(json.loads((Path(directory) / "profile_clock_samples.json").read_text())["phase"], "after")
 

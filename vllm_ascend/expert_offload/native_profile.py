@@ -14,7 +14,9 @@ class NativeTimings(CallbackTimings):
 
     def start(self):
         self.profiler.start()
+        self.marker_errors = 0
         self.active = True
+        self.mark_loading_stream()
 
     def stop(self):
         result = self.profiler.stop()
@@ -27,7 +29,8 @@ class NativeTimings(CallbackTimings):
             groups=[],
             units="us",
             mstx_enabled=True,
-            mstx_errors=result["marker_errors"],
+            mstx_errors=result["marker_errors"] + self.marker_errors,
+            loading_stream=self.loading_stream,
             native=True,
             scope="native task entry through mapping commit; no Python/GIL in task",
         )
@@ -36,9 +39,13 @@ class NativeTimings(CallbackTimings):
 def install_native_profile(manager, port):
     from torch_npu.npu import current_device
 
+    from vllm_ascend.expert_offload.profile_loading_stream import loading_stream_identity
+
     profiler = manager._native_update.profiler
     if profiler is None:
         raise ValueError("native MSTX profiler was not prepared")
     collector = NativeTimings(profiler)
-    collector.serve(port, clock_device=current_device())
+    device = current_device()
+    collector.loading_stream = loading_stream_identity(manager.load_stream, device)
+    collector.serve(port, clock_device=device)
     manager._callback_timing = collector

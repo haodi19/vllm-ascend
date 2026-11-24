@@ -88,7 +88,7 @@ for tokens in 5 128; do
     --max-tokens "$tokens" "${extra[@]}" \
     --warmup-requests 5 --timing-requests 20 --requests 1 \
     --startup-timeout 1800 --request-timeout 600 --profile-timeout 600 \
-    --bubble-stream-name 'Stream 56' --output-dir "$output_root/token${tokens}"; then
+    --bubble-stream-name auto --output-dir "$output_root/token${tokens}"; then
     code=0
   else
     code=$?

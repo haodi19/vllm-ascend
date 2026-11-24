@@ -103,6 +103,7 @@ def analyze_profile(trace, case, expected_count, stream_name, report):
             if line.startswith(
                 (
                     "COPY_TRACK ",
+                    "LOADING_STREAM_SELECTION ",
                     "TARGET_GAPS_US ",
                     "TARGET_DIRECTION_GAPS_US ",
                     "SELECTED_OFFLOAD_TRACK ",
@@ -214,6 +215,7 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                     (root / f"{case}_clock_samples.json").write_text(json.dumps(after), encoding="utf-8")
                     (root / f"{case}_profile_samples.json").write_text(json.dumps(samples), encoding="utf-8")
                     (root / f"{case}_profile_counters.json").write_text(json.dumps(counters), encoding="utf-8")
+                    report("LOADING_STREAM_RUNTIME " + case + " " + json.dumps(counters.get("loading_stream")))
                 finally:
                     request(opener, args.port, "/stop_profile", {}, timeout=args.profile_timeout)
                 wait_profile(directory, args.profile_timeout)
@@ -264,6 +266,9 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
         (root / f"{case}_profile_report.json").write_text(json.dumps(profiles[case]), encoding="utf-8")
     report(f"PROFILE_COMPLETE cases={','.join(profiles)}; each profile output matched the saved timing reference")
     report("PROFILE_MEASUREMENT: Host gap = next task entry - previous task return; includes zero-load tasks.")
-    report("Loading bubbles: exact named stream, union of all tasks including Transpose, 10<=gap<5000us.")
+    report(
+        "Loading bubbles: same-capture runtime loading stream (or explicit legacy name), "
+        "all tasks including Transpose, 10<=gap<5000us."
+    )
     report_gap_table(profiles, report)
     return profiles
