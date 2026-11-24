@@ -108,6 +108,23 @@ python -B script/reanalyze_native_moe_profiles.py \
 
 ## 验证状态
 
+2026-11-24 的两组续采均在物理卡 6 上完成，运行时 ACL 流 ID 和导出的加载轨道均为 Stream 56。Python/native 的预取→按需 Host 原始间隔为 104.876/257.082 μs，按需→下一层预取为 64.623/34.316 μs；全窗口加载流空泡为 444.669/273.944 μs，回调连续窗口为 389.865/201.577 μs。两方向加载批次空泡分别为 399.486/263.371 μs、330.873/71.108 μs。每组仅一个采集请求；这些是新采的 profile 数据，无采集时延仍引用 `native_update_06`。
+
+预取→按需 Host 间隔变长，可能因为预取任务提前结束而暴露出剩余计算等待，不能单凭间隔均值定因。可复用这两份已对齐 profile，执行：
+
+```bash
+python -B script/reanalyze_native_prefetch_overlap.py \
+  /data/w00919836/moeoffload/results/native_profile_python_01 \
+  /data/w00919836/moeoffload/results/native_profile_native_01 \
+  --output-dir /data/w00919836/moeoffload/results/native_overlap_01
+```
+
+此命令不运行模型、不导入 Torch、不重采或重对齐。只向新目录写入 `summary.txt`、逐样本 `prefetch_overlap.json` 和 `details.log`，核心表格同时打印到终端。它检查同次采集的输出、计数器与校准，再沿用原 MTE 消费边界和两种方案：方案 1 删除明确计算晚于预取结束的样本；方案 2 扣除这些样本从预取结束到计算到达消费位置的经过时间，采用边界区间中点。全样本口径下，不确定和无法识别样本保留原间隔；不做 IQR 或长尾截断。直接判定与原保守余量判定同时输出，所有相对原均值的降低都是描述性重统计，不是新测推理加速收益。
+
+摘要中的 Host 函数时延表覆盖全部任务，按全部、预取、按需三种范围对比 `host_callback`、`update_weights`、`load_submit`、`copy_submit`、`synchronize`，保留原始与 3×IQR 后的均值、有效/应有样本数及两组原均值变化。这里包括首尾和零加载任务，不局限于可配对的间隔样本；缺失分项不按零时延处理，嵌套分项不能相加。
+
+原因分析在同层同次序、边界算子一致的样本上拆分计算相对到达、Host 提前结束及后续按需开始的变化；另以上一按需 Host 结束作流程锚点，避免把预取启动时刻变化直接当作设备计算变慢。native 旧采集未记录逐专家加载计数，缺少 Python 的准备标记不当作零加载，跨组配对也不声称专家集合相同。时间戳先以十进制减去同次采集纪元再转浮点，避免紧邻原生标记在大时间戳上发生虚假的嵌套越界。当前只完成本地合成采集回归，实际原因及重统计数值需读取服务器上上述 profile 后确认。
+
 随后返回的完整时延日志仍标记为 `native_update_06`，使用新构建目录 `build_01`，构建及 NPU 小图检查全部通过。每组 5 次预热、20 次正式请求，输出均为 5 token，摘要与用量一致。无 profiler/MSTX 的结果如下；对照是 MTE Python 更新与 MTE 原生 C++ 更新，不是早期 launch-host-function 回调。
 
 | 指标 | MTE Python 更新 | MTE native 更新 | 降低 |

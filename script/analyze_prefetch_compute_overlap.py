@@ -5,6 +5,7 @@ import argparse
 import collections
 import contextlib
 import json
+from decimal import Decimal
 from pathlib import Path
 
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
@@ -13,6 +14,7 @@ from diagnose_mte_wait_timeline import read_trace, record, task_pairs
 from export_moe_aligned_profile import aligned_trace_path
 from inspect_moe_profile import _stats
 from moe_callback_compute_boundary import bind_callback_streams
+from moe_outlier_stats import outlier_summary
 
 ORDER_US = 1.0
 MAX_EXAMPLES = 8
@@ -257,9 +259,31 @@ def load_breakdown(rows):
     return result
 
 
-def analyze(path, backend="mte"):
+def host_stage_durations(hosts, stages):
+    """Retain every Host task, including initial/final and zero-load tasks."""
+    result = {}
+    for host in hosts:
+        call = host["context"]["call"]
+        parts = stages.get(int(call), {})
+        durations = {"host_callback": host["duration"]}
+        for stage in ("update_weights", "load_submit", "copy_submit", "synchronize"):
+            entries = parts.get(stage, [])
+            valid = (
+                len(entries) == 1
+                and entries[0]["tid"] == host["tid"]
+                and all(entries[0]["meta"].get(k) == host["context"].get(k) for k in ("kind", "layer", "rows"))
+                and host["start"] <= entries[0]["start"] <= entries[0]["end"] <= host["end"]
+            )
+            durations[stage] = entries[0]["end"] - entries[0]["start"] if valid else None
+        result[call] = durations
+    return result
+
+
+def analyze(path, backend="mte", *, profile_report=None, update_backend="python", exact_relative=False):
     if backend not in ("mte", "callback"):
         raise ValueError("unknown Host backend")
+    if update_backend not in ("python", "native") or (exact_relative and backend != "mte"):
+        raise ValueError("unsupported update backend or relative callback analysis")
     mapping = json.loads(path.with_name("clock_alignment.json").read_text(encoding="utf-8"))
     if (
         mapping.get("status") != "calibration_validated"
@@ -268,7 +292,10 @@ def analyze(path, backend="mte"):
         raise ValueError("need validated before/after calibration from this model capture")
     if Path(mapping["aligned_trace"]).resolve() != path.resolve():
         raise ValueError("alignment metadata refers to a different trace")
-    data = read_trace(path)
+    origin = Decimal(mapping["trace_origin_us"]) if exact_relative else None
+    data = read_trace(path, time_origin=origin) if exact_relative else read_trace(path)
+    if profile_report is not None and profile_report.get("count") != data["host_count"]:
+        raise ValueError("saved counters and trace Host counts differ")
     bindings = bind_streams(data) if backend == "mte" else bind_callback_streams(path, data)
     stream, reactive_pairs = bindings["reactive"]
     prefetch_pairs = bindings["prefetch"][1]
@@ -276,9 +303,9 @@ def analyze(path, backend="mte"):
     stages = collections.defaultdict(lambda: collections.defaultdict(list))
     host_pid = data["all_hosts"][0]["pid"]
     retained_stages = 0
-    for index, event in enumerate(events(path)):
+    for index, event in enumerate(events(path, parse_float=Decimal if exact_relative else float)):
         if event.get("ph") == "X" and (str(event.get("pid")), str(event.get("tid"))) == stream:
-            tasks.append(record(event, index))
+            tasks.append(record(event, index, time_origin=origin))
             if len(tasks) > MAX_INTERVALS:
                 raise ValueError("too many tasks; refuse partial analysis")
         name = str(event.get("name", ""))
@@ -290,7 +317,7 @@ def analyze(path, backend="mte"):
             and stage in STAGES
         ):
             meta = fields(event)
-            rec = record(event, index)
+            rec = record(event, index, time_origin=origin)
             stages[int(meta["call"])][stage].append(
                 dict(
                     start=rec["start"],
@@ -304,24 +331,41 @@ def analyze(path, backend="mte"):
                 raise ValueError("too many retained tasks/stages")
     # RUN/profile/CASE/POLICY/CAPTURE/ASCEND_PROFILER_OUTPUT/trace_view_aligned.json
     report_path = path.parents[5] / path.parents[3].name / "profile_report.json" if len(path.parents) > 5 else None
-    report = json.loads(report_path.read_text(encoding="utf-8")) if report_path and report_path.is_file() else None
-    loads, load_issues = load_annotations(data["all_hosts"], stages, report)
+    report = profile_report
+    if report is None and report_path and report_path.is_file():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    if update_backend == "native":
+        # Native submit has one range per batch, no per-expert prepare/refresh
+        # ranges. Their absence cannot be interpreted as zero experts loaded.
+        loads = {host["context"]["call"]: None for host in data["all_hosts"]}
+        load_issues = ["native capture has no per-expert load counts; load status remains unknown"]
+    else:
+        loads, load_issues = load_annotations(data["all_hosts"], stages, report)
     emit(
         "LOAD_EVIDENCE",
         dict(
-            report=str(report_path),
+            report="supplied capture counters" if profile_report is not None else str(report_path),
             issues=load_issues,
             basis="per-call load_prepare/scale_refresh counts checked against report loads",
         ),
     )
     tasks.sort(key=lambda row: (row["start"], row["index"]))
+    durations = host_stage_durations(data["all_hosts"], stages)
+    host_timings, host_timing_counts = {}, {}
+    for kind in ("all", "prefetch", "reactive"):
+        selected = [h for h in data["all_hosts"] if kind == "all" or h["context"]["kind"] == kind]
+        host_timing_counts[kind] = len(selected)
+        host_timings[kind] = {}
+        for stage in ("host_callback", "update_weights", "load_submit", "copy_submit", "synchronize"):
+            values = [value for h in selected if (value := durations[h["context"]["call"]][stage]) is not None]
+            host_timings[kind][stage] = dict(**_stats(values), outliers_us=outlier_summary(values))
     positions = {row["index"]: i for i, row in enumerate(tasks)}
     reactive = {host["index"]: i for i, host in enumerate(data["groups"]["reactive"])}
     prefetch = {host["index"]: i for i, host in enumerate(data["groups"]["prefetch"])}
     # This is a sensitivity margin, NOT a certified confidence interval.
     margin = max(map(float, mapping["endpoint_mapping_envelope_width_us"])) + ORDER_US
-    origin = float(mapping["trace_origin_us"])
-    span = [origin + float(x) for x in mapping["host_span_us"]]
+    epoch = 0.0 if exact_relative else float(mapping["trace_origin_us"])
+    span = [epoch + float(x) for x in mapping["host_span_us"]]
     rows, reasons = [], collections.Counter()
     for left, right in zip(data["all_hosts"], data["all_hosts"][1:]):
         if left["context"]["kind"] != "prefetch" or right["context"]["kind"] != "reactive":
@@ -333,13 +377,18 @@ def analyze(path, backend="mte"):
             layer=left["context"]["layer"],
             prefetch_call=left["context"]["call"],
             reactive_call=right["context"]["call"],
+            prefetch_rows=left["context"]["rows"],
+            reactive_rows=right["context"]["rows"],
             gap_us=right["start"] - left["end"],
             prefetch_duration_us=left["duration"],
+            reactive_duration_us=right["duration"],
             **{"class": "unmapped"},
             prefetch_loads=loads[left["context"]["call"]],
             reactive_loads=loads[right["context"]["call"]],
         )
         row["load_pair"] = load_pair(row["prefetch_loads"], row["reactive_loads"])
+        for role, host in (("prefetch", left), ("reactive", right)):
+            row[role + "_stages_us"] = durations[host["context"]["call"]]
         rows.append(row)
         rindex = reactive[right["index"]]
         pindex = prefetch[left["index"]]
@@ -401,6 +450,15 @@ def analyze(path, backend="mte"):
             join_ids=join["ids"],
             staging_copy_count=sum(task_type(item["name"]) == "copy" for item in segment[segment.index(join) + 1 :]),
         )
+        if rindex:
+            anchor = data["groups"]["reactive"][rindex - 1]["end"]
+            row["previous_reactive_anchor_us"] = dict(
+                prefetch_start=left["start"] - anchor,
+                prefetch_end=left["end"] - anchor,
+                compute_lower=lower - anchor,
+                compute_upper=upper - anchor,
+                reactive_start=right["start"] - anchor,
+            )
     emit("TRACE", str(path))
     mapped_count = sum(row["class"] != "unmapped" for row in rows)
     emit(
@@ -481,6 +539,10 @@ def analyze(path, backend="mte"):
 
     return dict(
         backend=backend,
+        update_backend=update_backend,
+        time_arithmetic="decimal epoch subtraction then relative float" if exact_relative else "absolute float",
+        host_timings=host_timings,
+        host_timing_expected_counts=host_timing_counts,
         callback_gate_checks=data.get("callback_gate_checks", []),
         trace=str(path),
         rows=rows,

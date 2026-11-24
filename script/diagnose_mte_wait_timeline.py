@@ -35,8 +35,19 @@ def identity_fields(args):
     }
 
 
-def record(event, index):
-    start, end = _interval(event)
+def record(event, index, *, time_origin=None):
+    if time_origin is None:
+        start, end = _interval(event)
+        duration = end - start
+    else:
+        # Subtract the epoch in decimal before converting to float. Native
+        # nested ranges can end only 0.1 us apart at ~1.8e15 us timestamps.
+        values = [Decimal(str(event.get(key))) for key in ("ts", "dur")]
+        if any(not value.is_finite() or value < 0 for value in values):
+            raise ValueError("invalid exact event interval")
+        timestamp, elapsed = values
+        start, end = float(timestamp - time_origin), float(timestamp + elapsed - time_origin)
+        duration = float(elapsed)
     return dict(
         index=index,
         name=str(event.get("name", "")),
@@ -44,7 +55,7 @@ def record(event, index):
         tid=str(event.get("tid")),
         start=start,
         end=end,
-        duration=end - start,
+        duration=duration,
         ids=identity_fields(event.get("args", {})),
     )
 
@@ -54,13 +65,13 @@ def host_key(event):
     return (str(event.get("pid")), str(event.get("tid")), *(context.get(key) for key in CONTEXT_FIELDS))
 
 
-def read_trace(path):
+def read_trace(path, *, time_origin=None):
     """Keep only protocol tasks and Host boundaries; validate the complete JSON."""
     processes, threads = {}, {}
     candidates, hosts, syncs = [], collections.defaultdict(list), collections.defaultdict(list)
     phases = collections.Counter()
     retained = 0
-    for index, event in enumerate(events(path)):
+    for index, event in enumerate(events(path, parse_float=Decimal if time_origin is not None else float)):
         if index and index % PROGRESS_EVENTS == 0:
             print(f"READ=1/2; scanned_events={index}", flush=True)
         name = str(event.get("name", ""))
@@ -78,12 +89,12 @@ def read_trace(path):
             phases[f"{stage}:{event.get('ph')}"] += 1
             if event.get("ph") != "X":
                 continue
-            rec = record(event, index)
+            rec = record(event, index, time_origin=time_origin)
             rec["context"] = fields(event)
             (hosts if stage.endswith("host_callback") else syncs)[host_key(event)].append(rec)
             retained += 1
         elif HANDSHAKE.fullmatch(name) and event.get("ph") == "X":
-            candidates.append(record(event, index))
+            candidates.append(record(event, index, time_origin=time_origin))
             retained += 1
         if retained + len(processes) + len(threads) > MAX_INTERVALS:
             raise ValueError("retained events exceed analysis limit; no partial statistics")
