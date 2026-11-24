@@ -118,6 +118,36 @@ class MoeProfileAuditTests(unittest.TestCase):
                 self.assertFalse(report["usable"])
                 self.assertEqual(report["nesting"]["invalid"], 1)
 
+    def test_native_call_138_decimal_endpoints_and_submicrosecond_gap(self):
+        for numeric_json in (False, True):
+            with self.subTest(numeric_json=numeric_json), tempfile.TemporaryDirectory() as directory:
+                data = self.trace()
+                data[0].update(ts="1795507048074376.043", dur="523.856")
+                data[1].update(ts="1795507048074376.664", dur="523.135")
+                data[2].update(ts="1795507048074900.049", dur="1.000")
+                data[3].update(ts="1795507048074900.099", dur="0.200")
+                raw = json.dumps(data)
+                if numeric_json:
+                    for row in data[:4]:
+                        for key in ("ts", "dur"):
+                            raw = raw.replace(json.dumps(row[key]), row[key])
+                path = Path(directory) / "trace.json"
+                path.write_text(raw, encoding="utf-8")
+                report = self.module.scan_trace(path, require_mte=True)
+                self.assertTrue(report["usable"])
+                self.assertEqual(report["nesting"]["matched"], 2)
+                self.assertAlmostEqual(report["host_gaps"][0]["mean_us"], 0.150)
+                json.dumps(report)  # Exact internal numbers must not leak into the public report.
+                self.assertEqual(path.read_text(encoding="utf-8"), raw)
+
+    def test_real_point_one_us_nesting_violation_is_still_rejected(self):
+        data = self.trace()
+        data[0].update(ts="1795507048074376.043", dur="523.856")
+        data[1].update(ts="1795507048074376.664", dur="523.335")
+        report = self.scan(data)
+        self.assertFalse(report["usable"])
+        self.assertEqual(report["nesting"]["invalid"], 1)
+
     def test_pairing_never_crosses_host_processes(self):
         data = self.trace()
         data[1]["pid"] = 8

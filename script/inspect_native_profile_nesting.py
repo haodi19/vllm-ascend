@@ -61,7 +61,7 @@ def audit_host_nesting(trace):
         inner_start, inner_end = Decimal(inner["ts"]), Decimal(inner["end"])
         same_thread = outer["tid"] == inner["tid"]
         exact_ok = same_thread and outer_start <= inner_start <= inner_end <= outer_end
-        # Reproduce the current check including binary64 timestamp addition.
+        # Reproduce the legacy check including binary64 timestamp addition.
         ofs, ifs = float(outer["ts"]), float(inner["ts"])
         ofe, ife = ofs + float(outer["dur"]), ifs + float(inner["dur"])
         float_ok = same_thread and ofs <= ifs <= ife <= ofe
@@ -99,7 +99,7 @@ def audit_host_nesting(trace):
         invalid_exact=exact_invalid,
         float_only_invalid=float_only_invalid,
         examples=examples,
-        scope="Exact exported decimals versus current float check; no tolerance or timestamp changes. "
+        scope="Exact exported decimals versus legacy float check; no tolerance or timestamp changes. "
         "Exact export violations do not alone prove runtime call ordering errors.",
     )
 

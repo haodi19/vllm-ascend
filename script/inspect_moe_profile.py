@@ -6,6 +6,7 @@ import collections
 import json
 import math
 import re
+from decimal import Decimal
 from pathlib import Path
 
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
@@ -145,7 +146,7 @@ def scan_trace(path, *, require_mte=False, large_gap_us=None):
     phases = collections.Counter()
     issues = []
     missing_identity = duplicates = event_count = 0
-    for event in events(path):
+    for event in events(path, parse_float=Decimal):
         event_count += 1
         name = str(event.get("name", ""))
         pid = "" if event.get("pid") is None else str(event["pid"])
@@ -181,7 +182,14 @@ def scan_trace(path, *, require_mte=False, large_gap_us=None):
                 elif (pid, call) in target:
                     duplicates += 1
                 else:
-                    target[(pid, call)] = dict(start=start, end=end, tid=tid, kind=info.get("kind", "unknown"))
+                    # Host ranges can differ by <1 us at ~1e15 us epochs.
+                    # Keep the JSON decimal precision through nesting and gap
+                    # subtraction; binary64 addition can reverse their ends.
+                    host_start = Decimal(str(event["ts"]))
+                    host_end = host_start + Decimal(str(event["dur"]))
+                    target[(pid, call)] = dict(
+                        start=host_start, end=host_end, tid=tid, kind=info.get("kind", "unknown")
+                    )
         retained = (
             len(callbacks) + len(updates) + len(tracks) + len(process_names) + len(thread_names) + len(copy_intervals)
         )
@@ -253,7 +261,7 @@ def scan_trace(path, *, require_mte=False, large_gap_us=None):
             if gap < 0:
                 overlaps[direction] += 1
             else:
-                by_direction[direction].append(gap)
+                by_direction[direction].append(float(gap))
         for direction in sorted(set(by_direction) | set(overlaps)):
             gaps.append(
                 dict(
@@ -289,6 +297,7 @@ def scan_trace(path, *, require_mte=False, large_gap_us=None):
         host_callbacks=len(callbacks),
         updates=len(updates),
         nesting=nesting,
+        host_time_arithmetic="exact JSON decimal nesting and subtraction; gaps converted to float after subtraction",
         streams=streams,
         host_gaps=gaps,
         memcpy_gaps=memcpy_gaps,

@@ -66,6 +66,17 @@ python -u -B script/run_native_moe_compare.py \
 
 若已打印 `PROFILE SAVED`、`ALIGNED_PROFILE`，随后因 callback/update 嵌套检查失败，不要重新启动模型。此时采集和对齐文件已经保存，可执行 `python -B script/inspect_native_profile_nesting.py <本次结果目录>`，只读输出 callback/update 数量、重复或缺失编号、线程不一致，以及最多 6 个异常区间的起止时间。检查同时比较现有浮点算法与直接解析 JSON 数值的十进制算法，以区分大时间戳运算误差和导出文件中实际存在的越界；不修改时间线、不增加容差、不自动接受失败采集。后续在线测试遇到此类失败也自动把这些诊断写入摘要。
 
+2026-11-24，`native_profile_native_02` 已确认是统计脚本的浮点误报：170 对 Host 区间全部配对、同线程，无重复或缺失编号；第 138 次调用内层结束为 `1795507048074899.799 us`，外层结束为 `1795507048074899.899 us`，实际提前 0.100 us，浮点相加却算成内层越界 0.25 us。嵌套检查及 Host 间隔相减现改用直接从 JSON 读取的十进制数，完成相减后才转为统计数值；真实越界仍拒绝，没有新增容差，也没有改动原可视化时间戳。已有采集可运行以下离线重统计，原测试入口也自动使用修复后的计算：
+
+```bash
+python -B script/reanalyze_native_moe_profiles.py \
+  /data/w00919836/moeoffload/bench_results/native_profile_python_01 \
+  /data/w00919836/moeoffload/bench_results/native_profile_native_02 \
+  --output-dir /data/w00919836/moeoffload/bench_results/native_profile_analysis_01
+```
+
+该命令先验证已有对齐元数据、Host 计数及保存的输出一致性，再复用原统计入口生成双向 Host 间隔和 Stream 56 空泡表；结果仅写入新目录的 `summary.txt` 及详细报告，不启动模型、不重新对齐、不覆盖原摘要。Host 间隔可能有亚微秒数值修正，加载流空泡的算法及筛选阈值保持不变。上述两个输入均来自物理卡 6；输出会列出读取到的用卡记录，不把离线重统计当成新一轮时延测试。
+
 只有约 7 GiB 可用时，可增加 `--min-profile-free-gib 5`，将本次门槛降到 5 GiB；默认值和其他实验入口不变。续采入口及每组采集服务启动前均使用此门槛，实际设置写入 `summary.txt`。这只是启动前剩余空间门槛，不限制 profile 大小，也不保证两组采集和对齐导出都能放下；第一组后剩余空间低于 5 GiB 会停止下一组并保留已有结果。
 
 每组计时服务和采集服务启动前、退出后都会把 `numactl -H`、全机与各 NUMA 节点的 free/文件缓存/匿名内存等、允许的内存节点以及可见 cgroup 限制写入 `summary.txt`。缺少 `numactl` 时仍使用 `/proc` 和 `/sys`。服务退出后再检查本组进程组是否还有非僵尸进程；没有退出则停止，不用清缓存掩盖残留进程。服务失败时额外记录清理前现场，保留原错误，不自动回收缓存。
