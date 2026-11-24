@@ -166,11 +166,26 @@ def main():
     parser.add_argument("--request-timeout", type=int, default=600)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--library", type=Path, help="existing handshake library, required with --skip-build")
+    parser.add_argument("--skip-profile", action="store_true", help="Timing only; omit separate diagnostic services")
+    parser.add_argument("--timing-port", type=int, default=18156)
+    parser.add_argument("--profile-timeout", type=int, default=180)
+    parser.add_argument(
+        "--bubble-stream-name", default="Stream 56", help="Exact visualization stream name, never guessed"
+    )
+    parser.add_argument(
+        "--build-dir",
+        type=Path,
+        default=ROOT / "build/native_moe_handshake",
+        help="Persistent handshake build directory, independent of results",
+    )
     args = parser.parse_args()
     if sys.platform != "linux" or args.npu < 0 or min(args.max_tokens, args.requests, args.warmup_requests) < 1:
         parser.error("requires Linux, a non-negative NPU and positive request/token counts")
     if not 1 <= args.port <= 65535:
         parser.error("--port must be between 1 and 65535")
+    if not 1 <= args.timing_port <= 65535 or args.timing_port == args.port or args.profile_timeout <= 0:
+        parser.error("requires a separate valid timing port and a positive profile timeout")
+    args.profile_requests = 1
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(args.npu))
@@ -213,14 +228,14 @@ def main():
 
     try:
         report(
-            "MTE Python update -> MTE native update; same cache/config; no profiler/MSTX. "
+            "MTE Python update -> MTE native update; same cache/config; timed requests have no profiler/MSTX. "
             "Native graph replay only; original eager/prefill. This is initial correctness/performance validation."
         )
         report(
             "PRIMARY=decode_ms (first to last content); TPOT=decode/(actual output tokens-1); "
             "HTTP E2E and TTFT retained. Five warmups by default; all samples in this summary."
         )
-        build = root / "device_build"
+        build = args.build_dir.resolve()
         library = build / "lib/libhost_sync_device.so"
         if args.skip_build:
             if args.library is None:
@@ -232,6 +247,8 @@ def main():
         commands = {case: service_command(source, case, library, args.port) for case in ("python", "native")}
         report(f"PASS launch command parsing: {args.test_script}")
         wait_port_free(args.port)
+        if not args.skip_profile:
+            wait_port_free(args.timing_port)
         report(f"PASS initial port check: {args.port}")
         if not args.skip_build:
             for extension in ("lrc_policy", "host_sync"):
@@ -280,7 +297,14 @@ def main():
         step("NPU scale byte-layout parity", [sys.executable, "-B", "script/test_native_scale_copy.py"])
         step(
             "NPU native strict graph and GIL independence",
-            [sys.executable, "-B", "script/test_native_update_graph.py", "--library", str(library)],
+            [
+                sys.executable,
+                "-B",
+                "script/test_native_update_graph.py",
+                "--library",
+                str(library),
+                *([] if args.skip_profile else ["--native-profile"]),
+            ],
             timeout=180,
         )
         reference = None
@@ -383,8 +407,16 @@ def main():
         report(
             f"PASS finite output parity; decode mean change={change}; "
             f"E2E mean change={(means['native'] / means['python'] - 1) * 100:.3f}%; "
-            "single service pair, not stability acceptance or bubble measurement"
+            "single service pair, not stability acceptance"
         )
+        if not args.skip_profile:
+            from native_moe_profile import profile_cases
+
+            report(
+                "PROFILE_PHASE: fresh Python/native services after timing; one request each after warmup; "
+                "native C MSTX ranges, aligned visualization, Host gaps and loading bubbles"
+            )
+            profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, reference)
     except Exception as exc:
         report(f"FAILED {type(exc).__name__}: {exc}")
         return 1

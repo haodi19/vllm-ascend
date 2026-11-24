@@ -305,8 +305,8 @@ class CallbackTimings:
                         pid=os.getpid(),
                         active=collector.active,
                         policy="LRC only",
-                        transport="torch",
-                        load_backend="python",
+                        transport=getattr(collector, "transport", "torch"),
+                        load_backend=getattr(collector, "load_backend", "python"),
                         mstx_enabled=collector.mstx is not None,
                         mstx_active=collector.active and collector.mstx is not None,
                         mstx_marker_attempts=collector.marker_attempts,
@@ -363,6 +363,11 @@ def install_callback_timing(manager, port):
     """Explicit diagnostic mode; original execution is untouched when disabled."""
     if hasattr(manager, "_callback_timing"):
         raise RuntimeError("Callback timing installed twice on this manager")
+    if getattr(manager.offload_config, "host_update_backend", "python") == "native":
+        # Only the control HTTP thread executes Python; native replay does not.
+        from vllm_ascend.expert_offload.native_profile import install_native_profile
+
+        return install_native_profile(manager, port)
     backend = manager.offload_config.cache_policy_backend
     if backend not in ("python", "cpp") or manager.enable_multi_card or manager.cache_policy is None:
         raise ValueError("Callback timing requires single-card python/cpp LRC")

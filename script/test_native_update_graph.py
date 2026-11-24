@@ -10,7 +10,7 @@ import traceback
 from pathlib import Path
 
 
-def run(library_path):
+def run(library_path, native_profile=False):
     import _vllm_ascend_lrc as native
     import torch
     import torch_npu  # noqa: F401
@@ -54,6 +54,16 @@ def run(library_path):
         "",
         False,
     )
+    ranges = profiler = None
+    if native_profile:
+        ranges = native.NativeRanges()
+        table.set_profiler(ranges)
+        profiler = torch_npu.profiler.profile(
+            activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
+            experimental_config=torch_npu.profiler._ExperimentalConfig(mstx=True),
+        )
+        profiler.start()
+        ranges.start()
     policy = native.Policy(1, 4, 32, 0.9, 1.0, 0.5, 0.3, 0.01, True)
     task = native.native_update_task(
         policy,
@@ -144,6 +154,12 @@ def run(library_path):
     session.end_device_access(stream_synchronized=True)
     session.stop()
     session.close()
+    if ranges is not None:
+        measured = ranges.stop()
+        profiler.stop()
+        if measured["count"] != 9 or measured["marker_errors"]:
+            raise RuntimeError(f"native MSTX counts/errors unexpected: {measured}")
+        print(f"PASS native C MSTX while GIL held: {measured}", flush=True)
     if not completions_under_gil:
         raise RuntimeError("all tasks finished before GIL bracket; GIL independence test inconclusive")
     print(
@@ -155,9 +171,10 @@ def run(library_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", type=Path, required=True)
+    parser.add_argument("--native-profile", action="store_true")
     args = parser.parse_args()
     try:
-        run(args.library)
+        run(args.library, args.native_profile)
     except BaseException:
         traceback.print_exc()
         sys.stdout.flush()

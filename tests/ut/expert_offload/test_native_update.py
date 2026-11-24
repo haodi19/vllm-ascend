@@ -42,6 +42,7 @@ class LayoutAndConfig(unittest.TestCase):
             host_update_backend="native", host_sync_backend="mte", cache_policy_backend="cpp", cache_policy_enabled=True
         )
         config.validate_native_update_config(good)
+        config.validate_native_update_config(dict(good, callback_timing_port=18156, callback_mstx_enabled=True))
         for key, value in (
             ("moe_offload_debug", True),
             ("callback_timing_port", 18155),
@@ -102,7 +103,7 @@ class ScaleLoading(unittest.TestCase):
         exec(compile(ast.Module(body=[manager], type_ignores=[]), "manager", "exec"), scope)
         cls.Manager = scope["ExpertOffloadManager"]
 
-    def test_single_buffer_mxfp4_and_original_eager_prefill_parity(self):
+    def test_native_packing_preserves_original_prefill_buffer_and_layout(self):
         torch = self.torch
         with patch.dict(sys.modules, {self.layout_module.__name__: self.layout_module}):
             for assembled in (False, True):
@@ -126,17 +127,23 @@ class ScaleLoading(unittest.TestCase):
                     for target in (torch.empty_like(expected), torch.empty(expected.shape, dtype=torch.uint8)):
                         target.copy_(source.reshape(target.shape))
                         torch.testing.assert_close(target, expected)
-                    if backend == "python":
-                        self.assertTrue(source.is_contiguous())
-                    else:
-                        self.assertEqual(source.stride(), expected.stride())
-                        # This CPU test substitutes pinning only; the NPU test uses actual pinned memory.
+                    self.assertTrue(source.is_contiguous())
+                    if backend == "native":
+
+                        class CpuFactory:
+                            @staticmethod
+                            def empty_strided(shape, strides, **kwargs):
+                                kwargs.pop("pin_memory")
+                                return torch.empty_strided(shape, strides, **kwargs)
+
                         with patch.object(torch.Tensor, "is_pinned", return_value=True):
-                            packed, reused = config.prepare_scale(torch, source, expected)
-                        self.assertTrue(reused)
-                        self.assertIs(packed, source)
+                            packed, reused = config.prepare_scale(CpuFactory, source, expected)
+                        self.assertFalse(reused)
+                        self.assertNotEqual(packed.data_ptr(), source.data_ptr())
+                        self.assertTrue(source.is_contiguous())
+                        torch.testing.assert_close(source, expected)
                         self.assertEqual(
-                            ctypes.string_at(source.data_ptr(), raw.numel()),
+                            ctypes.string_at(packed.data_ptr(), raw.numel()),
                             ctypes.string_at(raw.data_ptr(), raw.numel()),
                         )
 

@@ -5,6 +5,7 @@
 #include <mutex>
 #include <set>
 #include "native_task.h"
+#include "native_profile.h"
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
@@ -20,6 +21,7 @@ class NativeTransfers {
   std::vector<size_t> sizes;
   void* stream;
   bool cpu;
+  std::shared_ptr<NativeRanges> profiler;
   uint64_t batches = 0, copies = 0, bytes = 0;
   NativeTransfers(Addresses src, Addresses dst, std::vector<size_t> lengths,
                   uintptr_t stream_ptr, const std::string& library, bool cpu_test)
@@ -55,21 +57,27 @@ class NativeTransfers {
     if (library_) dlclose(library_);
 #endif
   }
-  void submit(const std::vector<std::pair<Id, Id>>& loads) {
-    for (auto [slot, eid] : loads) {
-      if (slot < 0 || static_cast<size_t>(slot) >= destinations.size() ||
-          eid < 0 || static_cast<size_t>(eid) >= sources.size())
-        throw std::runtime_error("native copy expert/slot outside table");
-      for (size_t part = 0; part < sizes.size(); ++part) {
-        void* dst = reinterpret_cast<void*>(destinations[slot][part]);
-        const void* src = reinterpret_cast<void*>(sources[eid][part]);
-        if (cpu) std::memcpy(dst, src, sizes[part]);
-        else check(copy_(dst, sizes[part], src, sizes[part], kHostToDevice, stream), "aclrtMemcpyAsync(H2D)");
-        ++copies;
-        bytes += sizes[part];
+  void submit(const std::vector<std::pair<Id, Id>>& loads,
+              NativeRanges* ranges = nullptr, const std::string& context = "") {
+    {
+      NativeRange load_range(ranges, "load_submit", context);
+      NativeRange copy_range(ranges, "copy_submit", context);
+      for (auto [slot, eid] : loads) {
+        if (slot < 0 || static_cast<size_t>(slot) >= destinations.size() ||
+            eid < 0 || static_cast<size_t>(eid) >= sources.size())
+          throw std::runtime_error("native copy expert/slot outside table");
+        for (size_t part = 0; part < sizes.size(); ++part) {
+          void* dst = reinterpret_cast<void*>(destinations[slot][part]);
+          const void* src = reinterpret_cast<void*>(sources[eid][part]);
+          if (cpu) std::memcpy(dst, src, sizes[part]);
+          else check(copy_(dst, sizes[part], src, sizes[part], kHostToDevice, stream), "aclrtMemcpyAsync(H2D)");
+          ++copies;
+          bytes += sizes[part];
+        }
       }
     }
     // Preserve the completion barrier even when this batch has no loads.
+    NativeRange wait_range(ranges, "synchronize", context);
     if (!cpu) check(wait_(stream, kCopyTimeoutMs), "aclrtSynchronizeStreamWithTimeout");
     ++batches;
   }
@@ -160,6 +168,13 @@ class NativeUpdate {
   }
 
   void execute() {
+    NativeMeasurement measurement(transfer->profiler);
+    const std::string context = measurement.call ?
+        "backend=cpp|layer=" + std::to_string(layer) + "|kind=" +
+        (prefetch ? "prefetch" : "reactive") + "|rows=" + std::to_string(ids.shape[0]) +
+        "|call=" + std::to_string(measurement.call) : "";
+    NativeRange host_range(measurement.get(), "host_callback", context);
+    NativeRange update_range(measurement.get(), "update_weights", context);
     std::lock_guard<std::recursive_mutex> guard(policy->mutex);
     const Id n = mapping.shape[0];
     std::vector<Id> resident, original(n);
@@ -207,7 +222,7 @@ class NativeUpdate {
     if (victims.size() != missing.size()) throw std::runtime_error("native expert cache has insufficient slots");
     std::vector<std::pair<Id, Id>> loads;
     for (size_t i = 0; i < missing.size(); ++i) loads.emplace_back(original[victims[i]], missing[i]);
-    transfer->submit(loads);
+    transfer->submit(loads, measurement.get(), context);
     for (size_t i = 0; i < missing.size(); ++i) {
       mapping.write(victims[i], -1);
       mapping.write(missing[i], loads[i].first);
@@ -216,9 +231,19 @@ class NativeUpdate {
 };
 
 inline void bind_native_update(py::module_& m) {
+  py::class_<NativeRanges, std::shared_ptr<NativeRanges>>(m, "NativeRanges")
+      .def(py::init<>())
+      .def("start", &NativeRanges::start)
+      .def("stop", [](NativeRanges& p) {
+        std::pair<uint64_t, uint64_t> result;
+        { py::gil_scoped_release release; result = p.stop(); }
+        const auto [count, errors] = result;
+        py::dict out; out["count"] = count; out["marker_errors"] = errors; return out;
+      });
   py::class_<NativeTransfers, std::shared_ptr<NativeTransfers>>(m, "NativeTransfers")
       .def(py::init<NativeTransfers::Addresses, NativeTransfers::Addresses, std::vector<size_t>,
-                    uintptr_t, const std::string&, bool>());
+                    uintptr_t, const std::string&, bool>())
+      .def("set_profiler", [](NativeTransfers& t, std::shared_ptr<NativeRanges> p) { t.profiler = std::move(p); });
   m.def("native_update_task", [](std::shared_ptr<Policy> policy, std::shared_ptr<NativeTransfers> table,
                                  Id layer, py::array ids, py::object scores, py::array mapping,
                                  bool prefetch, Id cap, py::object owners) {

@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Offline contracts for separate native profiling and full loading-stream gaps."""
+
+import importlib
+import json
+import runpy
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "script"))
+profile = importlib.import_module("native_moe_profile")
+
+
+def event(name, start, duration, pid=2, tid=56):
+    return dict(name=name, ts=start, dur=duration, pid=pid, tid=tid, ph="X")
+
+
+def fixture():
+    result = [
+        dict(name="process_name", pid=2, ph="M", args=dict(name="Ascend Hardware")),
+        dict(name="thread_name", pid=2, tid=56, ph="M", args=dict(name="Stream 56")),
+        event("host_sync_publish_2", 0, 1, tid=25),
+        event("host_sync_wait_2", 1, 3, tid=25),
+    ]
+    for call, (kind, layer, start) in enumerate((("prefetch", 1, 10), ("reactive", 1, 150), ("prefetch", 2, 300)), 1):
+        context = f"backend=cpp|layer={layer}|kind={kind}|rows=1|call={call}"
+        result.extend(
+            [
+                event("moe_offload/host_callback|" + context, start, 100, 1, 7),
+                event("moe_offload/update_weights|" + context, start + 1, 98, 1, 7),
+                event("MEMCPY_ASYNC", start + 10, 10),
+                # A sub-us internal gap is excluded; Transpose occupies the rest.
+                event("aclnnInplaceCopy_TransposeAiCore_Transpose", start + 20.05, 39.95),
+            ]
+        )
+    # A long gap is excluded, not mixed into the normal bubbles.
+    result.append(event("MEMCPY_ASYNC", 6000, 10))
+    return dict(traceEvents=result)
+
+
+class NativeProfileTests(unittest.TestCase):
+    def test_profile_request_failure_stops_owned_service(self):
+        args = SimpleNamespace(
+            port=8156, timing_port=18156, startup_timeout=60, max_tokens=5, warmup_requests=1, request_timeout=60
+        )
+        command = ["python", "--additional-config", '{"expert_offload_config":{}}']
+        child = Mock()
+        child.poll.return_value = None
+        stop = Mock()
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(profile, "ensure_profile_storage"),
+            patch.object(profile.subprocess, "Popen", return_value=child),
+            patch.object(profile, "request", side_effect=[dict(data=[dict(id="model")]), dict(mstx_enabled=True)]),
+            patch.object(profile, "streaming_completion", side_effect=TimeoutError("request timeout")),
+            patch.object(profile, "align_capture") as align,
+            self.assertRaisesRegex(TimeoutError, "request timeout"),
+        ):
+            profile.profile_cases(args, {"python": command}, Path(directory), {}, lambda _: None, Mock(), stop, [])
+        stop.assert_called_once_with(child)
+        align.assert_not_called()
+
+    def test_native_control_uses_native_counters_and_leaves_callbacks_unwrapped(self):
+        timing = runpy.run_path(str(ROOT / "vllm_ascend/expert_offload/callback_timing.py"))
+        module = ModuleType("vllm_ascend.expert_offload.callback_timing")
+        module.CallbackTimings = timing["CallbackTimings"]
+        with patch.dict(sys.modules, {module.__name__: module}):
+            native = runpy.run_path(str(ROOT / "vllm_ascend/expert_offload/native_profile.py"))
+        counters = Mock()
+        counters.stop.return_value = dict(count=17, marker_errors=2)
+        collector = native["NativeTimings"](counters)
+        collector.start()
+        self.assertTrue(collector.active)
+        observed = collector.stop()
+        self.assertEqual(observed["count"], 17)
+        self.assertEqual(observed["mstx_errors"], 2)
+        self.assertFalse(collector.active)
+        self.assertEqual(collector.samples, [])
+        self.assertEqual(collector.load_backend, "native")
+        self.assertEqual(collector.transport, "acl")
+        counters.start.assert_called_once()
+        counters.stop.assert_called_once()
+
+    def test_profile_config_leaves_timing_command_and_workload_unchanged(self):
+        config = dict(
+            expert_offload_config=dict(
+                host_update_backend="native", callback_timing_port=0, callback_mstx_enabled=False, num_device_experts=24
+            )
+        )
+        original = ["python", "--additional-config", json.dumps(config), "--port", "8156"]
+        modified = profile.profile_command(original, Path("profile/native"), 18156)
+        self.assertEqual(json.loads(original[2]), config)
+        observed = json.loads(modified[2])["expert_offload_config"]
+        self.assertEqual(observed["host_update_backend"], "native")
+        self.assertEqual(observed["num_device_experts"], 24)
+        self.assertTrue(observed["callback_mstx_enabled"])
+        self.assertEqual(observed["callback_timing_port"], 18156)
+        self.assertNotIn("--profiler-config", original)
+        self.assertIn("--profiler-config", modified)
+
+    def test_host_gaps_and_transpose_occupancy_are_both_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.json"
+            path.write_text(json.dumps(fixture()), encoding="utf-8")
+            lines = []
+            scan, details = profile.analyze_profile(path, "native", 3, "Stream 56", lines.append)
+        gaps = {row["direction"]: row["mean_us"] for row in scan["host_gaps"]}
+        self.assertEqual(gaps, {"prefetch->reactive": 40, "reactive->prefetch": 50})
+        bubbles = [
+            json.loads(line.split(" ", 1)[1]) for line in details.splitlines() if line.startswith("TARGET_GAPS_US ")
+        ]
+        full = next(row for row in bubbles if row["scope"] == "full_capture")
+        self.assertEqual(full["excluded_short"], 3)
+        self.assertEqual(full["excluded_long"], 1)
+        # Real idle gaps 160-70=90 and 310-210=100; not copy-only 140/150.
+        self.assertEqual(full["kept"]["n"], 2)
+        self.assertEqual(full["kept"]["mean"], 95)
+        self.assertTrue(any(line.startswith("HOST_CALLBACK_GAP native ") for line in lines))
+        self.assertTrue(any("TARGET_DIRECTION_GAPS_US" in line for line in lines))
+        table = []
+        profile.report_gap_table({"native": dict(scan=scan, bubble_stats=bubbles)}, table.append)
+        self.assertTrue(any("full_capture | 2 | 95" in line for line in table))
+
+    def test_incomplete_host_coverage_and_wrong_stream_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.json"
+            path.write_text(json.dumps(fixture()), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "callbacks=3/4"):
+                profile.analyze_profile(path, "native", 4, "Stream 56", lambda _: None)
+            with self.assertRaises(ValueError):
+                profile.analyze_profile(path, "native", 3, "Stream 27", lambda _: None)
+
+
+if __name__ == "__main__":
+    unittest.main()

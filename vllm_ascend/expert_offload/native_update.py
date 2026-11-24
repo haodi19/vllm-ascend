@@ -28,8 +28,6 @@ def validate_native_update_config(config):
         "enable_multi_card",
         "expert_substitution_enabled",
         "experts_pruning_enabled",
-        "callback_timing_port",
-        "callback_mstx_enabled",
         "expert_trace_enabled",
         "moe_offload_debug",
         "expert_prefetch_wait_timing",
@@ -38,6 +36,8 @@ def validate_native_update_config(config):
         raise ValueError(
             "native updates do not support multi-card, substitution/pruning or Python callback diagnostics"
         )
+    if bool(config.get("callback_timing_port")) != bool(config.get("callback_mstx_enabled")):
+        raise ValueError("native diagnostics require both control port and native MSTX ranges")
     for key, value in config.items():
         if (
             key.startswith("host_sync_diagnose_")
@@ -128,6 +128,11 @@ class NativeUpdateRuntime:
         self.packed_bytes = 0
         self.reused_bytes = 0
         self.targets = []
+        self.profiler = None
+        if manager.offload_config.callback_mstx_enabled:
+            if not hasattr(self.native, "NativeRanges"):
+                raise RuntimeError("rebuild csrc/lrc_policy for native profiling")
+            self.profiler = self.native.NativeRanges()
         # Drain Torch submissions before switching this load stream to direct ACL
         # on graph replay. Eager warmups still synchronize their Torch copies.
         manager.load_stream.synchronize()
@@ -187,7 +192,10 @@ class NativeUpdateRuntime:
             self._add_scale(layer.w13_weight_scale_fp32, cpu_sources, sources, destinations, sizes)
             targets["w13_weight_scale_fp32"] = (layer.w13_weight_scale_fp32, tensor_layout(layer.w13_weight_scale_fp32))
         self.targets.append(targets)
-        return self.native.NativeTransfers(sources, destinations, sizes, self.stream, "", False)
+        table = self.native.NativeTransfers(sources, destinations, sizes, self.stream, "", False)
+        if self.profiler is not None:
+            table.set_profiler(self.profiler)
+        return table
 
     def _add_scale(self, target, cpu_sources, sources, destinations, sizes):
         if self.npu.get_npu_format(target) not in (0, 2):

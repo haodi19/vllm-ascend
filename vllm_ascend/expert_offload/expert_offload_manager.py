@@ -593,7 +593,6 @@ class ExpertOffloadManager:
                 continue
             dev_tensor = getattr(layer, attr_name)
             dtype = dev_tensor.dtype
-            per_expert_strides = None
             if "scale_bias" in attr_name:
                 per_expert_shape = tuple(dev_tensor.shape[1:])
             elif dtype.itemsize == 1:
@@ -602,11 +601,6 @@ class ExpertOffloadManager:
                 dtype = torch.uint8
                 target_layout = apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8))
                 per_expert_shape = tuple(target_layout.shape)
-                if (getattr(self.offload_config, "host_update_backend", "python") == "native"
-                        and self.ep_size == 1):
-                    # Preserve logical values for eager/prefill Tensor copies,
-                    # but load final physical strides for native graph DMA.
-                    per_expert_strides = tuple(target_layout.stride())
             else:
                 per_expert_shape = (dev_tensor[0].numel(),)
             buffer_dict: dict = getattr(self, buffer_dict_name)
@@ -617,8 +611,8 @@ class ExpertOffloadManager:
                 buffers.append([])
             for _ in range(nalloc):
                 buffer = self._allocate_expert_host_tensor(per_expert_shape, dtype)
-                if per_expert_strides is not None:
-                    buffer = buffer.as_strided(per_expert_shape, per_expert_strides)
+                # Keep the original contiguous source for eager/prefill. Native
+                # decode packs a separate physical-layout buffer at finalization.
                 buffers[layer_moe_idx].append(buffer)
 
     def _assert_native_reload_safe(self, layer_idx=None):
