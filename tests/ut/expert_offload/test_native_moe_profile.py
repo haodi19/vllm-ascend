@@ -72,10 +72,10 @@ class NativeProfileTests(unittest.TestCase):
         ):
             profile.profile_cases(args, {"python": command}, Path(directory), {}, lambda _: None, Mock(), stop, [])
         stop.assert_called_once_with(child)
-        self.assertEqual(memory_before.call_args.args[1], "before profile/python")
+        self.assertEqual(memory_before.call_args.args[0], "before profile/python")
         self.assertTrue(memory_before.call_args.kwargs["before_start"])
-        self.assertEqual(memory_after.call_args.args[1], "after profile/python")
-        self.assertEqual(memory_after.call_args.args[3], child.pid)
+        self.assertEqual(memory_after.call_args.args[0], "after profile/python")
+        self.assertEqual(memory_after.call_args.args[2], child.pid)
         align.assert_not_called()
         storage.assert_called_once_with(
             Path(directory) / "profile/python", stage="before python profile service", min_free_gib=5

@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "script"))
@@ -19,10 +19,6 @@ def snapshot(free=200, available=300, node0=180, node1=180, allowed=(0, 1)):
         nodes=dict(node0=dict(MemFree=node0), node1=dict(MemFree=node1)),
         allowed_nodes=list(allowed),
     )
-
-
-def options(enabled=True):
-    return SimpleNamespace(auto_drop_caches=enabled, min_host_free_gib=160, min_numa_free_gib=160)
 
 
 class HostMemoryTests(unittest.TestCase):
@@ -41,17 +37,17 @@ class HostMemoryTests(unittest.TestCase):
         self.assertEqual(result["allowed_nodes"], [1, 2, 4])
 
     def test_low_node_triggers_even_when_global_available_is_high(self):
-        reasons = memory.reclaim_reasons(snapshot(node0=15), 160, 160)
+        reasons = memory.reclaim_reasons(snapshot(node0=15))
         self.assertEqual(reasons, ["node0 MemFree<160GiB"])
-        self.assertEqual(memory.reclaim_reasons(snapshot(node0=15, allowed=(1,)), 160, 160), [])
+        self.assertEqual(memory.reclaim_reasons(snapshot(node0=15, allowed=(1,))), [])
 
-    def test_healthy_memory_and_disabled_option_never_reclaim(self):
-        for args, reading in ((options(), snapshot()), (options(False), snapshot(free=10, node0=1))):
+    def test_healthy_memory_and_failure_diagnostics_never_reclaim(self):
+        for reclaim, reading in ((True, snapshot()), (False, snapshot(free=10, node0=1))):
             with (
                 patch.object(memory, "log_memory", return_value=reading),
                 patch.object(memory, "drop_page_cache") as drop,
             ):
-                memory.check_host_memory(args, "before", lambda _: None, before_start=True)
+                memory.check_host_memory("before", lambda _: None, before_start=True, reclaim=reclaim)
             drop.assert_not_called()
 
     def test_one_reclaim_with_before_after_evidence_and_no_repeated_attempt(self):
@@ -60,7 +56,7 @@ class HostMemoryTests(unittest.TestCase):
             patch.object(memory, "log_memory", side_effect=[snapshot(free=100, node0=10), snapshot(node0=140)]) as read,
             patch.object(memory, "drop_page_cache") as drop,
         ):
-            memory.check_host_memory(options(), "after python", lines.append)
+            memory.check_host_memory("after python", lines.append)
         drop.assert_called_once()
         self.assertEqual(read.call_count, 2)
         self.assertTrue(any("HOST_CACHE_DELTA" in line for line in lines))
@@ -72,7 +68,7 @@ class HostMemoryTests(unittest.TestCase):
             patch.object(memory, "drop_page_cache") as drop,
             self.assertRaisesRegex(RuntimeError, "next service not started"),
         ):
-            memory.check_host_memory(options(), "before native", lambda _: None, before_start=True)
+            memory.check_host_memory("before native", lambda _: None, before_start=True)
         drop.assert_called_once()
 
     def test_permission_failure_is_not_silently_ignored(self):
@@ -82,7 +78,7 @@ class HostMemoryTests(unittest.TestCase):
             patch.object(memory, "drop_page_cache", side_effect=PermissionError("read-only proc")),
             self.assertRaisesRegex(RuntimeError, "Page-cache reclaim failed"),
         ):
-            memory.check_host_memory(options(), "before", lines.append)
+            memory.check_host_memory("before", lines.append)
         self.assertTrue(any("read-only proc" in line for line in lines))
 
     def test_live_group_blocks_cache_reclaim(self):
@@ -93,7 +89,7 @@ class HostMemoryTests(unittest.TestCase):
             patch.object(memory, "drop_page_cache") as drop,
             self.assertRaisesRegex(RuntimeError, "still has live processes"),
         ):
-            memory.check_host_memory(options(), "after", lambda _: None, service_pgid=123)
+            memory.check_host_memory("after", lambda _: None, service_pgid=123)
         read.assert_not_called()
         drop.assert_not_called()
 
@@ -104,7 +100,7 @@ class HostMemoryTests(unittest.TestCase):
             patch.object(memory, "log_memory", side_effect=lambda *a: order.append("snapshot") or snapshot(free=10)),
             patch.object(memory, "drop_page_cache", side_effect=lambda: order.append("drop")),
         ):
-            memory.after_service_memory(options(), "after python", lambda _: None, 123)
+            memory.after_service_memory("after python", lambda _: None, 123)
         self.assertEqual(order, ["group exited", "snapshot", "drop", "snapshot"])
 
     def test_group_parser_excludes_zombies_and_other_services(self):
@@ -124,7 +120,7 @@ class HostMemoryTests(unittest.TestCase):
             try:
                 raise ValueError("original model failure")
             finally:
-                memory.after_service_memory(options(), "after failed", lambda _: None, 123)
+                memory.after_service_memory("after failed", lambda _: None, 123)
         self.assertFalse(check.call_args.kwargs["reclaim"])
         self.assertEqual(check.call_args.kwargs["service_pgid"], 123)
 
@@ -136,7 +132,7 @@ class HostMemoryTests(unittest.TestCase):
             try:
                 raise ValueError("original")
             finally:
-                memory.after_service_memory(options(), "after failed", lambda _: None, 123)
+                memory.after_service_memory("after failed", lambda _: None, 123)
 
     def test_drop_command_syncs_before_writing_only_one(self):
         with patch.object(memory.subprocess, "run") as run:

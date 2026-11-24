@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host/NUMA diagnostics between services; optional one-shot page-cache reclaim."""
+"""Host/NUMA diagnostics and automatic one-shot page-cache reclaim between services."""
 
 import json
 import re
@@ -10,8 +10,8 @@ from pathlib import Path
 
 KIB_PER_GIB = 1024**2
 # Trigger levels for this benchmark, not driver pinned-allocation guarantees.
-DEFAULT_MIN_HOST_FREE_GIB = 160
-DEFAULT_MIN_NUMA_FREE_GIB = 160
+MIN_HOST_FREE_GIB = 160
+MIN_NUMA_FREE_GIB = 160
 GROUP_EXIT_TIMEOUT = 15
 GROUP_POLL_SECONDS = 0.2
 NUMACTL_TIMEOUT = 10
@@ -138,19 +138,19 @@ def wait_group_exit(pgid, report):
     report(f"HOST_SERVICE_GROUP_EXITED pgid={pgid}")
 
 
-def reclaim_reasons(snapshot, host_threshold, node_threshold):
+def reclaim_reasons(snapshot):
     reasons = []
-    if snapshot["host"]["MemFree"] < host_threshold:
-        reasons.append(f"host MemFree<{host_threshold:g}GiB")
+    if snapshot["host"]["MemFree"] < MIN_HOST_FREE_GIB:
+        reasons.append(f"host MemFree<{MIN_HOST_FREE_GIB:g}GiB")
     allowed = snapshot["allowed_nodes"]
     for node, fields in snapshot["nodes"].items():
-        if allowed is not None and int(node[4:]) in allowed and fields["MemFree"] < node_threshold:
-            reasons.append(f"{node} MemFree<{node_threshold:g}GiB")
+        if allowed is not None and int(node[4:]) in allowed and fields["MemFree"] < MIN_NUMA_FREE_GIB:
+            reasons.append(f"{node} MemFree<{MIN_NUMA_FREE_GIB:g}GiB")
     return reasons
 
 
 def drop_page_cache():
-    # Only called by an explicit --auto-drop-caches request, outside measurements.
+    # The benchmark calls this only between services, outside measurements.
     # Never write 3, change huge pages, compact memory, or stop unrelated processes.
     subprocess.run(
         [
@@ -166,19 +166,17 @@ def drop_page_cache():
     )
 
 
-def check_host_memory(args, stage, report, *, service_pgid=None, before_start=False, reclaim=True):
+def check_host_memory(stage, report, *, service_pgid=None, before_start=False, reclaim=True):
     if service_pgid is not None:
         wait_group_exit(service_pgid, report)
     try:
         before = log_memory(stage, report)
     except OSError as exc:
         report(f"HOST_MEMORY_UNAVAILABLE stage={stage}; {exc}")
-        if args.auto_drop_caches:
-            raise RuntimeError("Cannot decide automatic cache reclaim without Host memory readings") from exc
-        return
-    if not args.auto_drop_caches or not reclaim:
+        raise RuntimeError("Cannot decide automatic cache reclaim without Host memory readings") from exc
+    if not reclaim:
         return before
-    reasons = reclaim_reasons(before, args.min_host_free_gib, args.min_numa_free_gib)
+    reasons = reclaim_reasons(before)
     after = before
     if reasons:
         report(f"HOST_CACHE_RECLAIM stage={stage}; reasons={reasons}; sync then drop_caches=1; host-wide file cache")
@@ -203,21 +201,21 @@ def check_host_memory(args, stage, report, *, service_pgid=None, before_start=Fa
                 )
             )
         )
-    remaining = reclaim_reasons(after, args.min_host_free_gib, args.min_numa_free_gib)
+    remaining = reclaim_reasons(after)
     report(
         f"HOST_MEMORY_DECISION stage={stage}; reclaimed={bool(reasons)}; remaining_low_free={remaining}; "
         "node free is a reclaim trigger, not proof of allocation failure or driver NUMA placement"
     )
-    if before_start and after["host"]["MemAvailable"] < args.min_host_free_gib:
-        raise RuntimeError("Host MemAvailable remains below configured threshold; next service not started")
+    if before_start and after["host"]["MemAvailable"] < MIN_HOST_FREE_GIB:
+        raise RuntimeError(f"Host MemAvailable remains below {MIN_HOST_FREE_GIB} GiB; next service not started")
     return after
 
 
-def after_service_memory(args, stage, report, pgid):
+def after_service_memory(stage, report, pgid):
     """Called from finally, after stopping the group; preserve the original error."""
     already_failed = sys.exc_info()[0] is not None
     try:
-        check_host_memory(args, stage, report, service_pgid=pgid, reclaim=not already_failed)
+        check_host_memory(stage, report, service_pgid=pgid, reclaim=not already_failed)
     except Exception as exc:
         if not already_failed:
             raise
