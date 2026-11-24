@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Host/NUMA diagnostics and automatic one-shot page-cache reclaim between services."""
+"""Host/NUMA diagnostics and a fixed page-cache drop after the Python service."""
 
 import json
 import re
@@ -9,9 +9,6 @@ import time
 from pathlib import Path
 
 KIB_PER_GIB = 1024**2
-# Trigger levels for this benchmark, not driver pinned-allocation guarantees.
-MIN_HOST_FREE_GIB = 160
-MIN_NUMA_FREE_GIB = 160
 GROUP_EXIT_TIMEOUT = 15
 GROUP_POLL_SECONDS = 0.2
 NUMACTL_TIMEOUT = 10
@@ -138,27 +135,10 @@ def wait_group_exit(pgid, report):
     report(f"HOST_SERVICE_GROUP_EXITED pgid={pgid}")
 
 
-def reclaim_reasons(snapshot):
-    reasons = []
-    if snapshot["host"]["MemFree"] < MIN_HOST_FREE_GIB:
-        reasons.append(f"host MemFree<{MIN_HOST_FREE_GIB:g}GiB")
-    allowed = snapshot["allowed_nodes"]
-    for node, fields in snapshot["nodes"].items():
-        if allowed is not None and int(node[4:]) in allowed and fields["MemFree"] < MIN_NUMA_FREE_GIB:
-            reasons.append(f"{node} MemFree<{MIN_NUMA_FREE_GIB:g}GiB")
-    return reasons
-
-
 def drop_page_cache():
-    # The benchmark calls this only between services, outside measurements.
-    # Never write 3, change huge pages, compact memory, or stop unrelated processes.
+    # Literal command requested for the Python -> native transition; no interpolation.
     subprocess.run(
-        [
-            sys.executable,
-            "-B",
-            "-c",
-            "import os; from pathlib import Path; os.sync(); Path('/proc/sys/vm/drop_caches').write_text('1\\n')",
-        ],
+        ["sh", "-c", "echo 1 > /proc/sys/vm/drop_caches"],
         check=True,
         capture_output=True,
         text=True,
@@ -166,56 +146,49 @@ def drop_page_cache():
     )
 
 
-def check_host_memory(stage, report, *, service_pgid=None, before_start=False, reclaim=True):
+def check_host_memory(stage, report, *, service_pgid=None):
     if service_pgid is not None:
         wait_group_exit(service_pgid, report)
     try:
-        before = log_memory(stage, report)
+        return log_memory(stage, report)
     except OSError as exc:
         report(f"HOST_MEMORY_UNAVAILABLE stage={stage}; {exc}")
-        raise RuntimeError("Cannot decide automatic cache reclaim without Host memory readings") from exc
-    if not reclaim:
-        return before
-    reasons = reclaim_reasons(before)
-    after = before
-    if reasons:
-        report(f"HOST_CACHE_RECLAIM stage={stage}; reasons={reasons}; sync then drop_caches=1; host-wide file cache")
-        try:
-            drop_page_cache()
-        except (OSError, subprocess.SubprocessError) as exc:
-            detail = getattr(exc, "stderr", None) or str(exc)
-            report(f"HOST_CACHE_RECLAIM_FAILED {detail}; no automatic retry")
-            raise RuntimeError("Page-cache reclaim failed; check container permission or read-only /proc") from exc
-        after = log_memory(stage + "/after_drop", report)
-        report(
-            "HOST_CACHE_DELTA "
-            + json.dumps(
-                dict(
-                    stage=stage,
-                    host_free_gib=after["host"]["MemFree"] - before["host"]["MemFree"],
-                    node_free_gib={
-                        node: fields["MemFree"] - before["nodes"][node]["MemFree"]
-                        for node, fields in after["nodes"].items()
-                        if node in before["nodes"]
-                    },
-                )
-            )
-        )
-    remaining = reclaim_reasons(after)
-    report(
-        f"HOST_MEMORY_DECISION stage={stage}; reclaimed={bool(reasons)}; remaining_low_free={remaining}; "
-        "node free is a reclaim trigger, not proof of allocation failure or driver NUMA placement"
-    )
-    if before_start and after["host"]["MemAvailable"] < MIN_HOST_FREE_GIB:
-        raise RuntimeError(f"Host MemAvailable remains below {MIN_HOST_FREE_GIB} GiB; next service not started")
-    return after
+        return None
 
 
-def after_service_memory(stage, report, pgid):
+def after_service_memory(stage, report, pgid, *, drop_cache=False):
     """Called from finally, after stopping the group; preserve the original error."""
     already_failed = sys.exc_info()[0] is not None
     try:
-        check_host_memory(stage, report, service_pgid=pgid, reclaim=not already_failed)
+        before = check_host_memory(stage, report, service_pgid=pgid)
+        if drop_cache and not already_failed:
+            report(
+                f"HOST_CACHE_RECLAIM stage={stage}; fixed Python -> native transition; "
+                "command=echo 1 > /proc/sys/vm/drop_caches"
+            )
+            try:
+                drop_page_cache()
+            except (OSError, subprocess.SubprocessError) as exc:
+                detail = getattr(exc, "stderr", None) or str(exc)
+                report(f"HOST_CACHE_RECLAIM_FAILED {detail}; next service not started")
+                raise RuntimeError("Fixed page-cache drop failed; next service not started") from exc
+            report(f"HOST_CACHE_RECLAIM_PASS stage={stage}; exit=0")
+            after = check_host_memory(stage + "/after_drop", report)
+            if before is not None and after is not None:
+                report(
+                    "HOST_CACHE_DELTA "
+                    + json.dumps(
+                        dict(
+                            stage=stage,
+                            host_free_gib=after["host"]["MemFree"] - before["host"]["MemFree"],
+                            node_free_gib={
+                                node: fields["MemFree"] - before["nodes"][node]["MemFree"]
+                                for node, fields in after["nodes"].items()
+                                if node in before["nodes"]
+                            },
+                        )
+                    )
+                )
     except Exception as exc:
         if not already_failed:
             raise

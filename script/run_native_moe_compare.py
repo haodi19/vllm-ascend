@@ -24,8 +24,6 @@ import urllib.request
 from pathlib import Path
 
 from moe_host_memory import (
-    MIN_HOST_FREE_GIB,
-    MIN_NUMA_FREE_GIB,
     after_service_memory,
     check_host_memory,
     log_memory,
@@ -340,8 +338,8 @@ def main():
 
     try:
         report(
-            f"HOST_MEMORY_POLICY: automatic cache reclaim; host_free_trigger_gib={MIN_HOST_FREE_GIB:g}; "
-            f"allowed_node_free_trigger_gib={MIN_NUMA_FREE_GIB:g}; outside all measurement windows"
+            "HOST_MEMORY_POLICY: after successful Python service exit, run echo 1 > /proc/sys/vm/drop_caches "
+            "once before native; no RAM threshold; outside all measurement windows"
         )
         if not args.skip_profile:
             report(
@@ -442,7 +440,7 @@ def main():
         timings = {}
         for case in ("python", "native"):
             wait_port_free(args.port)
-            check_host_memory(f"before timing/{case}", report, before_start=True)
+            check_host_memory(f"before timing/{case}", report)
             command = commands[case]
             # This exact argv preserves the original model and MTP settings.
             (root / f"{case}_command.json").write_text(
@@ -526,7 +524,7 @@ def main():
                     raise
                 finally:
                     stop_process_group(proc)
-                    after_service_memory(f"after timing/{case}", report, proc.pid)
+                    after_service_memory(f"after timing/{case}", report, proc.pid, drop_cache=case == "python")
             report(f"WAIT port release after service={case}; port={args.port}; timeout={PORT_RELEASE_TIMEOUT}s")
             wait_port_free(args.port, timeout=PORT_RELEASE_TIMEOUT)
             report(f"STOP service={case}; port={args.port} reusable")

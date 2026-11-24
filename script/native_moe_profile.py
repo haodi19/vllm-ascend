@@ -94,7 +94,7 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
         )
         wait_port_free(args.port)
         wait_port_free(args.timing_port)
-        check_host_memory(f"before profile/{case}", report, before_start=True)
+        check_host_memory(f"before profile/{case}", report)
         command = profile_command(original, directory, args.timing_port)
         log_path = root / f"{case}_profile.log"
         report(f"PROFILE_START {case}; separate diagnostic service; log={log_path}")
@@ -167,7 +167,7 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                 raise
             finally:
                 stop_process_group(child)
-                after_service_memory(f"after profile/{case}", report, child.pid)
+                after_service_memory(f"after profile/{case}", report, child.pid, drop_cache=case == "python")
         wait_port_free(args.port, timeout=10)
         wait_port_free(args.timing_port, timeout=10)
         captures = discover_roots([directory])
