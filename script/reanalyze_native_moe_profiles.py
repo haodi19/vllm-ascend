@@ -2,12 +2,65 @@
 """Recompute Host/loading gaps from saved aligned captures, without running models."""
 
 import argparse
+import collections
 import json
 import re
 from pathlib import Path
 
 from export_moe_aligned_profile import aligned_trace_path
 from native_moe_profile import analyze_profile, report_gap_table
+from verify_memcpy_gaps import MAX_DISTRIBUTION_VALUES, read_copy_tracks
+
+
+def saved_traces(runs):
+    seen = set()
+    for root in runs:
+        for case in ("python", "native"):
+            directory = root / "profile" / case
+            if not directory.is_dir():
+                continue
+            if case in seen:
+                raise ValueError(f"Duplicate {case} case; pass only one run per case")
+            seen.add(case)
+            paths = directory.rglob("trace_view.json")
+            trace = next(paths, None)
+            if trace is None or next(paths, None) is not None:
+                raise ValueError(f"{case}: expected exactly one saved trace")
+            yield root, case, aligned_trace_path(trace)
+    if not seen:
+        raise ValueError("No saved profile/python or profile/native found")
+
+
+def list_streams(runs, report):
+    report("READ ONLY: saved aligned trace inventory; no Torch/NPU/model, no writes, no automatic stream selection.")
+    for root, case, trace in saved_traces(runs):
+        report(f"SOURCE case={case}; run={root}; aligned_trace={trace}")
+        tracks, names = read_copy_tracks(trace)
+        if not tracks:
+            raise ValueError(f"{case}: no hardware MEMCPY tracks")
+        for key, copies in sorted(tracks.items()):
+            directions = collections.Counter(item["fields"].get("direction", "unknown") for item in copies)
+            sizes = collections.Counter(item["fields"].get("bytes") for item in copies)
+            missing_bytes = sizes.pop(None, 0)
+            report(
+                "COPY_TRACK "
+                + json.dumps(
+                    dict(
+                        case=case,
+                        pid=key[0],
+                        tid=key[1],
+                        name=names.get(key, ""),
+                        copies=len(copies),
+                        directions=dict(directions),
+                        common_bytes_counts=sizes.most_common(MAX_DISTRIBUTION_VALUES),
+                        missing_bytes=missing_bytes,
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+    report(
+        "INVENTORY_COMPLETE: names are visualization thread_name values, not tid. Counts alone do not identify weights."
+    )
 
 
 def saved_case(root, case):
@@ -42,47 +95,36 @@ def saved_case(root, case):
     return counters["count"], next(iter(physical_npus), None), (reference[0]["digest"], reference[0]["usage"])
 
 
-def reanalyze(runs, output, report):
+def reanalyze(runs, output, report, stream_name="Stream 56"):
     profiles, devices = {}, {}
     expected_output = None
-    for root in runs:
-        for case in ("python", "native"):
-            directory = root / "profile" / case
-            if not directory.is_dir():
-                continue
-            if case in profiles:
-                raise ValueError(f"Duplicate {case} case; pass only one run per case")
-            paths = directory.rglob("trace_view.json")
-            trace = next(paths, None)
-            if trace is None or next(paths, None) is not None:
-                raise ValueError(f"{case}: expected exactly one saved trace")
-            trace = aligned_trace_path(trace)
-            count, device, reference = saved_case(root, case)
-            if expected_output is not None and reference != expected_output:
-                raise ValueError("Python/native saved output references differ")
-            expected_output = reference
-            devices[case] = device
-            report(f"SOURCE case={case}; physical_npu={device}; run={root}; aligned_trace={trace}")
-            scan, details = analyze_profile(trace, case, count, "Stream 56", report)
-            bubbles = [
-                json.loads(line.split(" ", 1)[1])
-                for line in details.splitlines()
-                if line.startswith(("TARGET_GAPS_US ", "TARGET_DIRECTION_GAPS_US "))
-            ]
-            profiles[case] = dict(scan=scan, bubble_stats=bubbles)
-            (output / f"{case}_profile_report.json").write_text(json.dumps(profiles[case]), encoding="utf-8")
-            (output / f"{case}_bubble_details.log").write_text(details, encoding="utf-8")
-            report(
-                "PROFILE_CHECK "
-                + json.dumps(
-                    dict(
-                        case=case,
-                        callbacks=scan["host_callbacks"],
-                        nesting=scan["nesting"],
-                        arithmetic=scan["host_time_arithmetic"],
-                    )
+    for root, case, trace in saved_traces(runs):
+        count, device, reference = saved_case(root, case)
+        if expected_output is not None and reference != expected_output:
+            raise ValueError("Python/native saved output references differ")
+        expected_output = reference
+        devices[case] = device
+        report(f"SOURCE case={case}; physical_npu={device}; run={root}; aligned_trace={trace}")
+        scan, details = analyze_profile(trace, case, count, stream_name, report)
+        bubbles = [
+            json.loads(line.split(" ", 1)[1])
+            for line in details.splitlines()
+            if line.startswith(("TARGET_GAPS_US ", "TARGET_DIRECTION_GAPS_US "))
+        ]
+        profiles[case] = dict(scan=scan, bubble_stats=bubbles)
+        (output / f"{case}_profile_report.json").write_text(json.dumps(profiles[case]), encoding="utf-8")
+        (output / f"{case}_bubble_details.log").write_text(details, encoding="utf-8")
+        report(
+            "PROFILE_CHECK "
+            + json.dumps(
+                dict(
+                    case=case,
+                    callbacks=scan["host_callbacks"],
+                    nesting=scan["nesting"],
+                    arithmetic=scan["host_time_arithmetic"],
                 )
             )
+        )
     if not profiles:
         raise ValueError("No saved profile/python or profile/native found")
     report_gap_table(profiles, report)
@@ -104,8 +146,22 @@ def reanalyze(runs, output, report):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runs", nargs="+", type=Path)
-    parser.add_argument("--output-dir", required=True, type=Path)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--output-dir", type=Path)
+    mode.add_argument(
+        "--list-streams", action="store_true", help="Print saved hardware copy tracks without writing files"
+    )
+    parser.add_argument(
+        "--bubble-stream-name", default="Stream 56", help="Exact visualization name; never guessed from tid/count"
+    )
     args = parser.parse_args(argv)
+    if args.list_streams:
+        try:
+            list_streams([run.resolve(strict=True) for run in args.runs], lambda line: print(line, flush=True))
+        except Exception as exc:
+            print(f"INVENTORY_FAILED {type(exc).__name__}: {exc}", flush=True)
+            return 1
+        return 0
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=False)
 
@@ -121,7 +177,7 @@ def main(argv=None):
         "Host nesting/subtraction uses exact decimal arithmetic; no added tolerance."
     )
     try:
-        reanalyze([run.resolve(strict=True) for run in args.runs], output, report)
+        reanalyze([run.resolve(strict=True) for run in args.runs], output, report, args.bubble_stream_name)
     except Exception as exc:
         report(f"REANALYSIS_FAILED {type(exc).__name__}: {exc}; completed partial output retained")
         return 1

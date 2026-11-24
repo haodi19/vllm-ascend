@@ -92,21 +92,26 @@ def analyze_profile(trace, case, expected_count, stream_name, report):
     for row in scan["host_gaps"]:
         report("HOST_CALLBACK_GAP " + case + " " + json.dumps(row, ensure_ascii=False))
     capture = io.StringIO()
-    with contextlib.redirect_stdout(capture):
-        complete = inspect_offload_trace(trace, stream_name, MIN_BUBBLE_US, MAX_BUBBLE_US)
-    text = capture.getvalue()
-    for line in text.splitlines():
-        if line.startswith(
-            (
-                "TARGET_GAPS_US ",
-                "TARGET_DIRECTION_GAPS_US ",
-                "SELECTED_OFFLOAD_TRACK ",
-                "OFFLOAD_STATUS ",
-                "CALLBACK_SCOPE_UNAVAILABLE ",
-                "EXCLUDED_ADJACENT_PAIRS ",
-            )
-        ):
-            report(case + " " + line)
+    try:
+        with contextlib.redirect_stdout(capture):
+            complete = inspect_offload_trace(trace, stream_name, MIN_BUBBLE_US, MAX_BUBBLE_US)
+    finally:
+        # Stream numbering can change between captures. Preserve the inventory
+        # even when exact-name selection raises, so saved profiles can be reused.
+        text = capture.getvalue()
+        for line in text.splitlines():
+            if line.startswith(
+                (
+                    "COPY_TRACK ",
+                    "TARGET_GAPS_US ",
+                    "TARGET_DIRECTION_GAPS_US ",
+                    "SELECTED_OFFLOAD_TRACK ",
+                    "OFFLOAD_STATUS ",
+                    "CALLBACK_SCOPE_UNAVAILABLE ",
+                    "EXCLUDED_ADJACENT_PAIRS ",
+                )
+            ):
+                report(case + " " + line)
     if not complete:
         report(f"BUBBLES_PARTIAL {case}: full-window statistics retained; direction mapping may be incomplete")
     return scan, text

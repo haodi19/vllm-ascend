@@ -98,6 +98,57 @@ class NativeReanalysisTests(unittest.TestCase):
                 runner.main([str(root), "--output-dir", str(root)])
             self.assertEqual(summary.read_text(encoding="utf-8"), "original")
 
+    def test_changed_stream_name_is_listed_read_only_then_selected_explicitly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            root = base / "native"
+            trace = self.saved(root, "native")
+            data = fixture()
+            # Display name intentionally differs from tid. Do not guess by tid.
+            data["traceEvents"][1]["args"]["name"] = "Stream 54"
+            trace.write_text(json.dumps(data), encoding="utf-8")
+            before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            stdout = io.StringIO()
+            with (
+                patch("subprocess.Popen") as popen,
+                patch("subprocess.run") as run,
+                contextlib.redirect_stdout(stdout),
+            ):
+                self.assertEqual(runner.main([str(root), "--list-streams"]), 0)
+            popen.assert_not_called()
+            run.assert_not_called()
+            self.assertEqual(before, {p: p.read_bytes() for p in root.rglob("*") if p.is_file()})
+            self.assertEqual(list(base.iterdir()), [root])
+            row = next(line for line in stdout.getvalue().splitlines() if line.startswith("COPY_TRACK "))
+            track = json.loads(row.split(" ", 1)[1])
+            self.assertEqual((track["name"], track["tid"], track["copies"]), ("Stream 54", "56", 4))
+            self.assertEqual(track["missing_bytes"], 4)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(base / "wrong_01")]), 1)
+                self.assertEqual(
+                    runner.main(
+                        [str(root), "--bubble-stream-name", "Stream 54", "--output-dir", str(base / "analysis_01")]
+                    ),
+                    0,
+                )
+            summary = (base / "analysis_01/summary.txt").read_text(encoding="utf-8")
+            self.assertIn("Loading bubbles full_capture | 2 | 95", summary)
+            self.assertEqual(before, {p: p.read_bytes() for p in root.rglob("*") if p.is_file()})
+
+    def test_list_rejects_conflicting_track_names_without_printing_partial_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = self.saved(root, "native")
+            data = fixture()
+            data["traceEvents"].append(dict(name="thread_name", pid=2, tid=56, ph="M", args=dict(name="Stream 54")))
+            trace.write_text(json.dumps(data), encoding="utf-8")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                self.assertEqual(runner.main([str(root), "--list-streams"]), 1)
+            self.assertIn("INVENTORY_FAILED", stdout.getvalue())
+            self.assertNotIn("COPY_TRACK ", stdout.getvalue())
+            self.assertNotIn("INVENTORY_COMPLETE", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

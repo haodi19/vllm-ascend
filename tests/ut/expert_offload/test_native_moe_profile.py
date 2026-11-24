@@ -172,8 +172,13 @@ class NativeProfileTests(unittest.TestCase):
             path.write_text(json.dumps(fixture()), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "callbacks=3/4"):
                 profile.analyze_profile(path, "native", 4, "Stream 56", lambda _: None)
+            lines = []
             with self.assertRaises(ValueError):
-                profile.analyze_profile(path, "native", 3, "Stream 27", lambda _: None)
+                profile.analyze_profile(path, "native", 3, "Stream 27", lines.append)
+            tracks = [json.loads(line.split(" ", 2)[2]) for line in lines if line.startswith("native COPY_TRACK ")]
+            self.assertEqual([row["name"] for row in tracks], ["Stream 56"])
+            self.assertTrue(any(line.startswith("HOST_CALLBACK_GAP native ") for line in lines))
+            self.assertFalse(any("TARGET_GAPS_US " in line for line in lines))
 
 
 if __name__ == "__main__":
