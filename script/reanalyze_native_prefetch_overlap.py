@@ -67,6 +67,24 @@ def render_host_times(results, report):
     report(table(["范围", "Host函数/分项", "Python n/应有n; raw; IQR", "native n/应有n; raw; IQR", "原均值变化"], rows))
 
 
+def host_span_stats(result):
+    rows = result["rows"]
+    return {
+        "prefetch_host": _stats([r["prefetch_duration_us"] for r in rows]),
+        "gap": _stats([r["gap_us"] for r in rows]),
+        "prefetch_start_to_reactive_start": _stats([r["prefetch_duration_us"] + r["gap_us"] for r in rows]),
+    }
+
+
+def coordinate_estimate_eligible(result):
+    """Eligibility for sensitivity analysis, NEVER acceptance of failed order."""
+    checks = result.get("mte_order_checks", [])
+    if result.get("binding_error") or not checks or not any(not c["valid"] for c in checks):
+        return False
+    largest = max(max(c["publish_start_minus_host_start_us"], c["host_end_minus_wait_end_us"]) for c in checks)
+    return largest <= result["sensitivity_margin_us"]
+
+
 def render(results, report):
     classification, restats = [], []
     for case, result in results.items():
@@ -116,11 +134,20 @@ def render(results, report):
                 f"PARTIAL_BOUNDARIES {case}: 无法识别样本保留原间隔；"
                 "两方案只处理其余明确晚完成样本，不能视为全部计算等待已扣除。"
             )
+        if "coordinate_estimate" in result:
+            report(
+                f"COORDINATE_ESTIMATE {case}: 下表使用同一对齐坐标的条件估算；完整流内配对仍成立，"
+                "跨Host/设备顺序检查仍未通过。使用原校准余量区分早/晚/不确定；不修改时间戳，"
+                "不利用wait拟合时钟。此估算不能证明实际握手顺序正确。"
+            )
+        view = result.get("coordinate_estimate", result)
         for mode, label, group_key in (
             ("direct", "对齐坐标直接判定", "direct_classification"),
             ("conservative", "保守判定", "classification"),
         ):
-            groups = result[group_key]
+            groups = view[group_key]
+            if "coordinate_estimate" in result:
+                label += "（条件坐标估算）"
             counts = [
                 f"{groups[k]['count']}/{number(groups[k]['fraction_pct'])}%"
                 for k in ("early", "late", "uncertain", "unmapped")
@@ -135,7 +162,7 @@ def render(results, report):
                     number(groups["late"]["mean_us"]),
                 ]
             )
-            values = result[mode]["all_samples"]
+            values = view[mode]["all_samples"]
             cells = [
                 f"{values[k]['count']}/{number(values[k]['mean_us'])}"
                 for k in ("original", "method1_drop_late", "method2_subtract_remaining_compute")
@@ -145,17 +172,35 @@ def render(results, report):
             for key in ("method1_drop_late", "method2_subtract_remaining_compute"):
                 mean = values[key]["mean_us"]
                 changes.append(number(100 * (1 - mean / original)) + "%" if original and mean is not None else "—")
+            boundary_range = (
+                f"{number(values['method2_aligned_boundary_low']['mean_us'])}～"
+                f"{number(values['method2_aligned_boundary_high']['mean_us'])}"
+            )
+            if groups["unmapped"]["count"] == groups["all"]["count"]:
+                cells[1:] = ["—", "—"]
+                changes = ["—", "—"]
+                boundary_range = "—"
             restats.append(
                 [
                     case,
                     label,
                     *cells,
                     *changes,
-                    f"{number(values['method2_aligned_boundary_low']['mean_us'])}～{number(values['method2_aligned_boundary_high']['mean_us'])}",
+                    boundary_range,
                     values["counts"].get("invalid_subtraction", 0),
                 ]
             )
     render_host_times(results, report)
+    report("HOST_ONLY_SPAN：同一批预取→按需样本；只使用Host坐标，不依赖设备对齐；跨度=预取Host耗时+随后间隔。")
+    report(
+        table(
+            ["组", "n", "预取Host均值μs", "随后间隔均值μs", "预取开始→按需开始均值μs"],
+            [
+                [case, len(result["rows"]), *(number(s["mean_us"]) for s in host_span_stats(result).values())]
+                for case, result in results.items()
+            ],
+        )
+    )
     report(
         table(
             [
@@ -198,11 +243,14 @@ def render(results, report):
         report("COMPARISON_UNAVAILABLE: physical NPU missing or different; per-case restats retained.")
         return
     try:
-        pairs, excluded = comparison_rows(results["python"], results["native"])
+        views = {case: r.get("coordinate_estimate", r) for case, r in results.items()}
+        pairs, excluded = comparison_rows(views["python"], views["native"])
     except ValueError as exc:
         report(f"COMPARISON_UNAVAILABLE: {exc}")
         return
-    report(f"PAIRED_BOUNDARIES n={len(pairs)}; excluded={excluded}")
+    estimated = any("coordinate_estimate" in r for r in results.values())
+    label = "PAIRED_COORDINATE_ESTIMATES" if estimated else "PAIRED_BOUNDARIES"
+    report(f"{label} n={len(pairs)}; excluded={excluded}; conditional_on_aligned_coordinates={estimated}")
     if not pairs:
         report("COMPARISON_UNAVAILABLE: no valid paired compute boundaries; Host function timings retained.")
         return
@@ -249,7 +297,24 @@ def reanalyze(runs, output, report):
                         trace, profile_report=counters, update_backend=case, exact_relative=True, retain_unmapped=True
                     )
                 result.update(physical_npu=device, expected_callbacks=count)
+                result["host_only_span"] = host_span_stats(result)
                 results[case] = result
+                if coordinate_estimate_eligible(result):
+                    # The failed strict result stays in result; no acceptance
+                    # criterion or timestamps are changed by this second view.
+                    try:
+                        with contextlib.redirect_stdout(details):
+                            estimate = analyze(
+                                trace,
+                                profile_report=counters,
+                                update_backend=case,
+                                exact_relative=True,
+                                retain_unmapped=True,
+                                estimate_order_mismatches=True,
+                            )
+                        result["coordinate_estimate"] = estimate
+                    except (ValueError, KeyError, TypeError) as exc:
+                        report(f"COORDINATE_ESTIMATE_UNAVAILABLE {case}: {exc}; strict results retained")
                 report(
                     f"DONE {case}: pairs={len(result['rows'])}; "
                     f"unmapped={result['classification']['unmapped']['count']}"
@@ -262,10 +327,16 @@ def reanalyze(runs, output, report):
     if (
         not results
         or "native" not in results
-        or results["native"]["classification"]["unmapped"]["count"] == len(results["native"]["rows"])
+        or (
+            results["native"].get("coordinate_estimate", results["native"])["classification"]["unmapped"]["count"]
+            == len(results["native"]["rows"])
+        )
     ):
         raise ValueError("native compute boundary unavailable; no conclusion about exposed computation")
-    return any(r["classification"]["unmapped"]["count"] for r in results.values()) or len(results) != 2
+    if any("coordinate_estimate" in r for r in results.values()):
+        return "OVERLAP_ESTIMATED"
+    partial = any(r["classification"]["unmapped"]["count"] for r in results.values()) or len(results) != 2
+    return "OVERLAP_PARTIAL" if partial else "OVERLAP_COMPLETE"
 
 
 def main(argv=None):
@@ -282,7 +353,7 @@ def main(argv=None):
             destination.write(message + "\n")
 
     report(f"SUMMARY_FILE={output / 'summary.txt'}")
-    report("SCRIPT_REVISION=native_overlap_v2_partial_order_diagnostics")
+    report("SCRIPT_REVISION=native_overlap_v3_coordinate_sensitivity")
     report("只读已有对齐profile/计数器/输出；不导入Torch、不启动模型/NPU、不改原采集；仅写本次分析目录。")
     report("分析预取Host是否更早结束、计算是否暴露到间隔中；早/晚均指计算相对于预取Host结束。")
     report("方案1删除明确晚完成样本；方案2扣除其预取结束至计算到达的时间（边界区间中点）。")
@@ -291,12 +362,13 @@ def main(argv=None):
     report("重统计相对原均值的降低是描述性结果，不是新测Decode/TPOT收益；native缺少逐专家计数时不猜测零加载。")
     report("跨Host/设备顺序不符只阻止相关样本的计算分类；Host函数耗时独立统计，不平移时间戳、不放宽1μs检查。")
     report("LOAD_EVIDENCE只说明逐专家加载数能否核验；缺失加载后端元数据不等于Python加载路径运行失败。")
+    report("顺序残差未超过原校准敏感性余量时，另列条件坐标估算；严格检查失败记录原样保留，不宣称顺序已验证。")
     try:
-        partial = reanalyze([p.resolve(strict=True) for p in args.runs], output, report)
+        status = reanalyze([p.resolve(strict=True) for p in args.runs], output, report)
     except Exception as exc:
         report(f"OVERLAP_FAILED {type(exc).__name__}: {exc}; completed output retained")
         return 1
-    report(f"{'OVERLAP_PARTIAL' if partial else 'OVERLAP_COMPLETE'}; return this summary.txt, no model rerun needed.")
+    report(f"{status}; return this summary.txt, no model rerun needed.")
     return 0
 
 

@@ -136,7 +136,7 @@ class NativePrefetchOverlapTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "aligned protocol order check failed"):
                     bind_streams(read_trace(path, time_origin=origin))
                 with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 1 if len(affected) == 2 else 0)
+                    self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 0)
                 self.assertEqual(before, path.read_bytes())
                 result = json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8"))["native"]
                 self.assertEqual(result["host_timings"]["all"]["host_callback"]["count"], 5)
@@ -159,6 +159,100 @@ class NativePrefetchOverlapTests(unittest.TestCase):
                 self.assertIn("ORDER_FAILURE_EXAMPLES", summary)
                 self.assertIn('"host_end_minus_wait_end_us": 2.0', summary)
                 self.assertIn("HOST_FUNCTION_TIMES", summary)
+                self.assertIn("OVERLAP_ESTIMATED", summary)
+                self.assertTrue(result["coordinate_estimate"]["estimate_order_mismatches"])
+                self.assertEqual(result["coordinate_estimate"]["mte_order_checks"], result["mte_order_checks"])
+
+    def test_systematic_small_device_offset_keeps_strict_failure_and_separate_coordinate_estimate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, out = Path(temp) / "native", Path(temp) / "analysis_01"
+            path = capture(root, "native")
+            data = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+            for event in data["traceEvents"]:
+                if event.get("ph") == "X" and event["pid"] == "device":
+                    event["ts"] -= 5
+            path.write_text(json.dumps(data, default=str), encoding="utf-8")
+            alignment_path = path.with_name("clock_alignment.json")
+            alignment = json.loads(alignment_path.read_text(encoding="utf-8"))
+            alignment["endpoint_mapping_envelope_width_us"] = ["5", "5"]
+            alignment_path.write_text(json.dumps(alignment), encoding="utf-8")
+            before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 0)
+            self.assertEqual(before, {p: p.read_bytes() for p in root.rglob("*") if p.is_file()})
+            result = json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8"))["native"]
+            self.assertEqual(result["classification"]["unmapped"]["count"], 2)
+            self.assertEqual(sum(not c["valid"] for c in result["mte_order_checks"]), 3)
+            estimate = result["coordinate_estimate"]
+            self.assertEqual(estimate["classification"]["unmapped"]["count"], 0)
+            self.assertEqual(estimate["mte_order_checks"], result["mte_order_checks"])
+            self.assertEqual(estimate["classification"]["late"]["count"], 1)
+            self.assertAlmostEqual(estimate["direct"]["all_samples"]["method1_drop_late"]["mean_us"], 52)
+            # Coordinates retain the 5 us offset; no fitting to the wait/Host constraint.
+            self.assertAlmostEqual(
+                estimate["direct"]["all_samples"]["method2_subtract_remaining_compute"]["mean_us"], 39.75
+            )
+            self.assertAlmostEqual(result["host_only_span"]["prefetch_start_to_reactive_start"]["mean_us"], 93.5)
+            self.assertTrue(all(r["coordinate_estimate_only"] for r in estimate["rows"]))
+            summary = (out / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("条件坐标估算", summary)
+            self.assertNotIn("OVERLAP_COMPLETE", summary)
+
+    def test_large_order_failure_does_not_get_estimated_or_display_zero_improvement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, out = Path(temp) / "native", Path(temp) / "analysis_01"
+            path = capture(root, "native")
+            data = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+            for event in data["traceEvents"]:
+                if event.get("ph") == "X" and event["pid"] == "device":
+                    event["ts"] -= 8
+            path.write_text(json.dumps(data, default=str), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 1)
+            result = json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8"))["native"]
+            self.assertNotIn("coordinate_estimate", result)
+            self.assertEqual(result["classification"]["unmapped"]["count"], 2)
+            summary = (out / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("2/53.500 | — | — | — | — | —", summary)
+
+    def test_coordinate_estimation_does_not_accept_an_unsupported_device_compute_tail(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, out = Path(temp) / "native", Path(temp) / "analysis_01"
+            path = capture(root, "native", bad_tail=True)
+            data = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+            waits = [e for e in data["traceEvents"] if e.get("tid") == "main" and e["name"] == "host_sync_wait_2"]
+            waits[1]["dur"] -= 4
+            path.write_text(json.dumps(data, default=str), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 0)
+            result = json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8"))["native"]
+            estimate = result["coordinate_estimate"]
+            self.assertEqual(result["classification"]["unmapped"]["count"], 2)
+            self.assertEqual(estimate["classification"]["unmapped"]["count"], 1)
+            self.assertEqual(estimate["rows"][0]["reason"], "unsupported_consumer_staging_tail")
+
+    def test_estimate_error_preserves_strict_result_and_host_durations(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, out = Path(temp) / "native", Path(temp) / "analysis_01"
+            path = capture(root, "native")
+            data = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+            waits = [e for e in data["traceEvents"] if e.get("tid") == "main" and e["name"] == "host_sync_wait_2"]
+            waits[1]["dur"] -= 4
+            path.write_text(json.dumps(data, default=str), encoding="utf-8")
+            original = runner.analyze
+
+            def analyze(*args, **kwargs):
+                if kwargs.get("estimate_order_mismatches"):
+                    raise ValueError("synthetic estimate failure")
+                return original(*args, **kwargs)
+
+            with patch.object(runner, "analyze", side_effect=analyze), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 1)
+            result = json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8"))["native"]
+            self.assertEqual(result["host_timings"]["all"]["host_callback"]["count"], 5)
+            self.assertNotIn("coordinate_estimate", result)
+            summary = (out / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("COORDINATE_ESTIMATE_UNAVAILABLE native", summary)
 
     def test_structural_stream_failure_retains_independent_host_statistics(self):
         with tempfile.TemporaryDirectory() as temp:

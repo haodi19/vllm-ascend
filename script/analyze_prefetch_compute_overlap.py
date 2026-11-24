@@ -304,12 +304,21 @@ def host_stage_durations(hosts, stages):
 
 
 def analyze(
-    path, backend="mte", *, profile_report=None, update_backend="python", exact_relative=False, retain_unmapped=False
+    path,
+    backend="mte",
+    *,
+    profile_report=None,
+    update_backend="python",
+    exact_relative=False,
+    retain_unmapped=False,
+    estimate_order_mismatches=False,
 ):
     if backend not in ("mte", "callback"):
         raise ValueError("unknown Host backend")
     if update_backend not in ("python", "native") or (exact_relative and backend != "mte"):
         raise ValueError("unsupported update backend or relative callback analysis")
+    if estimate_order_mismatches and (backend != "mte" or not retain_unmapped or not exact_relative):
+        raise ValueError("coordinate estimates require exact relative MTE analysis with retained strict diagnostics")
     mapping = json.loads(path.with_name("clock_alignment.json").read_text(encoding="utf-8"))
     if (
         mapping.get("status") != "calibration_validated"
@@ -447,8 +456,13 @@ def analyze(
                     "callback_gate_host_order_mismatch" if backend == "callback" else "mte_protocol_host_order_mismatch"
                 )
                 row["invalid_gate_roles"] = invalid
-                reasons[row["reason"]] += 1
-                continue
+                if not estimate_order_mismatches:
+                    reasons[row["reason"]] += 1
+                    continue
+                # Separate, explicitly conditional coordinate estimate. The
+                # strict result and failed protocol checks remain unchanged.
+                row["coordinate_estimate_only"] = True
+                row["order_warning"] = row.pop("reason")
         pub = reactive_pairs[rindex][0]
         start = positions[reactive_pairs[rindex - 1][1]["index"]] + 1 if rindex else 0
         segment = tasks[start : positions[pub["index"]]]
@@ -588,6 +602,7 @@ def analyze(
     return dict(
         backend=backend,
         update_backend=update_backend,
+        estimate_order_mismatches=estimate_order_mismatches,
         time_arithmetic="decimal epoch subtraction then relative float" if exact_relative else "absolute float",
         host_timings=host_timings,
         host_timing_expected_counts=host_timing_counts,
