@@ -18,12 +18,12 @@ def _reject_constant(value):
 class _TraceReader:
     """Bound memory by one JSON value, rather than the complete event array."""
 
-    def __init__(self, source):
+    def __init__(self, source, *, parse_float=float):
         self.source = source
         self.buffer = ""
         self.offset = 0
         self.eof = False
-        self.decoder = json.JSONDecoder(parse_constant=_reject_constant)
+        self.decoder = json.JSONDecoder(parse_constant=_reject_constant, parse_float=parse_float)
 
     def fill(self):
         self.buffer = self.buffer[self.offset :]
@@ -91,10 +91,10 @@ class _TraceReader:
                 raise ValueError("时间线数组不能包含尾随逗号")
 
 
-def events(path):
+def events(path, *, parse_float=float):
     """流式读取根数组或 traceEvents 对象；遍历结束时验证整个 JSON 已闭合。"""
     with path.open(encoding="utf-8-sig") as source:
-        reader = _TraceReader(source)
+        reader = _TraceReader(source, parse_float=parse_float)
         first = reader.peek()
         if first == "[":
             yield from reader.event_array()

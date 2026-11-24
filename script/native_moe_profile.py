@@ -13,6 +13,7 @@ from align_moe_profile_clock import align_capture
 from export_moe_aligned_profile import publish_aligned_capture
 from inspect_moe_profile import scan_trace
 from inspect_moe_profiler_clocks import discover_roots
+from inspect_native_profile_nesting import audit_host_nesting
 from moe_host_memory import after_service_memory, check_host_memory, log_memory
 from moe_tpot import streaming_completion
 from run_verified_cpp_tests import ensure_profile_storage, request, wait_profile
@@ -77,6 +78,16 @@ def profile_command(command, directory, timing_port):
 def analyze_profile(trace, case, expected_count, stream_name, report):
     scan = scan_trace(trace, require_mte=True)
     if not scan["usable"] or scan["host_callbacks"] != expected_count:
+        report(
+            "PROFILE_CHECK "
+            + json.dumps(
+                {key: scan[key] for key in ("json_complete", "host_callbacks", "updates", "nesting", "issues")}
+            )
+        )
+        try:
+            report("HOST_NESTING_AUDIT " + json.dumps(audit_host_nesting(trace), ensure_ascii=False))
+        except Exception as exc:
+            report(f"HOST_NESTING_AUDIT_FAILED {type(exc).__name__}: {exc}")
         raise RuntimeError(f"Incomplete profile: callbacks={scan['host_callbacks']}/{expected_count}; {scan['issues']}")
     for row in scan["host_gaps"]:
         report("HOST_CALLBACK_GAP " + case + " " + json.dumps(row, ensure_ascii=False))
