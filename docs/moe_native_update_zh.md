@@ -49,15 +49,40 @@ python -u -B script/run_native_moe_compare.py \
 
 每份采集使用同次请求前后的 Add 校准，留出样本验证通过后发布对齐的 JSON 和数据库。MindStudio 导入 `profile/python/` 或 `profile/native/` 下的 `*_ascend_pt` 文件夹；`summary.txt` 会打印精确路径。MSTX 通过 [C 接口](https://www.hiascend.com/document/detail/en/mindstudio/2610/SDK/mstxAPIReference/docs/en/api_reference/Common/mstxRangeStartA.md) 在工作线程打点，无 Python/GIL；控制 HTTP 线程和冷启动校准仍是 Python。原生小图额外验证持有 GIL 时启用 C MSTX 的任务仍能完成。诊断插桩开销只存在于独立采集服务，不能用 profile 请求时延替换无插桩主时延。
 
+若两组时延已完成、profile 因空间不足等原因未取得，可只续采。先保证新输出目录所在文件系统至少有 20 GiB 可用空间，再执行：
+
+```bash
+python -u -B script/run_native_moe_compare.py \
+  --npu 7 --port 8156 --timing-port 18156 \
+  --profile-only-from /data/w00919836/moeoffload/bench_results/native_update_06 \
+  --output-dir /data/w00919836/moeoffload/bench_results/native_profile_01
+```
+
+续采读取原保存的两组启动命令、已完成请求及库路径，不重新编译、不重新做 20 次时延测试，也不重新解析当前 `test_graph2.sh`；每组仍启动模型、预热后采集。`max_tokens` 从原请求恢复，使用原环境和原物理卡执行。原报告不变，新 `summary.txt` 以 `TIMING_SOURCE` 标明沿用的历史时延，合并新采的 Host 间隔、空泡和可视化路径。续采与原计时不是同时进行，服务器状态可能不同；原数据缺组、输出不一致或库已丢失会停止，不以部分结果拼出对照。可把新输出目录改到另一个有空间的挂载盘，不能仅在同一满盘上换个目录名。
+
 复核同事的 `vllm-ascend` 提交 `c441874` 中 `prepared_h2d.py`：布局相同复用，否则一次性整理，再导出固定地址表；`native_submission.py` 还使用独立 DMA 通道、线程配置和依赖调度。我们参考前者，保留现有普通加载流与严格完成协议，没有把后者混入本次对照。对方 CPU MoE 的收益不能直接作为本项目的收益。
 
-2026-11-24 复核 `native_update_05`：两组各 20 次正式请求、输出一致，但未采 profile。Python/native 的 decode raw 均值为 151.937/162.576 ms，TPOT 为 37.984/40.644 ms/token；IQR 后 decode 为 148.445/153.739 ms。HTTP 均值为 3569.273/12416.579 ms，TTFT 为 3417.158/12253.835 ms。主要退化在首 token 之前，不能归为已取得优化收益，也不能从这些数值推断 Host 间隔和空泡。本次保留原 prefill scale 布局、补齐原生采集后重新验证；实际性能尚待绿区执行。
+2026-11-24 复核 `native_update_05`：两组各 20 次正式请求、输出一致，但未采 profile。Python/native 的 decode raw 均值为 151.937/162.576 ms，TPOT 为 37.984/40.644 ms/token；IQR 后 decode 为 148.445/153.739 ms。HTTP 均值为 3569.273/12416.579 ms，TTFT 为 3417.158/12253.835 ms。主要退化在首 token 之前，不能归为已取得优化收益，也不能从这些数值推断 Host 间隔和空泡。后续修正保留原 prefill scale 布局，并补齐原生采集；复测结果见下文。
 
 ## 验证状态
 
-2026-11-24：`native_update_06` 在构建 MTE 核时停止，`aic_obj/aiv_obj` 未重新编译，后续 `ld.lld` 对已有 `handshake.cpp.o` 报 `unknown file type`。这与早期阶段记录的复用目录失败同类，尚未执行模型或性能测试；仅凭日志不能确定对象文件为何不可识别。脚本已改为每次保留新的构建子目录，避免复用中间对象，新增目录隔离与旧文件保留回归。
+随后返回的完整时延日志仍标记为 `native_update_06`，使用新构建目录 `build_01`，构建及 NPU 小图检查全部通过。每组 5 次预热、20 次正式请求，输出均为 5 token，摘要与用量一致。无 profiler/MSTX 的结果如下；对照是 MTE Python 更新与 MTE 原生 C++ 更新，不是早期 launch-host-function 回调。
 
-2026-11-24：本地重编译原生 C++ 扩展，相关八组 CPU/离线回归共 120 项，117 项通过、3 项平台相关跳过。新增覆盖原 prefill 缓冲布局保持、独立采集配置不污染主计时命令、原生计数器、采集失败清理、Host 标记覆盖核验、精确选流及 Transpose 占用空泡统计。定向 Ruff 通过；完整 `format.sh ci` 因本地缺少 pre-commit 未完成。本轮原生 C MSTX 和恢复原 prefill 布局的实际 NPU 效果仍须绿区执行，脚本会在模型启动前先检查小图。
+| 指标 | MTE Python 更新 | MTE native 更新 | 降低 |
+| --- | ---: | ---: | ---: |
+| Decode 均值，ms | 149.154 | 123.746 | 17.03% |
+| TPOT 均值，ms/token | 37.289 | 30.936 | 17.03% |
+| TTFT 均值，ms | 3454.910 | 3421.619 | 0.96% |
+| HTTP E2E 均值，ms | 3604.243 | 3545.555 | 1.63% |
+| Decode 3×IQR 后均值，ms | 145.185（18/20） | 123.746（20/20） | 14.77% |
+
+Python/native 的 decode 标准差分别为 14.574/1.828 ms，原始范围分别为 137.530～194.444 / 121.275～127.241 ms。两组原始样本范围未重叠，过滤 Python 两个长尾后仍有收益；但仍是顺序运行的单对服务，不能代替交错复测或把全部收益单独归于 GIL。上一轮 TTFT 大幅退化本次未复现，与恢复 prefill 源布局的修正方向一致，尚不构成单因素根因证明。
+
+原生实际执行标记出现，43 层额外 scale 缓冲为 8657043456 字节（8.0625 GiB），复用为 0。本轮 profile 在启动第一组采集服务前因结果盘仅剩 0.70 GiB、低于 20 GiB 门槛而停止，所以没有本轮 Host 间隔或 memcpy 空泡数值，不能声称空泡已消除。无采集时延与输出一致性数据保留有效。
+
+此前的 `native_update_06` 尝试在构建 MTE 核时停止，`aic_obj/aiv_obj` 未重新编译，后续 `ld.lld` 对已有 `handshake.cpp.o` 报 `unknown file type`。这与早期阶段记录的复用目录失败同类，当次尚未执行模型或性能测试；仅凭日志不能确定对象文件为何不可识别。脚本已改为每次保留新的构建子目录，避免复用中间对象，新增目录隔离与旧文件保留回归；上方复测已通过构建。
+
+2026-11-24：本地重编译原生 C++ 扩展，相关八组 CPU/离线回归共 120 项，117 项通过、3 项平台相关跳过。新增覆盖原 prefill 缓冲布局保持、独立采集配置不污染主计时命令、原生计数器、采集失败清理、Host 标记覆盖核验、精确选流及 Transpose 占用空泡统计。定向 Ruff 通过；完整 `format.sh ci` 因本地缺少 pre-commit 未完成。上方复测通过 NPU 小图检查并取得时延结果，真实模型的 Host 间隔和加载流空泡仍待续采。
 
 本地 Windows CPU 环境可以编译、加载两个 C++ 扩展，并验证原生线程在 Python 持有 GIL 时独立完成、错误不发布成功、重复请求读取新输入、预取上限和 LRC 状态一致性。随机序列测试比较 200 次更新的驻留集合与实际槽位字节。已有工作线程、生命周期、C++ LRC 和延后等待回归保留。
 

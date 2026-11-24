@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -20,6 +21,114 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
+    def saved_timing_fixture(self, directory, tokens=128):
+        library = directory / "libhost_sync_device.so"
+        library.write_bytes(b"test library; never loaded")
+        source = "vllm serve /model --port 8155 --additional-config " + shlex.quote(
+            '{"expert_offload_config":{"num_device_experts":24}}'
+        )
+        records = []
+        for case in ("python", "native"):
+            command = runner.service_command(source, case, library, 8156)
+            (directory / f"{case}_command.json").write_text(json.dumps(command), encoding="utf-8")
+            sample = dict(
+                digest="same",
+                usage=dict(completion_tokens=tokens),
+                completion_tokens=tokens,
+                content_chunks=3,
+                decode_us=2000,
+                ttft_us=3000,
+                output_latency_us=5000,
+                tpot_us=2000 / (tokens - 1),
+                http_wall_us=5100,
+            )
+            records.append(dict(case=case, requests=2, output_match=True, stream_samples=[sample, sample]))
+        (directory / "summary.txt").write_text(
+            "\n".join("RESULT " + json.dumps(row) for row in records) + "\nFAILED profile disk full\n", encoding="utf-8"
+        )
+        return records
+
+    def test_profile_continuation_keeps_saved_settings_and_does_not_rebuild_or_retime(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "timing"
+            source.mkdir()
+            self.saved_timing_fixture(source)
+            output = Path(temporary) / "continued"
+            argv = [
+                "runner",
+                "--npu",
+                "7",
+                "--port",
+                "8158",
+                "--profile-only-from",
+                str(source),
+                "--test-script",
+                "must-not-read.sh",
+                "--output-dir",
+                str(output),
+            ]
+            original = (source / "summary.txt").read_bytes()
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(sys, "platform", "linux"),
+                patch("run_verified_cpp_tests.ensure_profile_storage"),
+                patch("native_moe_profile.profile_cases") as profiles,
+                patch.object(runner.subprocess, "Popen") as popen,
+                patch.object(runner.subprocess, "run") as run,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(runner.main(), 0)
+            popen.assert_not_called()
+            run.assert_not_called()
+            args, commands = profiles.call_args.args[:2]
+            self.assertEqual(args.max_tokens, 128)
+            self.assertEqual(set(commands), {"python", "native"})
+            for command in commands.values():
+                self.assertEqual(command[command.index("--port") + 1], "8158")
+                config = json.loads(command[command.index("--additional-config") + 1])
+                self.assertEqual(config["expert_offload_config"]["num_device_experts"], 24)
+            self.assertEqual((source / "summary.txt").read_bytes(), original)
+            summary = (output / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("TIMING_SOURCE=", summary)
+            self.assertIn("| native |", summary)
+
+    def test_profile_continuation_rejects_incomplete_and_mismatched_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            records = self.saved_timing_fixture(directory)
+            summary = directory / "summary.txt"
+            for invalid in (records[:1], records + records[:1]):
+                summary.write_text("\n".join("RESULT " + json.dumps(row) for row in invalid), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    runner.load_completed_timing_run(directory, 8156)
+            records[1]["stream_samples"][0]["digest"] = "different"
+            summary.write_text("\n".join("RESULT " + json.dumps(row) for row in records), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "outputs/usage"):
+                runner.load_completed_timing_run(directory, 8156)
+
+    def test_profile_continuation_rejects_missing_library(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self.saved_timing_fixture(directory)
+            (directory / "libhost_sync_device.so").unlink()
+            with self.assertRaisesRegex(FileNotFoundError, "handshake library"):
+                runner.load_completed_timing_run(directory, 8156)
+
+    def test_profile_continuation_checks_disk_before_starting_services(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            self.saved_timing_fixture(directory)
+            output = directory / "continuation"
+            output.mkdir()
+            args = SimpleNamespace(profile_only_from=directory, port=8156, npu=7, warmup_requests=5, profile_requests=1)
+            with (
+                patch("run_verified_cpp_tests.ensure_profile_storage", side_effect=RuntimeError("disk full")),
+                patch("native_moe_profile.profile_cases") as profiles,
+                self.assertRaisesRegex(RuntimeError, "disk full"),
+            ):
+                runner.continue_profile(args, output, {}, lambda _: None)
+            profiles.assert_not_called()
+
     def test_handshake_rebuild_uses_fresh_directory_and_retains_old_objects(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory) / "persistent_build"

@@ -102,6 +102,79 @@ def timing_row(case, timing, e2e_mean_ms):
     return f"| {case} | {' | '.join(values)} | {e2e_mean_ms:.3f} |"
 
 
+def load_completed_timing_run(directory, port):
+    """Read both completed cases; never treat partial samples as a baseline."""
+    records, commands = {}, {}
+    with (directory / "summary.txt").open(encoding="utf-8") as source:
+        for line in source:
+            if line.startswith("RESULT "):
+                row = json.loads(line[len("RESULT ") :])
+                case = row["case"]
+                if case in records:
+                    raise ValueError(f"Duplicate timing result for {case}")
+                records[case] = row
+    if set(records) != {"python", "native"}:
+        raise ValueError("Profile continuation requires completed Python and native timing results")
+    reference = None
+    for case in ("python", "native"):
+        row = records[case]
+        samples = row["stream_samples"]
+        if not samples or len(samples) != row["requests"] or row.get("output_match") is not True:
+            raise ValueError(f"Incomplete timing samples for {case}")
+        outputs = [(sample["digest"], sample["usage"]) for sample in samples]
+        if any(output != outputs[0] for output in outputs) or (reference is not None and outputs != reference):
+            raise ValueError("Saved timing outputs/usage do not match")
+        reference = outputs
+        command = json.loads((directory / f"{case}_command.json").read_text(encoding="utf-8"))
+        if not isinstance(command, list) or not all(isinstance(word, str) for word in command):
+            raise ValueError("Saved command must be a string argv list")
+        if command[1:4] != ["-m", "vllm.entrypoints.cli.main", "serve"]:
+            raise ValueError("Saved command is not a native comparison vLLM service")
+        if Path(command[0]).resolve() != Path(sys.executable).resolve():
+            raise ValueError("Activate the original Python environment before continuing profiling")
+        config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
+        if (
+            config.get("host_update_backend") != case
+            or config.get("host_sync_backend") != "mte"
+            or config.get("callback_timing_port")
+            or config.get("callback_mstx_enabled")
+            or "--profiler-config" in command
+        ):
+            raise ValueError("Saved command does not describe an unprofiled Python/native MTE timing case")
+        if not Path(config["host_sync_library"]).is_file():
+            raise FileNotFoundError(f"Saved handshake library is missing: {config['host_sync_library']}")
+        command[command.index("--port") + 1] = str(port)
+        commands[case] = command
+    tokens = reference[0][1]["completion_tokens"]
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 1:
+        raise ValueError("Saved output token count is invalid")
+    return records, commands, reference, tokens
+
+
+def continue_profile(args, root, env, report):
+    from native_moe_profile import profile_cases
+    from run_verified_cpp_tests import ensure_profile_storage
+
+    source = args.profile_only_from.resolve(strict=True)
+    records, commands, reference, args.max_tokens = load_completed_timing_run(source, args.port)
+    report(f"TIMING_SOURCE={source}; completed earlier; timing requests and builds are NOT repeated")
+    report(
+        f"PROFILE_ONLY: max_tokens={args.max_tokens} from saved samples; physical_npu={args.npu}; "
+        f"warmups={args.warmup_requests}; profile_requests={args.profile_requests}"
+    )
+    for case in ("python", "native"):
+        report("RESULT " + json.dumps(records[case]))
+        (root / f"{case}_command.json").write_text(json.dumps(commands[case]), encoding="utf-8")
+    report("| Version | Decode mean ms (primary) | TTFT mean ms | TPOT mean ms/token | HTTP E2E mean ms |")
+    report("| --- | ---: | ---: | ---: | ---: |")
+    for case in ("python", "native"):
+        samples = records[case]["stream_samples"]
+        report(timing_row(case, summarize_streams(samples), statistics.mean(s["http_wall_us"] / 1000 for s in samples)))
+    ensure_profile_storage(root, stage="before profile continuation; no model started")
+    profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, reference)
+    return 0
+
+
 def report_service_failure(case, log_path, samples, completed, proc, exc, report):
     """Preserve failure evidence before cleanup adds secondary shutdown errors."""
     report(
@@ -181,6 +254,11 @@ def main():
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--library", type=Path, help="existing handshake library, required with --skip-build")
     parser.add_argument("--skip-profile", action="store_true", help="Timing only; omit separate diagnostic services")
+    parser.add_argument(
+        "--profile-only-from",
+        type=Path,
+        help="Continue profiling from completed saved timing results; no build or retiming",
+    )
     parser.add_argument("--timing-port", type=int, default=18156)
     parser.add_argument("--profile-timeout", type=int, default=180)
     parser.add_argument(
@@ -193,6 +271,8 @@ def main():
         help="Persistent parent for fresh numbered handshake builds, independent of results",
     )
     args = parser.parse_args()
+    if args.profile_only_from and (args.skip_profile or args.skip_build or args.library):
+        parser.error("--profile-only-from uses saved commands/libraries; do not combine with skip/library switches")
     if sys.platform != "linux" or args.npu < 0 or min(args.max_tokens, args.requests, args.warmup_requests) < 1:
         parser.error("requires Linux, a non-negative NPU and positive request/token counts")
     if not 1 <= args.port <= 65535:
@@ -241,6 +321,8 @@ def main():
             return json.load(response)
 
     try:
+        if args.profile_only_from:
+            return continue_profile(args, root, env, report)
         report(
             "MTE Python update -> MTE native update; same cache/config; timed requests have no profiler/MSTX. "
             "Native graph replay only; original eager/prefill. This is initial correctness/performance validation."
