@@ -37,7 +37,7 @@ python -u -B script/run_native_moe_compare.py \
 
 依次执行：构建两个 CPU 扩展；读取当前逻辑卡 0 的实际型号并构建匹配的 MTE 核；运行 CPU 回归；用小张量验证连续/转置/MXFP4 布局 scale 的字节拷贝和 pinned 复用；运行真实 NPU 图的 D2H→publish→原生搬运→严格 wait→映射 H2D 测试；原 MTE 组合配置与原生更新配置各启动一个服务，5 次预热、20 次正式请求。两组只有 `host_update_backend` 不同，计时服务不启用 profiler/MSTX。随后分别另起诊断服务，各预热 5 次、采集 1 次请求，统计 Host 间隔和加载流空泡。共启动四个串行服务；可用 `--skip-profile` 只测时延。
 
-握手库默认构建在项目的 `build/native_moe_handshake/lib/libhost_sync_device.so`，不依赖临时结果目录。修改 C++ 后需让脚本重编译，不使用 `--skip-build`；此步骤只编译两个小扩展和握手核，不重新安装整个 Ascend 插件。
+握手库默认构建在项目的 `build/native_moe_handshake/build_01/lib/libhost_sync_device.so`，之后构建使用未占用的 `build_02` 等子目录，不依赖临时结果目录。`summary.txt` 的 `HANDSHAKE_LIBRARY` 打印本轮精确路径。旧产物全部保留，避免 CANN 重用已合并的对象文件；`--build-dir` 指定这些新子目录的父目录。修改 C++ 后需让脚本重编译，不使用 `--skip-build`；此步骤只编译两个小扩展和握手核，不重新安装整个 Ascend 插件。
 
 小图使用禁止调用的 Python 回调作为兜底哨兵，验证重复输入、miss、淘汰后的权重/scale/映射内容；Python 持有 GIL 忙等期间，必须观察到至少一次尚未完成的原生任务完成。无法形成该观测则报验证不充分，不假报通过。该测试在独立子进程运行，严格等待失败后终止子进程，不继续模型测试。
 
@@ -54,6 +54,8 @@ python -u -B script/run_native_moe_compare.py \
 2026-11-24 复核 `native_update_05`：两组各 20 次正式请求、输出一致，但未采 profile。Python/native 的 decode raw 均值为 151.937/162.576 ms，TPOT 为 37.984/40.644 ms/token；IQR 后 decode 为 148.445/153.739 ms。HTTP 均值为 3569.273/12416.579 ms，TTFT 为 3417.158/12253.835 ms。主要退化在首 token 之前，不能归为已取得优化收益，也不能从这些数值推断 Host 间隔和空泡。本次保留原 prefill scale 布局、补齐原生采集后重新验证；实际性能尚待绿区执行。
 
 ## 验证状态
+
+2026-11-24：`native_update_06` 在构建 MTE 核时停止，`aic_obj/aiv_obj` 未重新编译，后续 `ld.lld` 对已有 `handshake.cpp.o` 报 `unknown file type`。这与早期阶段记录的复用目录失败同类，尚未执行模型或性能测试；仅凭日志不能确定对象文件为何不可识别。脚本已改为每次保留新的构建子目录，避免复用中间对象，新增目录隔离与旧文件保留回归。
 
 2026-11-24：本地重编译原生 C++ 扩展，相关八组 CPU/离线回归共 120 项，117 项通过、3 项平台相关跳过。新增覆盖原 prefill 缓冲布局保持、独立采集配置不污染主计时命令、原生计数器、采集失败清理、Host 标记覆盖核验、精确选流及 Transpose 占用空泡统计。定向 Ruff 通过；完整 `format.sh ci` 因本地缺少 pre-commit 未完成。本轮原生 C MSTX 和恢复原 prefill 布局的实际 NPU 效果仍须绿区执行，脚本会在模型启动前先检查小图。
 

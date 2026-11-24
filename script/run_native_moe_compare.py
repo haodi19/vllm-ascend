@@ -68,6 +68,20 @@ def handshake_configure_command(build, cann_root, soc):
     ]
 
 
+def fresh_handshake_build(parent):
+    """Keep artifacts outside results, but never reuse AscendC merge objects."""
+    parent = Path(parent).resolve()
+    parent.mkdir(parents=True, exist_ok=True)
+    number = 1
+    while True:
+        candidate = parent / f"build_{number:02d}"
+        try:
+            candidate.mkdir()
+            return candidate
+        except FileExistsError:
+            number += 1
+
+
 def report_failed_step(log_path, start_offset, report):
     """Keep the last failing command visible without copying a whole build log."""
     with log_path.open("rb") as log:
@@ -176,7 +190,7 @@ def main():
         "--build-dir",
         type=Path,
         default=ROOT / "build/native_moe_handshake",
-        help="Persistent handshake build directory, independent of results",
+        help="Persistent parent for fresh numbered handshake builds, independent of results",
     )
     args = parser.parse_args()
     if sys.platform != "linux" or args.npu < 0 or min(args.max_tokens, args.requests, args.warmup_requests) < 1:
@@ -251,6 +265,14 @@ def main():
             wait_port_free(args.timing_port)
         report(f"PASS initial port check: {args.port}")
         if not args.skip_build:
+            # CANN merge_obj_text may rewrite intermediate .o files in place.
+            # Reusing those objects has produced 'unknown file type' on rebuild.
+            # Reserve a new directory; retain all previous artifacts/evidence.
+            build = fresh_handshake_build(args.build_dir)
+            library = build / "lib/libhost_sync_device.so"
+            commands = {case: service_command(source, case, library, args.port) for case in ("python", "native")}
+            report(f"HANDSHAKE_BUILD={build}; fresh directory; existing builds retained")
+            report(f"HANDSHAKE_LIBRARY={library}; persistent path outside experiment results")
             for extension in ("lrc_policy", "host_sync"):
                 step(
                     f"build {extension}",

@@ -20,6 +20,44 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
+    def test_handshake_rebuild_uses_fresh_directory_and_retains_old_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "persistent_build"
+            parent.mkdir()
+            stale = parent / "handshake.cpp.o"
+            stale.write_bytes(b"previous merge output")
+            first = runner.fresh_handshake_build(parent)
+            (first / "handshake.cpp.o").write_bytes(b"first build evidence")
+            # An occupied filename is also skipped; it is never replaced.
+            (parent / "build_02").write_text("reserved", encoding="utf-8")
+            second = runner.fresh_handshake_build(parent)
+            self.assertEqual(first.name, "build_01")
+            self.assertEqual(second.name, "build_03")
+            self.assertEqual(list(second.iterdir()), [])
+            self.assertEqual(stale.read_bytes(), b"previous merge output")
+            self.assertEqual((first / "handshake.cpp.o").read_bytes(), b"first build evidence")
+            for build in (first, second):
+                command = runner.handshake_configure_command(build, Path("cann root"), "ascend950pr_957c")
+                self.assertEqual(command[command.index("-B") + 1], str(build))
+                words = runner.service_command(
+                    (ROOT / "script/test_graph2.sh").read_text(encoding="utf-8"),
+                    "native",
+                    build / "lib/libhost_sync_device.so",
+                    8156,
+                )
+                config = json.loads(words[words.index("--additional-config") + 1])
+                self.assertEqual(
+                    config["expert_offload_config"]["host_sync_library"], str(build / "lib/libhost_sync_device.so")
+                )
+
+    def test_fresh_handshake_build_creates_missing_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory) / "build" / "handshake"
+            created = runner.fresh_handshake_build(parent)
+            self.assertEqual(created.parent, parent.resolve())
+            self.assertEqual(created.name, "build_01")
+            self.assertTrue(created.is_dir())
+
     def test_port_check_rejects_live_listener_and_accepts_released_port(self):
         with socket.socket() as server:
             server.bind(("127.0.0.1", 0))
