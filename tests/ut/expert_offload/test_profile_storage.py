@@ -48,6 +48,37 @@ class ProfileStorageTests(unittest.TestCase):
             ):
                 self.module.ensure_profile_storage(Path.cwd(), stage="test")
 
+    def test_custom_threshold_allows_seven_gib_without_changing_default(self):
+        with (
+            patch.object(self.module.shutil, "disk_usage", return_value=SimpleNamespace(free=7 * 1024**3)),
+            patch.object(
+                self.module.os, "statvfs", return_value=SimpleNamespace(f_files=100, f_favail=90), create=True
+            ),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            self.module.ensure_profile_storage(Path.cwd(), stage="test", min_free_gib=5)
+            with self.assertRaisesRegex(RuntimeError, "required=20 GiB"):
+                self.module.ensure_profile_storage(Path.cwd(), stage="test")
+        self.assertIn("required=5 GiB", output.getvalue())
+
+    def test_custom_threshold_still_rejects_low_space_and_no_inodes(self):
+        for free, inodes in ((4, 90), (7, 0)):
+            with (
+                self.subTest(free=free, inodes=inodes),
+                patch.object(self.module.shutil, "disk_usage", return_value=SimpleNamespace(free=free * 1024**3)),
+                patch.object(
+                    self.module.os, "statvfs", return_value=SimpleNamespace(f_files=100, f_favail=inodes), create=True
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaisesRegex(RuntimeError, "required=5 GiB"),
+            ):
+                self.module.ensure_profile_storage(Path.cwd(), stage="test", min_free_gib=5)
+
+    def test_invalid_threshold_rejected(self):
+        for minimum in (0, -1, float("nan"), float("inf")):
+            with self.subTest(minimum=minimum), self.assertRaises(ValueError):
+                self.module.ensure_profile_storage(Path.cwd(), stage="test", min_free_gib=minimum)
+
 
 if __name__ == "__main__":
     unittest.main()

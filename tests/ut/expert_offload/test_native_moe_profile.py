@@ -46,7 +46,13 @@ def fixture():
 class NativeProfileTests(unittest.TestCase):
     def test_profile_request_failure_stops_owned_service(self):
         args = SimpleNamespace(
-            port=8156, timing_port=18156, startup_timeout=60, max_tokens=5, warmup_requests=1, request_timeout=60
+            port=8156,
+            timing_port=18156,
+            startup_timeout=60,
+            max_tokens=5,
+            warmup_requests=1,
+            request_timeout=60,
+            min_profile_free_gib=5,
         )
         command = ["python", "--additional-config", '{"expert_offload_config":{}}']
         child = Mock()
@@ -54,7 +60,7 @@ class NativeProfileTests(unittest.TestCase):
         stop = Mock()
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch.object(profile, "ensure_profile_storage"),
+            patch.object(profile, "ensure_profile_storage") as storage,
             patch.object(profile.subprocess, "Popen", return_value=child),
             patch.object(profile, "request", side_effect=[dict(data=[dict(id="model")]), dict(mstx_enabled=True)]),
             patch.object(profile, "streaming_completion", side_effect=TimeoutError("request timeout")),
@@ -64,6 +70,9 @@ class NativeProfileTests(unittest.TestCase):
             profile.profile_cases(args, {"python": command}, Path(directory), {}, lambda _: None, Mock(), stop, [])
         stop.assert_called_once_with(child)
         align.assert_not_called()
+        storage.assert_called_once_with(
+            Path(directory) / "profile/python", stage="before python profile service", min_free_gib=5
+        )
 
     def test_native_control_uses_native_counters_and_leaves_callbacks_unwrapped(self):
         timing = runpy.run_path(str(ROOT / "vllm_ascend/expert_offload/callback_timing.py"))

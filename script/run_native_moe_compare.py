@@ -25,6 +25,7 @@ from pathlib import Path
 
 from moe_tpot import streaming_completion, summarize_streams
 from run_host_sync_stage2 import target_cmake_args
+from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB
 
 ROOT = Path(__file__).resolve().parents[1]
 PORT_RELEASE_TIMEOUT = 10
@@ -170,7 +171,9 @@ def continue_profile(args, root, env, report):
     for case in ("python", "native"):
         samples = records[case]["stream_samples"]
         report(timing_row(case, summarize_streams(samples), statistics.mean(s["http_wall_us"] / 1000 for s in samples)))
-    ensure_profile_storage(root, stage="before profile continuation; no model started")
+    ensure_profile_storage(
+        root, stage="before profile continuation; no model started", min_free_gib=args.min_profile_free_gib
+    )
     profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, reference)
     return 0
 
@@ -262,6 +265,12 @@ def main():
     parser.add_argument("--timing-port", type=int, default=18156)
     parser.add_argument("--profile-timeout", type=int, default=180)
     parser.add_argument(
+        "--min-profile-free-gib",
+        type=float,
+        default=MIN_PROFILE_FREE_GIB,
+        help="Minimum free GiB before each profile service (default: 20); not a profile size limit",
+    )
+    parser.add_argument(
         "--bubble-stream-name", default="Stream 56", help="Exact visualization stream name, never guessed"
     )
     parser.add_argument(
@@ -271,6 +280,8 @@ def main():
         help="Persistent parent for fresh numbered handshake builds, independent of results",
     )
     args = parser.parse_args()
+    if not 0 < args.min_profile_free_gib < float("inf"):
+        parser.error("--min-profile-free-gib must be positive and finite")
     if args.profile_only_from and (args.skip_profile or args.skip_build or args.library):
         parser.error("--profile-only-from uses saved commands/libraries; do not combine with skip/library switches")
     if sys.platform != "linux" or args.npu < 0 or min(args.max_tokens, args.requests, args.warmup_requests) < 1:
@@ -321,6 +332,10 @@ def main():
             return json.load(response)
 
     try:
+        if not args.skip_profile:
+            report(
+                f"PROFILE_STORAGE: minimum_free_gib={args.min_profile_free_gib:g}; checked before each profile service"
+            )
         if args.profile_only_from:
             return continue_profile(args, root, env, report)
         report(

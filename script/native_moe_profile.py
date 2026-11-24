@@ -88,7 +88,9 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
     for case, original in commands.items():
         directory = root / "profile" / case
         directory.mkdir(parents=True)
-        ensure_profile_storage(directory, stage=f"before {case} profile service")
+        ensure_profile_storage(
+            directory, stage=f"before {case} profile service", min_free_gib=args.min_profile_free_gib
+        )
         wait_port_free(args.port)
         wait_port_free(args.timing_port)
         command = profile_command(original, directory, args.timing_port)

@@ -60,6 +60,8 @@ class NativeRunnerTests(unittest.TestCase):
                 "7",
                 "--port",
                 "8158",
+                "--min-profile-free-gib",
+                "5",
                 "--profile-only-from",
                 str(source),
                 "--test-script",
@@ -71,7 +73,7 @@ class NativeRunnerTests(unittest.TestCase):
             with (
                 patch.object(sys, "argv", argv),
                 patch.object(sys, "platform", "linux"),
-                patch("run_verified_cpp_tests.ensure_profile_storage"),
+                patch("run_verified_cpp_tests.ensure_profile_storage") as storage,
                 patch("native_moe_profile.profile_cases") as profiles,
                 patch.object(runner.subprocess, "Popen") as popen,
                 patch.object(runner.subprocess, "run") as run,
@@ -82,6 +84,10 @@ class NativeRunnerTests(unittest.TestCase):
             run.assert_not_called()
             args, commands = profiles.call_args.args[:2]
             self.assertEqual(args.max_tokens, 128)
+            self.assertEqual(args.min_profile_free_gib, 5)
+            storage.assert_called_once_with(
+                output.resolve(), stage="before profile continuation; no model started", min_free_gib=5
+            )
             self.assertEqual(set(commands), {"python", "native"})
             for command in commands.values():
                 self.assertEqual(command[command.index("--port") + 1], "8158")
@@ -120,7 +126,14 @@ class NativeRunnerTests(unittest.TestCase):
             self.saved_timing_fixture(directory)
             output = directory / "continuation"
             output.mkdir()
-            args = SimpleNamespace(profile_only_from=directory, port=8156, npu=7, warmup_requests=5, profile_requests=1)
+            args = SimpleNamespace(
+                profile_only_from=directory,
+                port=8156,
+                npu=7,
+                warmup_requests=5,
+                profile_requests=1,
+                min_profile_free_gib=20,
+            )
             with (
                 patch("run_verified_cpp_tests.ensure_profile_storage", side_effect=RuntimeError("disk full")),
                 patch("native_moe_profile.profile_cases") as profiles,

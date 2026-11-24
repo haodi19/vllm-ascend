@@ -49,7 +49,7 @@ python -u -B script/run_native_moe_compare.py \
 
 每份采集使用同次请求前后的 Add 校准，留出样本验证通过后发布对齐的 JSON 和数据库。MindStudio 导入 `profile/python/` 或 `profile/native/` 下的 `*_ascend_pt` 文件夹；`summary.txt` 会打印精确路径。MSTX 通过 [C 接口](https://www.hiascend.com/document/detail/en/mindstudio/2610/SDK/mstxAPIReference/docs/en/api_reference/Common/mstxRangeStartA.md) 在工作线程打点，无 Python/GIL；控制 HTTP 线程和冷启动校准仍是 Python。原生小图额外验证持有 GIL 时启用 C MSTX 的任务仍能完成。诊断插桩开销只存在于独立采集服务，不能用 profile 请求时延替换无插桩主时延。
 
-若两组时延已完成、profile 因空间不足等原因未取得，可只续采。先保证新输出目录所在文件系统至少有 20 GiB 可用空间，再执行：
+若两组时延已完成、profile 因空间不足等原因未取得，可只续采。默认要求新输出目录所在文件系统至少有 20 GiB 可用空间，再执行：
 
 ```bash
 python -u -B script/run_native_moe_compare.py \
@@ -59,6 +59,8 @@ python -u -B script/run_native_moe_compare.py \
 ```
 
 续采读取原保存的两组启动命令、已完成请求及库路径，不重新编译、不重新做 20 次时延测试，也不重新解析当前 `test_graph2.sh`；每组仍启动模型、预热后采集。`max_tokens` 从原请求恢复，使用原环境和原物理卡执行。原报告不变，新 `summary.txt` 以 `TIMING_SOURCE` 标明沿用的历史时延，合并新采的 Host 间隔、空泡和可视化路径。续采与原计时不是同时进行，服务器状态可能不同；原数据缺组、输出不一致或库已丢失会停止，不以部分结果拼出对照。可把新输出目录改到另一个有空间的挂载盘，不能仅在同一满盘上换个目录名。
+
+只有约 7 GiB 可用时，可增加 `--min-profile-free-gib 5`，将本次门槛降到 5 GiB；默认值和其他实验入口不变。续采入口及每组采集服务启动前均使用此门槛，实际设置写入 `summary.txt`。这只是启动前剩余空间门槛，不限制 profile 大小，也不保证两组采集和对齐导出都能放下；第一组后剩余空间低于 5 GiB 会停止下一组并保留已有结果。
 
 复核同事的 `vllm-ascend` 提交 `c441874` 中 `prepared_h2d.py`：布局相同复用，否则一次性整理，再导出固定地址表；`native_submission.py` 还使用独立 DMA 通道、线程配置和依赖调度。我们参考前者，保留现有普通加载流与严格完成协议，没有把后者混入本次对照。对方 CPU MoE 的收益不能直接作为本项目的收益。
 

@@ -54,8 +54,10 @@ METRICS = (
 )
 
 
-def ensure_profile_storage(path, *, stage):
+def ensure_profile_storage(path, *, stage, min_free_gib=MIN_PROFILE_FREE_GIB):
     """Check actual output filesystem before building, starting a service or profiling."""
+    if not 0 < min_free_gib < float("inf"):
+        raise ValueError("Profile minimum free GiB must be positive and finite")
     directory = Path(path).resolve()
     while not directory.exists():
         directory = directory.parent
@@ -67,13 +69,13 @@ def ensure_profile_storage(path, *, stage):
             free_inodes = info.f_favail
     print(
         f"STORAGE: stage={stage}; path={directory}; free={free_gib:.2f} GiB; "
-        f"required={MIN_PROFILE_FREE_GIB} GiB; available_inodes={free_inodes}",
+        f"required={min_free_gib:g} GiB; available_inodes={free_inodes}",
         flush=True,
     )
-    if free_gib < MIN_PROFILE_FREE_GIB or free_inodes == 0:
+    if free_gib < min_free_gib or free_inodes == 0:
         raise RuntimeError(
             f"Insufficient profile storage at {directory}: free={free_gib:.2f} GiB, "
-            f"required={MIN_PROFILE_FREE_GIB} GiB, available_inodes={free_inodes}. "
+            f"required={min_free_gib:g} GiB, available_inodes={free_inodes}. "
             "Stop comparison; completed results are retained. Free space or use a new output directory "
             "on a filesystem with sufficient space."
         )
