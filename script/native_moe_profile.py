@@ -114,6 +114,10 @@ def analyze_profile(trace, case, expected_count, stream_name, report):
                 report(case + " " + line)
     if not complete:
         report(f"BUBBLES_PARTIAL {case}: full-window statistics retained; direction mapping may be incomplete")
+    selected = [
+        json.loads(line.split(" ", 1)[1]) for line in text.splitlines() if line.startswith("SELECTED_OFFLOAD_TRACK ")
+    ]
+    scan["loading_track"] = selected[0] if len(selected) == 1 else None
     return scan, text
 
 
@@ -128,10 +132,19 @@ def report_gap_table(profiles, report):
                 f"| {case} | Host {row['direction']} | {row['count']} | {row['mean_us']} | "
                 f"{clean['n']} | {clean['mean']} |"
             )
+        selected = profile["scan"].get("loading_track")
+        if selected is not None and selected["loaded_batches"] == 0:
+            report(
+                f"BUBBLES_UNVERIFIED {case}: {selected['name']} has no matched loading batches; "
+                "track diagnostics retained, excluded from loading-bubble comparison. "
+                "Confirm the loading stream in this capture and reanalyze the saved profile."
+            )
+            continue
         for row in profile["bubble_stats"]:
             kept = row["kept"]
             scope = row.get("scope", row.get("direction"))
-            report(f"| {case} | Loading bubbles {scope} | {kept['n']} | {kept['mean']} | — | — |")
+            count, mean = (0, "—") if kept is None else (kept["n"], kept["mean"])
+            report(f"| {case} | Loading bubbles {scope} | {count} | {mean} | — | — |")
 
 
 def profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, expected_outputs):

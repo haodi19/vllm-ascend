@@ -180,6 +180,55 @@ class NativeProfileTests(unittest.TestCase):
             self.assertTrue(any(line.startswith("HOST_CALLBACK_GAP native ") for line in lines))
             self.assertFalse(any("TARGET_GAPS_US " in line for line in lines))
 
+    def test_zero_eligible_gaps_are_missing_not_zero_latency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.json"
+            path.write_text(json.dumps(fixture()), encoding="utf-8")
+            # All adjacent gaps are excluded by the upper bound, but the
+            # selected stream still has three matched loading batches.
+            with patch.object(profile, "MAX_BUBBLE_US", 50):
+                scan, details = profile.analyze_profile(path, "native", 3, "Stream 56", lambda _: None)
+        bubbles = [
+            json.loads(line.split(" ", 1)[1])
+            for line in details.splitlines()
+            if line.startswith(("TARGET_GAPS_US ", "TARGET_DIRECTION_GAPS_US "))
+        ]
+        self.assertEqual(scan["loading_track"]["loaded_batches"], 3)
+        self.assertTrue(all(row["kept"] is None for row in bubbles))
+        lines = []
+        profile.report_gap_table({"native": dict(scan=scan, bubble_stats=bubbles)}, lines.append)
+        for row in bubbles:
+            scope = row.get("scope", row.get("direction"))
+            self.assertIn(f"| native | Loading bubbles {scope} | 0 | — | — | — |", lines)
+
+    def test_unrelated_existing_stream_is_not_reported_as_loading_bubble_result(self):
+        data = fixture()
+        data["traceEvents"].extend(
+            [
+                dict(name="thread_name", pid=2, tid=54, ph="M", args=dict(name="Stream 54")),
+                # Both copies cross Host boundaries; no unique loading batch.
+                event("MEMCPY_ASYNC", 0, 200, tid=54),
+                event("MEMCPY_ASYNC", 270, 400, tid=54),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace.json"
+            path.write_text(json.dumps(data), encoding="utf-8")
+            scan, details = profile.analyze_profile(path, "native", 3, "Stream 54", lambda _: None)
+        bubbles = [
+            json.loads(line.split(" ", 1)[1])
+            for line in details.splitlines()
+            if line.startswith(("TARGET_GAPS_US ", "TARGET_DIRECTION_GAPS_US "))
+        ]
+        self.assertEqual(scan["loading_track"]["loaded_batches"], 0)
+        self.assertEqual(bubbles[0]["kept"]["mean"], 70)
+        self.assertIsNone(bubbles[-1]["kept"])
+        lines = []
+        profile.report_gap_table({"native": dict(scan=scan, bubble_stats=bubbles)}, lines.append)
+        self.assertTrue(any(line.startswith("BUBBLES_UNVERIFIED native: Stream 54") for line in lines))
+        self.assertTrue(any("| Host prefetch->reactive |" in line for line in lines))
+        self.assertFalse(any("| Loading bubbles " in line for line in lines))
+
 
 if __name__ == "__main__":
     unittest.main()
