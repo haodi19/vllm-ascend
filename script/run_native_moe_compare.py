@@ -23,6 +23,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from moe_host_memory import (
+    DEFAULT_MIN_HOST_FREE_GIB,
+    DEFAULT_MIN_NUMA_FREE_GIB,
+    after_service_memory,
+    check_host_memory,
+    log_memory,
+)
 from moe_tpot import streaming_completion, summarize_streams
 from run_host_sync_stage2 import target_cmake_args
 from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB
@@ -265,6 +272,13 @@ def main():
     parser.add_argument("--timing-port", type=int, default=18156)
     parser.add_argument("--profile-timeout", type=int, default=180)
     parser.add_argument(
+        "--auto-drop-caches",
+        action="store_true",
+        help="Between services only: sync and drop host-wide page cache once when free RAM is low",
+    )
+    parser.add_argument("--min-host-free-gib", type=float, default=DEFAULT_MIN_HOST_FREE_GIB)
+    parser.add_argument("--min-numa-free-gib", type=float, default=DEFAULT_MIN_NUMA_FREE_GIB)
+    parser.add_argument(
         "--min-profile-free-gib",
         type=float,
         default=MIN_PROFILE_FREE_GIB,
@@ -280,6 +294,8 @@ def main():
         help="Persistent parent for fresh numbered handshake builds, independent of results",
     )
     args = parser.parse_args()
+    if not all(0 < value < float("inf") for value in (args.min_host_free_gib, args.min_numa_free_gib)):
+        parser.error("Host and NUMA free-memory thresholds must be positive and finite")
     if not 0 < args.min_profile_free_gib < float("inf"):
         parser.error("--min-profile-free-gib must be positive and finite")
     if args.profile_only_from and (args.skip_profile or args.skip_build or args.library):
@@ -332,6 +348,11 @@ def main():
             return json.load(response)
 
     try:
+        report(
+            f"HOST_MEMORY_POLICY: auto_drop_caches={args.auto_drop_caches}; "
+            f"host_free_trigger_gib={args.min_host_free_gib:g}; "
+            f"allowed_node_free_trigger_gib={args.min_numa_free_gib:g}; outside all measurement windows"
+        )
         if not args.skip_profile:
             report(
                 f"PROFILE_STORAGE: minimum_free_gib={args.min_profile_free_gib:g}; checked before each profile service"
@@ -431,6 +452,7 @@ def main():
         timings = {}
         for case in ("python", "native"):
             wait_port_free(args.port)
+            check_host_memory(args, f"before timing/{case}", report, before_start=True)
             command = commands[case]
             # This exact argv preserves the original model and MTP settings.
             (root / f"{case}_command.json").write_text(
@@ -508,11 +530,13 @@ def main():
                 except Exception as exc:
                     try:
                         report_service_failure(case, log_path, samples, completed, proc, exc, report)
+                        log_memory(f"failure timing/{case}/before_cleanup", report)
                     except Exception as diagnostic_error:
                         report(f"FAILURE_DIAGNOSTICS_UNAVAILABLE {type(diagnostic_error).__name__}: {diagnostic_error}")
                     raise
                 finally:
                     stop_process_group(proc)
+                    after_service_memory(args, f"after timing/{case}", report, proc.pid)
             report(f"WAIT port release after service={case}; port={args.port}; timeout={PORT_RELEASE_TIMEOUT}s")
             wait_port_free(args.port, timeout=PORT_RELEASE_TIMEOUT)
             report(f"STOP service={case}; port={args.port} reusable")

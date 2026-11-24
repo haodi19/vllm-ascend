@@ -62,6 +62,12 @@ python -u -B script/run_native_moe_compare.py \
 
 只有约 7 GiB 可用时，可增加 `--min-profile-free-gib 5`，将本次门槛降到 5 GiB；默认值和其他实验入口不变。续采入口及每组采集服务启动前均使用此门槛，实际设置写入 `summary.txt`。这只是启动前剩余空间门槛，不限制 profile 大小，也不保证两组采集和对齐导出都能放下；第一组后剩余空间低于 5 GiB 会停止下一组并保留已有结果。
 
+每组计时服务和采集服务启动前、退出后都会把 `numactl -H`、全机与各 NUMA 节点的 free/文件缓存/匿名内存等、允许的内存节点以及可见 cgroup 限制写入 `summary.txt`。缺少 `numactl` 时仍使用 `/proc` 和 `/sys`。服务退出后再检查本组进程组是否还有非僵尸进程；没有退出则停止，不用清缓存掩盖残留进程。服务失败时额外记录清理前现场，保留原错误，不自动回收缓存。
+
+需要自动回收时增加 `--auto-drop-caches`。全机 MemFree 低于 `--min-host-free-gib`，或任一允许的 NUMA 节点 MemFree 低于 `--min-numa-free-gib`，在服务之外执行一次 `sync` 后写 `drop_caches=1`，打印回收前后差值。两个触发阈值默认均为 160 GiB，按当前约 137 GiB 专家缓冲加 8.06 GiB scale 缓冲留出余量；这是可调的回收触发值，不是已证实的驱动分配要求。只清文件页缓存，不修改大页、NUMA 绑定或 memlock，不反复清理。权限不足会明确停止。回收后若全机 MemAvailable 仍低于配置阈值，下一组不启动；仅某节点 free 仍低则记录提示，不能在实际落点未知时据此断言该节点导致 OOM。
+
+该动作影响宿主机文件缓存，不能释放仍被进程或驱动占用的 pinned 内存，也不保证解决分配失败。第一组启动前同样检查，所有回收均在正式计时、预热和 profile 窗口之外；各组保留原预热次数。是否执行过回收及前后状态进入报告，冷启动环境可能变化。参考 [Linux drop_caches 说明](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/vm.html#drop-caches)。
+
 复核同事的 `vllm-ascend` 提交 `c441874` 中 `prepared_h2d.py`：布局相同复用，否则一次性整理，再导出固定地址表；`native_submission.py` 还使用独立 DMA 通道、线程配置和依赖调度。我们参考前者，保留现有普通加载流与严格完成协议，没有把后者混入本次对照。对方 CPU MoE 的收益不能直接作为本项目的收益。
 
 2026-11-24 复核 `native_update_05`：两组各 20 次正式请求、输出一致，但未采 profile。Python/native 的 decode raw 均值为 151.937/162.576 ms，TPOT 为 37.984/40.644 ms/token；IQR 后 decode 为 148.445/153.739 ms。HTTP 均值为 3569.273/12416.579 ms，TTFT 为 3417.158/12253.835 ms。主要退化在首 token 之前，不能归为已取得优化收益，也不能从这些数值推断 Host 间隔和空泡。后续修正保留原 prefill scale 布局，并补齐原生采集；复测结果见下文。

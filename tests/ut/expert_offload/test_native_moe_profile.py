@@ -61,6 +61,9 @@ class NativeProfileTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(profile, "ensure_profile_storage") as storage,
+            patch.object(profile, "check_host_memory") as memory_before,
+            patch.object(profile, "log_memory"),
+            patch.object(profile, "after_service_memory") as memory_after,
             patch.object(profile.subprocess, "Popen", return_value=child),
             patch.object(profile, "request", side_effect=[dict(data=[dict(id="model")]), dict(mstx_enabled=True)]),
             patch.object(profile, "streaming_completion", side_effect=TimeoutError("request timeout")),
@@ -69,6 +72,10 @@ class NativeProfileTests(unittest.TestCase):
         ):
             profile.profile_cases(args, {"python": command}, Path(directory), {}, lambda _: None, Mock(), stop, [])
         stop.assert_called_once_with(child)
+        self.assertEqual(memory_before.call_args.args[1], "before profile/python")
+        self.assertTrue(memory_before.call_args.kwargs["before_start"])
+        self.assertEqual(memory_after.call_args.args[1], "after profile/python")
+        self.assertEqual(memory_after.call_args.args[3], child.pid)
         align.assert_not_called()
         storage.assert_called_once_with(
             Path(directory) / "profile/python", stage="before python profile service", min_free_gib=5
