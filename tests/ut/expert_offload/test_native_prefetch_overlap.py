@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "script"))
 import reanalyze_native_prefetch_overlap as runner
+from analyze_prefetch_compute_overlap import bind_streams
 from diagnose_mte_wait_timeline import read_trace
 
 
@@ -96,6 +97,120 @@ def capture(root, case, *, bad_tail=False):
 
 
 class NativePrefetchOverlapTests(unittest.TestCase):
+    def test_publish_after_host_start_is_not_accepted_as_valid_boundary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, out = Path(temp) / "native", Path(temp) / "analysis_01"
+            path = capture(root, "native")
+            data = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+            publish = next(
+                e for e in data["traceEvents"] if e.get("tid") == "prefetch" and e["name"] == "host_sync_publish_1"
+            )
+            publish["ts"] += 22  # prefetch Host starts at 100, publish now at 102
+            path.write_text(json.dumps(data, default=str), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 0)
+            result = json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8"))["native"]
+            self.assertEqual(result["rows"][0]["class"], "unmapped")
+            check = next(c for c in result["mte_order_checks"] if not c["valid"])
+            self.assertEqual(check["call"], "2")
+            self.assertEqual(check["publish_start_minus_host_start_us"], 2)
+            self.assertEqual(result["host_timings"]["all"]["host_callback"]["count"], 5)
+
+    def test_protocol_failures_keep_host_timings_and_mark_only_dependent_rows_unmapped(self):
+        # (stream, ordinal wait, new end, expected affected prefetch calls)
+        for stream, ordinal, end, affected in (
+            ("prefetch", 0, 158, ["2"]),
+            ("main", 0, 18, ["2"]),  # previous reactive defines the compute segment
+            ("main", 1, 238, ["2", "4"]),  # current reactive AND next segment's anchor
+        ):
+            with self.subTest(stream=stream, ordinal=ordinal), tempfile.TemporaryDirectory() as temp:
+                root, out = Path(temp) / "native", Path(temp) / "analysis_01"
+                path = capture(root, "native")
+                data = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+                waits = [e for e in data["traceEvents"] if e.get("tid") == stream and e["name"] == "host_sync_wait_2"]
+                target = waits[ordinal]
+                origin = Decimal("1795507048074000.043")
+                target["dur"] = origin + end - Decimal(target["ts"])
+                path.write_text(json.dumps(data, default=str), encoding="utf-8")
+                before = path.read_bytes()
+                with self.assertRaisesRegex(ValueError, "aligned protocol order check failed"):
+                    bind_streams(read_trace(path, time_origin=origin))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 1 if len(affected) == 2 else 0)
+                self.assertEqual(before, path.read_bytes())
+                result = json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8"))["native"]
+                self.assertEqual(result["host_timings"]["all"]["host_callback"]["count"], 5)
+                self.assertAlmostEqual(result["host_timings"]["prefetch"]["host_callback"]["mean_us"], 40)
+                bad = [c for c in result["mte_order_checks"] if not c["valid"]]
+                self.assertEqual(len(bad), 1)
+                self.assertEqual(bad[0]["host_end_minus_wait_end_us"], 2)
+                self.assertEqual([r["prefetch_call"] for r in result["rows"] if r["class"] == "unmapped"], affected)
+                for row in result["rows"]:
+                    if row["prefetch_call"] in affected:
+                        self.assertEqual(row["reason"], "mte_protocol_host_order_mismatch")
+                        self.assertNotIn("readiness_minus_prefetch_end_bounds_us", row)
+                stats = result["direct"]["all_samples"]
+                self.assertEqual(stats["original"]["count"], 2)
+                self.assertAlmostEqual(stats["original"]["mean_us"], 53.5)
+                self.assertAlmostEqual(
+                    stats["method2_subtract_remaining_compute"]["mean_us"], 53.5 if len(affected) == 2 else 37.25
+                )
+                summary = (out / "summary.txt").read_text(encoding="utf-8")
+                self.assertIn("ORDER_FAILURE_EXAMPLES", summary)
+                self.assertIn('"host_end_minus_wait_end_us": 2.0', summary)
+                self.assertIn("HOST_FUNCTION_TIMES", summary)
+
+    def test_structural_stream_failure_retains_independent_host_statistics(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, out = Path(temp) / "native", Path(temp) / "analysis_01"
+            path = capture(root, "native")
+            # Device handshake name unavailable, but all Host markers are valid.
+            path.write_text(
+                path.read_text(encoding="utf-8").replace("host_sync_publish_1", "unknown_publish"), encoding="utf-8"
+            )
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 1)
+            result = json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8"))["native"]
+            self.assertEqual(result["classification"]["unmapped"]["count"], 2)
+            self.assertTrue(result["binding_error"])
+            self.assertAlmostEqual(result["host_timings"]["all"]["update_weights"]["mean_us"], 28.45)
+            self.assertEqual(result["direct"]["all_samples"]["method1_drop_late"]["count"], 2)
+            self.assertAlmostEqual(
+                result["direct"]["all_samples"]["method2_subtract_remaining_compute"]["mean_us"], 53.5
+            )
+
+    def test_invalid_host_nesting_is_still_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, out = Path(temp) / "native", Path(temp) / "analysis_01"
+            path = capture(root, "native")
+            data = json.loads(path.read_text(encoding="utf-8"), parse_float=Decimal)
+            sync = next(e for e in data["traceEvents"] if e["name"].startswith("moe_offload/synchronize"))
+            sync["dur"] = 1000
+            path.write_text(json.dumps(data, default=str), encoding="utf-8")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 1)
+            self.assertEqual(json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8")), {})
+
+    def test_missing_python_load_metadata_is_unknown_not_zero_or_missing_host_duration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp)
+            roots = [base / c for c in ("python", "native")]
+            for root in roots:
+                capture(root, root.name)
+            path = roots[0] / "python_profile_counters.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            del data["load_backend"]
+            del data["h2d_backend"]
+            path.write_text(json.dumps(data), encoding="utf-8")
+            out = base / "analysis_01"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([*map(str, roots), "--output-dir", str(out)]), 0)
+            result = json.loads((out / "prefetch_overlap.json").read_text(encoding="utf-8"))["python"]
+            self.assertTrue(result["load_issues"])
+            self.assertTrue(all(r["prefetch_loads"] is None for r in result["rows"]))
+            self.assertEqual(result["host_timings"]["all"]["host_callback"]["count"], 5)
+            self.assertEqual(result["classification"]["unmapped"]["count"], 0)
+
     def test_offline_actual_capture_analysis_and_both_methods(self):
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)

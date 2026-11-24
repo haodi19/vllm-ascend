@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 
 from analyze_moe_overlap_difference import coordinates, transitions
-from analyze_prefetch_compute_overlap import analyze
+from analyze_prefetch_compute_overlap import MAX_EXAMPLES, ORDER_US, analyze
 from inspect_moe_profile import _stats
 from moe_experiment_tables import number, table
 from reanalyze_native_moe_profiles import saved_case, saved_traces
@@ -75,6 +75,47 @@ def render(results, report):
             f"margin_us={number(result['sensitivity_margin_us'])}; unmapped_reasons={result['reasons']}"
         )
         report(f"LOAD_EVIDENCE {case}: {result['load_issues']}")
+        checks = result.get("mte_order_checks", [])
+        failed = [item for item in checks if not item["valid"]]
+        report(
+            "PROTOCOL_ORDER "
+            + json.dumps(
+                dict(
+                    case=case,
+                    checked=len(checks),
+                    failed=len(failed),
+                    tolerance_us=ORDER_US,
+                    binding_error=result.get("binding_error"),
+                    max_publish_after_host_us=max(
+                        (max(0, item["publish_start_minus_host_start_us"]) for item in checks), default=None
+                    ),
+                    max_wait_before_host_end_us=max(
+                        (max(0, item["host_end_minus_wait_end_us"]) for item in checks), default=None
+                    ),
+                ),
+                ensure_ascii=False,
+            )
+        )
+        if failed:
+            report(
+                "ORDER_FAILURE_EXAMPLES "
+                + json.dumps(
+                    dict(
+                        case=case,
+                        examples=sorted(
+                            failed,
+                            key=lambda x: max(x["publish_start_minus_host_start_us"], x["host_end_minus_wait_end_us"]),
+                            reverse=True,
+                        )[:MAX_EXAMPLES],
+                    ),
+                    ensure_ascii=False,
+                )
+            )
+        if result["classification"]["unmapped"]["count"]:
+            report(
+                f"PARTIAL_BOUNDARIES {case}: 无法识别样本保留原间隔；"
+                "两方案只处理其余明确晚完成样本，不能视为全部计算等待已扣除。"
+            )
         for mode, label, group_key in (
             ("direct", "对齐坐标直接判定", "direct_classification"),
             ("conservative", "保守判定", "classification"),
@@ -162,6 +203,9 @@ def render(results, report):
         report(f"COMPARISON_UNAVAILABLE: {exc}")
         return
     report(f"PAIRED_BOUNDARIES n={len(pairs)}; excluded={excluded}")
+    if not pairs:
+        report("COMPARISON_UNAVAILABLE: no valid paired compute boundaries; Host function timings retained.")
+        return
     report("按同层同次序和相同边界算子比较；未核验两组专家ID/加载数一致，不能作等工作量因果证明。")
     report("计算到达以各自预取开始为零；不是设备算子总耗时。另用上一按需Host结束作共同流程锚点检查预取启动变化。")
     metric_rows = []
@@ -201,7 +245,9 @@ def reanalyze(runs, output, report):
             details.write(f"CASE={case}\n")
             try:
                 with contextlib.redirect_stdout(details):
-                    result = analyze(trace, profile_report=counters, update_backend=case, exact_relative=True)
+                    result = analyze(
+                        trace, profile_report=counters, update_backend=case, exact_relative=True, retain_unmapped=True
+                    )
                 result.update(physical_npu=device, expected_callbacks=count)
                 results[case] = result
                 report(
@@ -219,6 +265,7 @@ def reanalyze(runs, output, report):
         or results["native"]["classification"]["unmapped"]["count"] == len(results["native"]["rows"])
     ):
         raise ValueError("native compute boundary unavailable; no conclusion about exposed computation")
+    return any(r["classification"]["unmapped"]["count"] for r in results.values()) or len(results) != 2
 
 
 def main(argv=None):
@@ -235,18 +282,21 @@ def main(argv=None):
             destination.write(message + "\n")
 
     report(f"SUMMARY_FILE={output / 'summary.txt'}")
+    report("SCRIPT_REVISION=native_overlap_v2_partial_order_diagnostics")
     report("只读已有对齐profile/计数器/输出；不导入Torch、不启动模型/NPU、不改原采集；仅写本次分析目录。")
     report("分析预取Host是否更早结束、计算是否暴露到间隔中；早/晚均指计算相对于预取Host结束。")
     report("方案1删除明确晚完成样本；方案2扣除其预取结束至计算到达的时间（边界区间中点）。")
     report("两方案全样本口径：早、不确定、无法识别样本均保留原间隔；不做IQR、不设时长截断。")
     report("直接判定不加余量；保守判定用同次校准包络宽度+1μs。边界范围不是完整时钟误差区间。")
     report("重统计相对原均值的降低是描述性结果，不是新测Decode/TPOT收益；native缺少逐专家计数时不猜测零加载。")
+    report("跨Host/设备顺序不符只阻止相关样本的计算分类；Host函数耗时独立统计，不平移时间戳、不放宽1μs检查。")
+    report("LOAD_EVIDENCE只说明逐专家加载数能否核验；缺失加载后端元数据不等于Python加载路径运行失败。")
     try:
-        reanalyze([p.resolve(strict=True) for p in args.runs], output, report)
+        partial = reanalyze([p.resolve(strict=True) for p in args.runs], output, report)
     except Exception as exc:
         report(f"OVERLAP_FAILED {type(exc).__name__}: {exc}; completed output retained")
         return 1
-    report("OVERLAP_COMPLETE; return this summary.txt, no model rerun needed.")
+    report(f"{'OVERLAP_PARTIAL' if partial else 'OVERLAP_COMPLETE'}; return this summary.txt, no model rerun needed.")
     return 0
 
 

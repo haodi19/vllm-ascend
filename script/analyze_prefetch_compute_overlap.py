@@ -37,20 +37,44 @@ def task_type(name):
     return "compute"
 
 
-def bind_streams(data):
+def bind_streams(data, *, retain_unmapped=False):
     """Complete ordinal mapping, independent of the overlap being tested."""
     if data["issues"] or data["invalid_kinds"]:
         raise ValueError(f"invalid Host markers: {data['issues']}")
     bindings = {}
+    checks = data["mte_order_checks"] = []
     for stream, tasks in data["tasks"].items():
         pairs, reason = task_pairs(tasks, ORDER_US)
         kinds = [k for k, hosts in data["groups"].items() if pairs and len(hosts) == len(pairs)]
         if reason != "ok" or len(kinds) != 1 or kinds[0] in bindings:
-            raise ValueError("no unique complete ordinal stream mapping")
+            raise ValueError(
+                f"no unique complete ordinal stream mapping: stream={stream}; "
+                f"reason={reason}; tasks={len(tasks)}; pairs={len(pairs)}; candidate_kinds={kinds}"
+            )
         kind = kinds[0]
-        for (publish, wait), host in zip(pairs, data["groups"][kind]):
-            if publish["start"] > host["start"] + ORDER_US or wait["end"] < host["end"] - ORDER_US:
-                raise ValueError("aligned protocol order check failed")
+        for ordinal, ((publish, wait), host) in enumerate(zip(pairs, data["groups"][kind])):
+            publish_overrun = publish["start"] - host["start"]
+            wait_shortfall = host["end"] - wait["end"]
+            valid = publish_overrun <= ORDER_US and wait_shortfall <= ORDER_US
+            publish["host_coverage_valid"] = valid
+            check = dict(
+                kind=kind,
+                stream=list(stream),
+                ordinal=ordinal,
+                call=host["context"]["call"],
+                layer=host["context"]["layer"],
+                valid=valid,
+                publish_start_minus_host_start_us=publish_overrun,
+                host_end_minus_wait_end_us=wait_shortfall,
+                sync_end_minus_wait_end_us=host["sync"]["end"] - wait["end"],
+                host_duration_us=host["duration"],
+                wait_duration_us=wait["duration"],
+                publish_ids=publish.get("ids", {}),
+                wait_ids=wait.get("ids", {}),
+            )
+            checks.append(check)
+            if not valid and not retain_unmapped:
+                raise ValueError(f"aligned protocol order check failed: {check}")
         bindings[kind] = (stream, pairs)
     if set(bindings) != {"prefetch", "reactive"}:
         raise ValueError("need both MTE streams; callback backend is not classified with MTE rules")
@@ -279,7 +303,9 @@ def host_stage_durations(hosts, stages):
     return result
 
 
-def analyze(path, backend="mte", *, profile_report=None, update_backend="python", exact_relative=False):
+def analyze(
+    path, backend="mte", *, profile_report=None, update_backend="python", exact_relative=False, retain_unmapped=False
+):
     if backend not in ("mte", "callback"):
         raise ValueError("unknown Host backend")
     if update_backend not in ("python", "native") or (exact_relative and backend != "mte"):
@@ -296,9 +322,24 @@ def analyze(path, backend="mte", *, profile_report=None, update_backend="python"
     data = read_trace(path, time_origin=origin) if exact_relative else read_trace(path)
     if profile_report is not None and profile_report.get("count") != data["host_count"]:
         raise ValueError("saved counters and trace Host counts differ")
-    bindings = bind_streams(data) if backend == "mte" else bind_callback_streams(path, data)
-    stream, reactive_pairs = bindings["reactive"]
-    prefetch_pairs = bindings["prefetch"][1]
+    # Invalid Host identities/nesting still reject the capture. Cross-clock
+    # mapping failures must not discard independently valid Host durations.
+    if data["issues"] or data["invalid_kinds"] or not data["all_hosts"]:
+        raise ValueError(f"invalid Host markers: {data['issues']}")
+    binding_error = None
+    try:
+        bindings = (
+            bind_streams(data, retain_unmapped=retain_unmapped)
+            if backend == "mte"
+            else bind_callback_streams(path, data)
+        )
+    except ValueError as exc:
+        if not retain_unmapped or backend != "mte":
+            raise
+        binding_error = str(exc)
+        bindings = {}
+    stream, reactive_pairs = bindings.get("reactive", (None, []))
+    prefetch_stream, prefetch_pairs = bindings.get("prefetch", (None, []))
     tasks = []
     stages = collections.defaultdict(lambda: collections.defaultdict(list))
     host_pid = data["all_hosts"][0]["pid"]
@@ -390,15 +431,21 @@ def analyze(path, backend="mte", *, profile_report=None, update_backend="python"
         for role, host in (("prefetch", left), ("reactive", right)):
             row[role + "_stages_us"] = durations[host["context"]["call"]]
         rows.append(row)
+        if binding_error:
+            row["reason"] = "mte_stream_mapping_unavailable"
+            reasons[row["reason"]] += 1
+            continue
         rindex = reactive[right["index"]]
         pindex = prefetch[left["index"]]
-        if backend == "callback":
+        if backend == "callback" or retain_unmapped:
             required = [("prefetch", prefetch_pairs[pindex]), ("reactive", reactive_pairs[rindex])]
             if rindex:
                 required.append(("previous_reactive", reactive_pairs[rindex - 1]))
             invalid = [role for role, pair in required if not pair[0]["host_coverage_valid"]]
             if invalid:
-                row["reason"] = "callback_gate_host_order_mismatch"
+                row["reason"] = (
+                    "callback_gate_host_order_mismatch" if backend == "callback" else "mte_protocol_host_order_mismatch"
+                )
                 row["invalid_gate_roles"] = invalid
                 reasons[row["reason"]] += 1
                 continue
@@ -475,10 +522,11 @@ def analyze(path, backend="mte", *, profile_report=None, update_backend="python"
         "BOUNDARY",
         dict(
             main_stream=stream,
-            prefetch_stream=bindings["prefetch"][0],
-            prefetch_callbacks=len(prefetch_pairs),
+            prefetch_stream=prefetch_stream,
+            prefetch_callbacks=len(data["groups"]["prefetch"]),
             adjacent_same_layer_pairs=len(rows),
-            unmatched_prefetch=len(prefetch_pairs) - len(rows),
+            unmatched_prefetch=len(data["groups"]["prefetch"]) - len(rows),
+            binding_error=binding_error,
             sensitivity_margin_us=margin,
             reasons=dict(reasons),
             pairing="complete ordinal candidates; not independent slot/generation identity proof",
@@ -544,6 +592,8 @@ def analyze(path, backend="mte", *, profile_report=None, update_backend="python"
         host_timings=host_timings,
         host_timing_expected_counts=host_timing_counts,
         callback_gate_checks=data.get("callback_gate_checks", []),
+        mte_order_checks=data.get("mte_order_checks", []),
+        binding_error=binding_error,
         trace=str(path),
         rows=rows,
         classification=summarize(rows),
