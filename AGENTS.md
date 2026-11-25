@@ -6,6 +6,7 @@ This document provides instructions for contributors to the vLLM Ascend project.
 
 Maintain [docs/moe_experiment_results_zh.md](docs/moe_experiment_results_zh.md) as the single MoE experiment record, with a linked table of contents. Do not create a new Markdown report for each run.
 
+- Include only important performance comparisons with completed, verifiable measurements and their relevant statistical analyses. Exclude failed runs, functional checks, bug-fix investigations and unexecuted plans. Preserve baselines and non-improving results within a valid comparison; do not selectively report only favorable outcomes.
 - Each experiment must record its date, purpose, contents/configuration, and result directory names and paths, followed by its data and conclusions.
 - Distinguish the run date from offline reanalysis and documentation dates. Mark missing historical metadata as unknown; do not infer actual result paths from example commands.
 - Add reanalysis to the original experiment entry, preserving raw results and identifying the source capture. Separate directly measured timing from estimates and conditional analyses.

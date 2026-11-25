@@ -1,102 +1,102 @@
 # 基于阻塞旧版的 worker 轮询改造
 
-本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-yield-20261027)。
+本段实验正文与数据已移至 [性能实验总记录](moe_experiment_results_zh.md)。
 
 <a id="基线与阅读准备"></a>
 
-[基线与阅读准备](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-3)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="一取消空闲-yield"></a>
 
-[一、取消空闲 yield](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-23)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="原逻辑与修改内容"></a>
 
-[原逻辑与修改内容](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-25)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="测试方法"></a>
 
-[测试方法](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-51)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="测试结果关闭内部计时判断收益"></a>
 
-[测试结果：关闭内部计时，判断收益](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-114)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="测试结果开启内部计时分析原因与测量扰动"></a>
 
-[测试结果：开启内部计时，分析原因与测量扰动](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-136)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="结论"></a>
 
-[结论](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-180)
+[性能实验总记录](moe_experiment_results_zh.md)
 
-本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-scan-20261027)。
+本段实验正文与数据已移至 [性能实验总记录](moe_experiment_results_zh.md)。
 
 <a id="二减少扫描范围静态集合的独立测试"></a>
 
-[二、减少扫描范围：静态集合的独立测试](moe_experiment_results_zh.md#worker-scan-20261027-worker_poll_optimization_zh-185)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="原逻辑与修改内容-1"></a>
 
-[原逻辑与修改内容](moe_experiment_results_zh.md#worker-scan-20261027-worker_poll_optimization_zh-187)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="测试方法-1"></a>
 
-[测试方法](moe_experiment_results_zh.md#worker-scan-20261027-worker_poll_optimization_zh-214)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="当前结果"></a>
 
-[当前结果](moe_experiment_results_zh.md#worker-scan-20261027-worker_poll_optimization_zh-235)
+[性能实验总记录](moe_experiment_results_zh.md)
 
-本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-atomic-20261028)。
+本段实验正文与数据已移至 [性能实验总记录](moe_experiment_results_zh.md)。
 
 <a id="三减少空闲扫描-mutex独立测试已验证"></a>
 
-[三、减少空闲扫描 mutex：独立测试已验证](moe_experiment_results_zh.md#worker-atomic-20261028-worker_poll_optimization_zh-264)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="原逻辑与修改内容-2"></a>
 
-[原逻辑与修改内容](moe_experiment_results_zh.md#worker-atomic-20261028-worker_poll_optimization_zh-266)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="测试方法-2"></a>
 
-[测试方法](moe_experiment_results_zh.md#worker-atomic-20261028-worker_poll_optimization_zh-288)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="当前结果-1"></a>
 
-[当前结果](moe_experiment_results_zh.md#worker-atomic-20261028-worker_poll_optimization_zh-304)
+[性能实验总记录](moe_experiment_results_zh.md)
 
-本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-affinity-20261028)。
+本段实验正文与数据已移至 [性能实验总记录](moe_experiment_results_zh.md)。
 
 <a id="四工作线程绑核功能通过当前-cpu-未显示稳定收益"></a>
 
-[四、工作线程绑核：功能通过，当前 CPU 未显示稳定收益](moe_experiment_results_zh.md#worker-affinity-20261028-worker_poll_optimization_zh-327)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="原逻辑与修改内容-3"></a>
 
-[原逻辑与修改内容](moe_experiment_results_zh.md#worker-affinity-20261028-worker_poll_optimization_zh-329)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="测试方法-3"></a>
 
-[测试方法](moe_experiment_results_zh.md#worker-affinity-20261028-worker_poll_optimization_zh-340)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="当前结果-2"></a>
 
-[当前结果](moe_experiment_results_zh.md#worker-affinity-20261028-worker_poll_optimization_zh-358)
+[性能实验总记录](moe_experiment_results_zh.md)
 
-本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-combined-20261028)。
+本段实验正文与数据已移至 [性能实验总记录](moe_experiment_results_zh.md)。
 
 <a id="五有效项组合对照已完成未观察到叠加收益"></a>
 
-[五、有效项组合对照：已完成，未观察到叠加收益](moe_experiment_results_zh.md#worker-combined-20261028-worker_poll_optimization_zh-378)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="本次结果"></a>
 
-[本次结果](moe_experiment_results_zh.md#worker-combined-20261028-worker_poll_optimization_zh-393)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="阶段判断"></a>
 
-[阶段判断](moe_experiment_results_zh.md#worker-combined-20261028-worker_poll_optimization_zh-417)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 ## 六、MoE 可选接入：动态有效前缀与三个独立开关
 
@@ -171,51 +171,51 @@ profile 保存在本轮结果目录的 `profile/mte`，控制台给出 summary �
 
 <a id="7-mte普通流下逐项验证真实模型收益2026-10-31"></a>
 
-[7. MTE普通流下逐项验证真实模型收益（2026-10-31）](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-494)
+[7. MTE普通流下逐项验证真实模型收益（2026-10-31）](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="当前基线与实验范围"></a>
 
-[当前基线与实验范围](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-496)
+[当前基线与实验范围](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="五组顺序实验"></a>
 
-[五组顺序实验](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-513)
+[五组顺序实验](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="绿区一次执行-1"></a>
 
-[绿区一次执行](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-535)
+[绿区一次执行](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="结果判断与当前状态"></a>
 
-[结果判断与当前状态](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-551)
+[结果判断与当前状态](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="首轮采集缺失与重测要求"></a>
 
-[首轮采集缺失与重测要求](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-567)
+[首轮采集缺失与重测要求](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="多请求整体时延与单请求profile分开测量"></a>
 
-[多请求整体时延与单请求profile分开测量](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-584)
+[多请求整体时延与单请求profile分开测量](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="atomic-独立服务交替复验"></a>
 
-[atomic 独立服务交替复验](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-622)
+[atomic 独立服务交替复验](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="allocated-与-atomic-组合验证"></a>
 
-[allocated 与 atomic 组合验证](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-647)
+[allocated 与 atomic 组合验证](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="组合测试结果2026-10-31"></a>
 
-[组合测试结果（2026-10-31）](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-684)
+[组合测试结果（2026-10-31）](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="回调mte-默认与-mte-组合三组对照"></a>
 
-[回调、MTE 默认与 MTE 组合三组对照](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-724)
+[回调、MTE 默认与 MTE 组合三组对照](moe_experiment_results_zh.md#worker-model-20261031)
 
 <a id="增加-python-lrc-与-debug-开启的早期配置对照"></a>
 
-[增加 Python LRC 与 debug 开启的早期配置对照](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-763)
+[增加 Python LRC 与 debug 开启的早期配置对照](moe_experiment_results_zh.md#worker-model-20261031)
 
 ## 独立测试的绿区执行
 

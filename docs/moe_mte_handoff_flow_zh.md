@@ -418,11 +418,11 @@ BEGIN、SUBMITTED、COMPLETE，定位第一个未完成的操作。它会改变�
 正常关闭时先同步设备，确保图不再访问控制地址，再停止监控线程、结束设备访问租约、
 停止 worker、注销 Host 映射并释放内存。不能在图仍等待或访问控制区时先释放它。
 
-本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#mte-20261022)。
+本段实验正文与数据已移至 [性能实验总记录](moe_experiment_results_zh.md)。
 
 <a id="8-2026-10-22-的验证结果与当时边界"></a>
 
-[8. 2026-10-22 的验证结果与当时边界](moe_experiment_results_zh.md#mte-20261022-moe_mte_handoff_flow_zh-421)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 ## 9. 图捕获与模型请求的关系
 
@@ -444,11 +444,11 @@ MTP 一步可以涉及多行 token，不能简单认为一个 token 就对应一
 `MteHostDispatcher.launch` 分配新的交接槽位。重放不重新执行这个 Python 方法，
 但 CPU 工作线程仍需每次执行内层卸载任务。
 
-本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#block-history-20261028)。
+本段实验正文与数据已移至 [性能实验总记录](moe_experiment_results_zh.md)。
 
 <a id="10-历史阻塞定位旧版全-mte-路径复现2026-10-27"></a>
 
-[10. 历史阻塞定位：旧版全 MTE 路径复现（2026-10-27）](moe_experiment_results_zh.md#block-history-20261028-moe_mte_handoff_flow_zh-458)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 ## 11. 对照代码阅读
 
@@ -666,11 +666,11 @@ SyncLaunchStream则由当前调用线程直接调用相应Runtime接口。算子
 
 <a id="13-早期回调当前回调与两种mte配置的四组实测2026-10-31"></a>
 
-[13. 早期回调、当前回调与两种MTE配置的四组实测（2026-10-31）](moe_experiment_results_zh.md#four-way-20261031-moe_mte_handoff_flow_zh-817)
+[13. 早期回调、当前回调与两种MTE配置的四组实测（2026-10-31）](moe_experiment_results_zh.md#four-way-20261031)
 
 <a id="131-配置采样窗口和有效性"></a>
 
-[13.1 配置、采样窗口和有效性](moe_experiment_results_zh.md#four-way-20261031-moe_mte_handoff_flow_zh-819)
+[13.1 配置、采样窗口和有效性](moe_experiment_results_zh.md#four-way-20261031)
 
 <a id="132-异常值处理及端到端结果"></a>
 
@@ -686,56 +686,56 @@ SyncLaunchStream则由当前调用线程直接调用相应Runtime接口。算子
 
 <a id="135-memcpy大间隔和可视化"></a>
 
-[13.5 MEMCPY大间隔和可视化](moe_experiment_results_zh.md#four-way-20261031-moe_mte_handoff_flow_zh-925)
+[13.5 MEMCPY大间隔和可视化](moe_experiment_results_zh.md#four-way-20261031)
 
 <a id="136-用于结论文档的简述"></a>
 
-[13.6 用于结论文档的简述](moe_experiment_results_zh.md#four-way-20261031-moe_mte_handoff_flow_zh-948)
+[13.6 用于结论文档的简述](moe_experiment_results_zh.md#four-way-20261031)
 
-本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#outliers-20261102)。
+本段实验正文与数据已移至 [性能实验总记录](moe_experiment_results_zh.md)。
 
 <a id="137-统一离群值处理及历史实验离线重算2026-11-02"></a>
 
-[13.7 统一离群值处理及历史实验离线重算（2026-11-02）](moe_experiment_results_zh.md#outliers-20261102-moe_mte_handoff_flow_zh-956)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 <a id="137-历史实验异常值复核范围与重算结果2026-11-02"></a>
 
-[13.7 历史实验异常值复核范围与重算结果（2026-11-02）](moe_experiment_results_zh.md#outliers-20261102-moe_mte_handoff_flow_zh-1004)
+[性能实验总记录](moe_experiment_results_zh.md)
 
 本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#dt-20261105)。
 
 <a id="14-新服务器四组推理对照2026-11-05"></a>
 
-[14. 新服务器四组推理对照（2026-11-05）](moe_experiment_results_zh.md#dt-20261105-moe_mte_handoff_flow_zh-1065)
+[14. 新服务器四组推理对照（2026-11-05）](moe_experiment_results_zh.md#dt-20261105)
 
 <a id="141-实验配置与采样"></a>
 
-[14.1 实验配置与采样](moe_experiment_results_zh.md#dt-20261105-moe_mte_handoff_flow_zh-1067)
+[14.1 实验配置与采样](moe_experiment_results_zh.md#dt-20261105)
 
 <a id="142-无profiler的整体请求时延"></a>
 
-[14.2 无profiler的整体请求时延](moe_experiment_results_zh.md#dt-20261105-moe_mte_handoff_flow_zh-1101)
+[14.2 无profiler的整体请求时延](moe_experiment_results_zh.md#dt-20261105)
 
 <a id="143-lrc调试日志与权重加载分项"></a>
 
-[14.3 LRC、调试日志与权重加载分项](moe_experiment_results_zh.md#dt-20261105-moe_mte_handoff_flow_zh-1150)
+[14.3 LRC、调试日志与权重加载分项](moe_experiment_results_zh.md#dt-20261105)
 
 <a id="144-host间隔与加载流空泡"></a>
 
-[14.4 Host间隔与加载流空泡](moe_experiment_results_zh.md#dt-20261105-moe_mte_handoff_flow_zh-1181)
+[14.4 Host间隔与加载流空泡](moe_experiment_results_zh.md#dt-20261105)
 
 <a id="145-内存缓存配置与实际加载量"></a>
 
-[14.5 内存、缓存配置与实际加载量](moe_experiment_results_zh.md#dt-20261105-moe_mte_handoff_flow_zh-1256)
+[14.5 内存、缓存配置与实际加载量](moe_experiment_results_zh.md#dt-20261105)
 
 <a id="146-结论与历史实验对照"></a>
 
-[14.6 结论与历史实验对照](moe_experiment_results_zh.md#dt-20261105-moe_mte_handoff_flow_zh-1282)
+[14.6 结论与历史实验对照](moe_experiment_results_zh.md#dt-20261105)
 
 <a id="147-时间线阶段与加载批次空泡口径"></a>
 
-[14.7 时间线阶段与加载批次空泡口径](moe_experiment_results_zh.md#dt-20261105-moe_mte_handoff_flow_zh-1297)
+[14.7 时间线阶段与加载批次空泡口径](moe_experiment_results_zh.md#dt-20261105)
 
 <a id="148-逐请求专家加载与缓存驻留诊断"></a>
 
-[14.8 逐请求专家加载与缓存驻留诊断](moe_experiment_results_zh.md#dt-20261105-moe_mte_handoff_flow_zh-1513)
+[14.8 逐请求专家加载与缓存驻留诊断](moe_experiment_results_zh.md#dt-20261105)
