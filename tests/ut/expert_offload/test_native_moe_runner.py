@@ -21,6 +21,131 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
+    def run_mock_comparison(self, directory, case="both", *, varied_outputs=False):
+        """Exercise the complete runner without processes, Torch or NPU."""
+        library = directory / "libhost_sync_device.so"
+        library.write_bytes(b"fixture, never loaded")
+        output = directory / "result"
+        argv = [
+            "runner",
+            "--case",
+            case,
+            "--npu",
+            "6",
+            "--skip-build",
+            "--library",
+            str(library),
+            "--warmup-requests",
+            "1",
+            "--requests",
+            "2",
+            "--output-dir",
+            str(output),
+        ]
+        sample = dict(
+            digest="same",
+            usage=dict(completion_tokens=5),
+            completion_tokens=5,
+            content_chunks=3,
+            decode_us=2000,
+            ttft_us=3000,
+            output_latency_us=5000,
+            tpot_us=500,
+            http_wall_us=5100,
+        )
+        launched = []
+
+        def start(command, **kwargs):
+            if "vllm.entrypoints.cli.main" in command:
+                config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
+                launched.append(config["host_update_backend"])
+                if config["host_update_backend"] == "native":
+                    kwargs["stdout"].write("[MOE-NATIVE] first native graph task completed without Python\n")
+                    kwargs["stdout"].write(
+                        "[MOE-NATIVE] SCALE_MEMORY "
+                        + json.dumps(
+                            dict(
+                                policy="shared_final_layout_v1",
+                                layers=43,
+                                duplicate_bytes=0,
+                                reused_bytes=100,
+                                replaced_bytes=0,
+                                derived_bytes=0,
+                            )
+                        )
+                        + "\n"
+                    )
+                    kwargs["stdout"].flush()
+            return Mock(pid=1234, poll=lambda: None, wait=lambda **kwargs: 0)
+
+        opener = Mock()
+        opener.open.side_effect = lambda *args, **kwargs: contextlib.nullcontext(
+            io.BytesIO(b'{"data":[{"id":"test-model"}]}')
+        )
+        streamed = [dict(sample) for _ in range(6)]
+        if varied_outputs:
+            streamed[2]["digest"] = "different"
+        with (
+            patch.object(sys, "argv", argv),
+            patch.object(sys, "platform", "linux"),
+            patch.object(runner.urllib.request, "build_opener", return_value=opener),
+            patch.object(runner.subprocess, "Popen", side_effect=start),
+            patch.object(runner, "streaming_completion", side_effect=streamed) as requests,
+            patch.object(runner, "wait_port_free"),
+            patch.object(runner, "stop_process_group"),
+            patch.object(runner, "check_host_memory"),
+            patch.object(runner, "after_service_memory"),
+            patch.object(runner, "log_memory"),
+            patch("native_moe_profile.profile_cases") as profiles,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            code = runner.main()
+        return code, output, launched, requests.call_count, profiles
+
+    def test_independent_complete_runs_preserve_timing_and_selected_profile(self):
+        for case in ("python", "native"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
+                code, output, launched, requests, profiles = self.run_mock_comparison(Path(temporary), case)
+                self.assertEqual(code, 0)
+                self.assertEqual(launched, [case])
+                self.assertEqual(requests, 3)  # warmup + two timed requests
+                self.assertEqual(list(profiles.call_args.args[1]), [case])
+                self.assertFalse(profiles.call_args.args[0].skip_profile)
+                text = (output / "summary.txt").read_text(encoding="utf-8")
+                rows = [json.loads(line[7:]) for line in text.splitlines() if line.startswith("RESULT ")]
+                self.assertEqual([row["case"] for row in rows], [case])
+                self.assertEqual(rows[0]["requests"], 2)
+                self.assertEqual(rows[0]["output_match_scope"], "within_case")
+                self.assertIn("cross-version output parity and speedup not evaluated", text)
+                self.assertNotIn("mean change=", text)
+                other = "python" if case == "native" else "native"
+                self.assertFalse((output / f"{other}_command.json").exists())
+                # A single-case directory can also resume just its own profile.
+                records, commands, _, tokens = runner.load_completed_timing_run(output, 8157, (case,))
+                self.assertEqual(list(commands), [case])
+                self.assertEqual(tokens, 5)
+                self.assertEqual(records[case]["requests"], 2)
+
+    def test_combined_run_still_launches_both_and_compares(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            code, output, launched, requests, profiles = self.run_mock_comparison(Path(temporary))
+            self.assertEqual(code, 0)
+            self.assertEqual(launched, ["python", "native"])
+            self.assertEqual(requests, 6)
+            self.assertEqual(list(profiles.call_args.args[1]), launched)
+            text = (output / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("decode mean change=0.000%", text)
+            self.assertNotIn("SINGLE_CASE_TIMING_COMPLETE", text)
+
+    def test_single_case_rejects_inconsistent_outputs_before_profile(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            code, output, _, _, profiles = self.run_mock_comparison(Path(temporary), "python", varied_outputs=True)
+            self.assertEqual(code, 1)
+            profiles.assert_not_called()
+            text = (output / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("outputs/usage differ between timed requests", text)
+            self.assertNotIn("RESULT ", text)
+
     def saved_timing_fixture(self, directory, tokens=128):
         library = directory / "libhost_sync_device.so"
         library.write_bytes(b"test library; never loaded")

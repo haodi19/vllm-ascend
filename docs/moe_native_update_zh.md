@@ -24,6 +24,8 @@
 
 继续使用 `script/run_native_moe_compare.py`，无需新增开关。它先运行 CPU 回归、NPU scale 字节一致性、严格图重放及 GIL 独立推进检查，再运行 Python/native 两组性能请求和独立 profile。结果统一汇总到指定目录的 `summary.txt`，保留 Decode、HTTP E2E、TTFT、TPOT、Host 间隔及加载流空泡。
 
+需要分开运行时，分别传 `--case python` 和 `--case native`，使用两个新的结果目录。每条命令均独立完成该组计时和 profile，不依赖其他结果目录；省略 `--case` 仍顺序运行两组。单组摘要只验证该组请求一致性，不宣称跨版本输出一致或性能提升；比较时同时提供两组 `summary.txt`。单组计时完成后如需补采，可用 `--profile-only-from` 配合对应的 `--profile-case`。
+
 新版 `NATIVE_SCALE_MEMORY` 记录会出现在计时与 profile 的摘要中：
 
 | 字段 | 含义 |

@@ -109,8 +109,8 @@ def timing_row(case, timing, e2e_mean_ms):
     return f"| {case} | {' | '.join(values)} | {e2e_mean_ms:.3f} |"
 
 
-def load_completed_timing_run(directory, port):
-    """Read both completed cases; never treat partial samples as a baseline."""
+def load_completed_timing_run(directory, port, required_cases=("python", "native")):
+    """Read completed cases; never treat partial samples as a baseline."""
     records, commands = {}, {}
     with (directory / "summary.txt").open(encoding="utf-8") as source:
         for line in source:
@@ -120,10 +120,10 @@ def load_completed_timing_run(directory, port):
                 if case in records:
                     raise ValueError(f"Duplicate timing result for {case}")
                 records[case] = row
-    if set(records) != {"python", "native"}:
-        raise ValueError("Profile continuation requires completed Python and native timing results")
+    if not set(required_cases) <= set(records) or not set(records) <= {"python", "native"}:
+        raise ValueError(f"Profile continuation requires completed timing results for {','.join(required_cases)}")
     reference = None
-    for case in ("python", "native"):
+    for case in required_cases:
         row = records[case]
         samples = row["stream_samples"]
         if not samples or len(samples) != row["requests"] or row.get("output_match") is not True:
@@ -163,9 +163,8 @@ def continue_profile(args, root, env, report):
     from run_verified_cpp_tests import ensure_profile_storage
 
     source = args.profile_only_from.resolve(strict=True)
-    records, commands, reference, args.max_tokens = load_completed_timing_run(source, args.port)
-    if args.profile_case != "both":
-        commands = {args.profile_case: commands[args.profile_case]}
+    cases = ("python", "native") if args.profile_case == "both" else (args.profile_case,)
+    records, commands, reference, args.max_tokens = load_completed_timing_run(source, args.port, cases)
     report(f"TIMING_SOURCE={source}; completed earlier; timing requests and builds are NOT repeated")
     report(
         f"PROFILE_ONLY: max_tokens={args.max_tokens} from saved samples; physical_npu={args.npu}; "
@@ -252,6 +251,12 @@ def service_command(source, case, library, port):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--case",
+        choices=("both", "python", "native"),
+        default="both",
+        help="Run timing and profile for both versions (default) or one independent version",
+    )
     parser.add_argument("--npu", type=int, required=True)
     parser.add_argument("--port", type=int, default=8156)
     parser.add_argument("--test-script", type=Path, default=ROOT / "script/test_graph2.sh")
@@ -298,6 +303,8 @@ def main():
     args = parser.parse_args()
     if args.profile_case != "both" and not args.profile_only_from:
         parser.error("--profile-case python/native requires --profile-only-from")
+    if args.profile_only_from and args.case != "both":
+        parser.error("--case selects a fresh complete run; use --profile-case with --profile-only-from")
     if not 0 < args.min_profile_free_gib < float("inf"):
         parser.error("--min-profile-free-gib must be positive and finite")
     if args.profile_only_from and (args.skip_profile or args.skip_build or args.library):
@@ -309,6 +316,7 @@ def main():
     if not 1 <= args.timing_port <= 65535 or args.timing_port == args.port or args.profile_timeout <= 0:
         parser.error("requires a separate valid timing port and a positive profile timeout")
     args.profile_requests = 1
+    cases = ("python", "native") if args.case == "both" else (args.case,)
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(args.npu))
@@ -352,7 +360,7 @@ def main():
     try:
         report(
             "HOST_MEMORY_POLICY: after successful Python service exit, run echo 1 > /proc/sys/vm/drop_caches "
-            "once before native; no RAM threshold; outside all measurement windows"
+            "once; no RAM threshold; outside all measurement windows"
         )
         if not args.skip_profile:
             report(
@@ -361,7 +369,7 @@ def main():
         if args.profile_only_from:
             return continue_profile(args, root, env, report)
         report(
-            "MTE Python update -> MTE native update; same cache/config; timed requests have no profiler/MSTX. "
+            f"CASES={','.join(cases)}; MTE weight updates; timed requests have no profiler/MSTX. "
             "Native graph replay; eager/prefill share final-layout scales. This is correctness/performance validation."
         )
         report(
@@ -374,10 +382,10 @@ def main():
             if args.library is None:
                 raise ValueError("--skip-build requires --library")
             library = args.library.resolve()
-        # Parse both commands before compiling or touching the NPU. A syntax
+        # Parse selected commands before compiling or touching the NPU. A syntax
         # error in the local launch script must not waste the hardware checks.
         source = args.test_script.read_text(encoding="utf-8")
-        commands = {case: service_command(source, case, library, args.port) for case in ("python", "native")}
+        commands = {case: service_command(source, case, library, args.port) for case in cases}
         report(f"PASS launch command parsing: {args.test_script}")
         wait_port_free(args.port)
         if not args.skip_profile:
@@ -389,7 +397,7 @@ def main():
             # Reserve a new directory; retain all previous artifacts/evidence.
             build = fresh_handshake_build(args.build_dir)
             library = build / "lib/libhost_sync_device.so"
-            commands = {case: service_command(source, case, library, args.port) for case in ("python", "native")}
+            commands = {case: service_command(source, case, library, args.port) for case in cases}
             report(f"HANDSHAKE_BUILD={build}; fresh directory; existing builds retained")
             report(f"HANDSHAKE_LIBRARY={library}; persistent path outside experiment results")
             for extension in ("lrc_policy", "host_sync"):
@@ -451,7 +459,7 @@ def main():
         reference = None
         means = {}
         timings = {}
-        for case in ("python", "native"):
+        for case in cases:
             wait_port_free(args.port)
             check_host_memory(f"before timing/{case}", report)
             command = commands[case]
@@ -507,6 +515,8 @@ def main():
                         raise RuntimeError("no confirmed native graph execution; refusing fallback-only comparison")
                     if case == "native":
                         report_native_scale_memory(log_path, report)
+                    if any(output != outputs[0] for output in outputs):
+                        raise RuntimeError(f"{case} outputs/usage differ between timed requests")
                     if reference is None:
                         reference = outputs
                     elif outputs != reference:
@@ -526,6 +536,7 @@ def main():
                                 stream_samples=samples,
                                 timing=timings[case],
                                 output_match=True,
+                                output_match_scope="within_case" if len(cases) == 1 else "paired_run",
                                 digest=hashlib.sha256(json.dumps(outputs).encode()).hexdigest(),
                             )
                         )
@@ -545,21 +556,27 @@ def main():
             report(f"STOP service={case}; port={args.port} reusable")
         report("| Version | Decode mean ms (primary) | TTFT mean ms | TPOT mean ms/token | HTTP E2E mean ms |")
         report("| --- | ---: | ---: | ---: | ---: |")
-        for case in ("python", "native"):
+        for case in cases:
             report(timing_row(case, timings[case], means[case]))
-        before = timings["python"]["decode_ms"]["raw"]["mean"]
-        after = timings["native"]["decode_ms"]["raw"]["mean"]
-        change = f"{(after / before - 1) * 100:.3f}%" if before > 0 else "undefined (single content chunk)"
-        report(
-            f"PASS finite output parity; decode mean change={change}; "
-            f"E2E mean change={(means['native'] / means['python'] - 1) * 100:.3f}%; "
-            "single service pair, not stability acceptance"
-        )
+        if len(cases) == 2:
+            before = timings["python"]["decode_ms"]["raw"]["mean"]
+            after = timings["native"]["decode_ms"]["raw"]["mean"]
+            change = f"{(after / before - 1) * 100:.3f}%" if before > 0 else "undefined (single content chunk)"
+            report(
+                f"PASS finite output parity; decode mean change={change}; "
+                f"E2E mean change={(means['native'] / means['python'] - 1) * 100:.3f}%; "
+                "single service pair, not stability acceptance"
+            )
+        else:
+            report(
+                f"SINGLE_CASE_TIMING_COMPLETE case={cases[0]}; within-case outputs match; "
+                "cross-version output parity and speedup not evaluated"
+            )
         if not args.skip_profile:
             from native_moe_profile import profile_cases
 
             report(
-                "PROFILE_PHASE: fresh Python/native services after timing; one request each after warmup; "
+                f"PROFILE_PHASE: fresh {','.join(cases)} services after timing; one request each after warmup; "
                 "native C MSTX ranges, aligned visualization, Host gaps and loading bubbles"
             )
             profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, reference)
