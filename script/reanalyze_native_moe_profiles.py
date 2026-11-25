@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from export_moe_aligned_profile import aligned_trace_path
+from native_moe_artifacts import case_directory, saved_case_file
 from native_moe_profile import analyze_profile, report_gap_table
 from verify_memcpy_gaps import MAX_DISTRIBUTION_VALUES, read_copy_tracks
 
@@ -79,8 +80,8 @@ def saved_case(root, case):
     if len(records) != 1 or not records[0].get("output_match"):
         raise ValueError(f"{case}: missing or ambiguous saved timing reference")
     reference = records[0].get("stream_samples", [])
-    samples = json.loads((root / f"{case}_profile_samples.json").read_text(encoding="utf-8"))
-    counters = json.loads((root / f"{case}_profile_counters.json").read_text(encoding="utf-8"))
+    samples = json.loads(saved_case_file(root, case, "profile_samples.json").read_text(encoding="utf-8"))
+    counters = json.loads(saved_case_file(root, case, "profile_counters.json").read_text(encoding="utf-8"))
     if not reference or not samples:
         raise ValueError(f"{case}: no completed saved requests")
     if any(
@@ -112,8 +113,9 @@ def reanalyze(runs, output, report, stream_name="auto"):
             if line.startswith(("TARGET_GAPS_US ", "TARGET_DIRECTION_GAPS_US "))
         ]
         profiles[case] = dict(scan=scan, bubble_stats=bubbles)
-        (output / f"{case}_profile_report.json").write_text(json.dumps(profiles[case]), encoding="utf-8")
-        (output / f"{case}_bubble_details.log").write_text(details, encoding="utf-8")
+        artifacts = case_directory(output, case)
+        (artifacts / "profile_report.json").write_text(json.dumps(profiles[case]), encoding="utf-8")
+        (artifacts / "bubble_details.log").write_text(details, encoding="utf-8")
         report(
             "PROFILE_CHECK "
             + json.dumps(

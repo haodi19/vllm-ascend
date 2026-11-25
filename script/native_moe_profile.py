@@ -16,6 +16,7 @@ from inspect_moe_profiler_clocks import discover_roots
 from inspect_native_profile_nesting import audit_host_nesting
 from moe_host_memory import after_service_memory, check_host_memory, log_memory
 from moe_tpot import streaming_completion
+from native_moe_artifacts import case_directory
 from run_verified_cpp_tests import ensure_profile_storage, request, wait_profile
 from verify_memcpy_gaps import inspect_offload_trace
 
@@ -198,6 +199,7 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     profiles = {}
     for case, original in commands.items():
+        artifacts = case_directory(root, case)
         directory = root / "profile" / case
         directory.mkdir(parents=True)
         ensure_profile_storage(
@@ -207,9 +209,9 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
         wait_port_free(args.timing_port)
         check_host_memory(f"before profile/{case}", report)
         command = profile_command(original, directory, args.timing_port)
-        log_path = root / f"{case}_profile.log"
+        log_path = artifacts / "profile.log"
         report(f"PROFILE_START {case}; separate diagnostic service; log={log_path}")
-        (root / f"{case}_profile_command.json").write_text(json.dumps(command), encoding="utf-8")
+        (artifacts / "profile_command.json").write_text(json.dumps(command), encoding="utf-8")
         with log_path.open("w", encoding="utf-8") as log:
             child = subprocess.Popen(
                 command, cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
@@ -246,7 +248,7 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                 request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
                 try:
                     before = request(opener, args.timing_port, "/clock/before", {}, timeout=args.profile_timeout)
-                    (root / f"{case}_clock_samples.json").write_text(json.dumps(before), encoding="utf-8")
+                    (artifacts / "clock_samples.json").write_text(json.dumps(before), encoding="utf-8")
                     request(opener, args.timing_port, "/start", {})
                     try:
                         samples = [
@@ -256,9 +258,9 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                     finally:
                         counters = request(opener, args.timing_port, "/stop", {}, timeout=40)
                     after = request(opener, args.timing_port, "/clock/after", {}, timeout=args.profile_timeout)
-                    (root / f"{case}_clock_samples.json").write_text(json.dumps(after), encoding="utf-8")
-                    (root / f"{case}_profile_samples.json").write_text(json.dumps(samples), encoding="utf-8")
-                    (root / f"{case}_profile_counters.json").write_text(json.dumps(counters), encoding="utf-8")
+                    (artifacts / "clock_samples.json").write_text(json.dumps(after), encoding="utf-8")
+                    (artifacts / "profile_samples.json").write_text(json.dumps(samples), encoding="utf-8")
+                    (artifacts / "profile_counters.json").write_text(json.dumps(counters), encoding="utf-8")
                     report("LOADING_STREAM_RUNTIME " + case + " " + json.dumps(counters.get("loading_stream")))
                 finally:
                     request(opener, args.port, "/stop_profile", {}, timeout=args.profile_timeout)
@@ -307,14 +309,14 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
         report(f"ALIGNED_PROFILE {case}: {captures[0]}")
         report("CLOCK_ALIGNMENT " + case + " " + json.dumps(mapping))
         scan, details = analyze_profile(trace, case, counters["count"], args.bubble_stream_name, report)
-        (root / f"{case}_bubble_details.log").write_text(details, encoding="utf-8")
+        (artifacts / "bubble_details.log").write_text(details, encoding="utf-8")
         bubble_stats = [
             json.loads(line.split(" ", 1)[1])
             for line in details.splitlines()
             if line.startswith(("TARGET_GAPS_US ", "TARGET_DIRECTION_GAPS_US "))
         ]
         profiles[case] = dict(scan=scan, mapping=mapping, aligned_profile=published, bubble_stats=bubble_stats)
-        (root / f"{case}_profile_report.json").write_text(json.dumps(profiles[case]), encoding="utf-8")
+        (artifacts / "profile_report.json").write_text(json.dumps(profiles[case]), encoding="utf-8")
     report(f"PROFILE_COMPLETE cases={','.join(profiles)}; each profile output matched the saved timing reference")
     report("PROFILE_MEASUREMENT: Host gap = next task entry - previous task return; includes zero-load tasks.")
     report(

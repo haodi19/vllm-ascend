@@ -29,6 +29,7 @@ from moe_host_memory import (
     log_memory,
 )
 from moe_tpot import streaming_completion, summarize_streams
+from native_moe_artifacts import case_directory, saved_case_file
 from native_moe_profile import report_native_scale_memory, verify_full_submit
 from run_host_sync_stage2 import target_cmake_args
 from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB
@@ -138,7 +139,7 @@ def load_completed_timing_run(directory, port, required_cases=("python", "native
         if any(output != outputs[0] for output in outputs) or (reference is not None and outputs != reference):
             raise ValueError("Saved timing outputs/usage do not match")
         reference = outputs
-        command = json.loads((directory / f"{case}_command.json").read_text(encoding="utf-8"))
+        command = json.loads(saved_case_file(directory, case, "command.json").read_text(encoding="utf-8"))
         if not isinstance(command, list) or not all(isinstance(word, str) for word in command):
             raise ValueError("Saved command must be a string argv list")
         if command[1:4] != ["-m", "vllm.entrypoints.cli.main", "serve"]:
@@ -178,7 +179,9 @@ def continue_profile(args, root, env, report):
     )
     for case in commands:
         report("RESULT " + json.dumps(records[case]))
-        (root / f"{case}_command.json").write_text(json.dumps(commands[case]), encoding="utf-8")
+        artifacts = case_directory(root, case)
+        (artifacts / "command.json").write_text(json.dumps(commands[case]), encoding="utf-8")
+        (artifacts / "timing_result.json").write_text(json.dumps(records[case]), encoding="utf-8")
     report("| Version | Decode mean ms (primary) | TTFT mean ms | TPOT mean ms/token | HTTP E2E mean ms |")
     report("| --- | ---: | ---: | ---: | ---: |")
     for case in commands:
@@ -472,11 +475,10 @@ def main():
             wait_port_free(args.port)
             check_host_memory(f"before timing/{case}", report)
             command = commands[case]
+            artifacts = case_directory(root, case)
             # This exact argv preserves the original model and MTP settings.
-            (root / f"{case}_command.json").write_text(
-                json.dumps(command, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            log_path = root / f"{case}.log"
+            (artifacts / "command.json").write_text(json.dumps(command, ensure_ascii=False, indent=2), encoding="utf-8")
+            log_path = artifacts / "inference.log"
             report(f"START service={case}; log={log_path}")
             with log_path.open("w", encoding="utf-8") as log:
                 proc = subprocess.Popen(
@@ -538,21 +540,18 @@ def main():
                     for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
                         if "[MOE-NATIVE]" in line:
                             report(line)
-                    report(
-                        "RESULT "
-                        + json.dumps(
-                            dict(
-                                case=case,
-                                requests=len(samples),
-                                mean_ms=means[case],
-                                stream_samples=samples,
-                                timing=timings[case],
-                                output_match=True,
-                                output_match_scope="within_case" if len(cases) == 1 else "paired_run",
-                                digest=hashlib.sha256(json.dumps(outputs).encode()).hexdigest(),
-                            )
-                        )
+                    result = dict(
+                        case=case,
+                        requests=len(samples),
+                        mean_ms=means[case],
+                        stream_samples=samples,
+                        timing=timings[case],
+                        output_match=True,
+                        output_match_scope="within_case" if len(cases) == 1 else "paired_run",
+                        digest=hashlib.sha256(json.dumps(outputs).encode()).hexdigest(),
                     )
+                    (artifacts / "timing_result.json").write_text(json.dumps(result), encoding="utf-8")
+                    report("RESULT " + json.dumps(result))
                 except Exception as exc:
                     try:
                         report_service_failure(case, log_path, samples, completed, proc, exc, report)

@@ -72,6 +72,29 @@ bash script/run_native_moe_suite.sh --case native_full --npu 6 \
 
 仅测一种输出长度时，在相应命令追加 `--tokens 5` 或 `--tokens 128`，仍需使用新目录。默认服务端口为 8156、独立计时端口为 18156；占用时传入 `--port` 和 `--timing-port`。批量入口沿用 5 GiB 剩余空间检查，profile 导出最多等 600 秒。结果位于根目录的 `token5/`、`token128/`；`status.txt` 逐轮记录退出码，根目录 `summary.txt` 在后台结束时合并生成。第一轮失败后仍尝试第二轮，合并摘要明确标记失败，不能当成完整对照通过。
 
+每个 token 目录内，三组日志、命令与数据分别归档，三组可视化集中放在 `profile/`。例如：
+
+```text
+native_three_way_01/
+├── run.log                         # 后台实时输出
+├── summary.txt                     # token5、token128 完整汇总
+├── status.txt
+├── token5/
+│   ├── summary.txt                 # 三组计时、Host 间隔、空泡及两种重统计方案
+│   ├── build.log
+│   ├── python/                     # inference.log、command.json、timing_result.json
+│   ├── native/                     # 同上，另含 profile.log、profile_counters.json 等
+│   ├── native_full/                # 每组均保留独立 profile 报告及 bubble_details.log
+│   ├── profile/
+│   │   ├── python/<采集目录>/
+│   │   ├── native/<采集目录>/
+│   │   └── native_full/<采集目录>/
+│   └── prefetch_overlap.json       # 三组计算早/晚完成与重统计的逐样本数据
+└── token128/                       # 结构与 token5 相同
+```
+
+导入对应组的 `<采集目录>` 即可查看已对齐的可视化。单组测试也使用相同结构，只生成所选组。旧版平铺的日志目录仍支持补采及离线分析，不需要手动搬文件。
+
 原 `run_native_moe_compare.py` 入口保留，可按 `--case`、`--max-tokens` 和 `--output-dir` 前台独立执行。计时阶段关闭 profiler/MSTX；profile 使用同次时钟对齐并自动识别加载流。`native_full` 必须同时出现原生图任务完成、共享 scale 校验和 `FULL_SUBMIT executed=` 记录，防止只注册但未执行新路径的测试被接受。
 
 每次完成 profile 后，脚本默认把以下分析追加到同一个 `summary.txt`，Python/native 分开运行时也一样，无需额外开关：

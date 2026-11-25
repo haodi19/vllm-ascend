@@ -11,6 +11,7 @@ from analyze_moe_overlap_difference import coordinates, transitions
 from analyze_prefetch_compute_overlap import MAX_EXAMPLES, ORDER_US, analyze
 from inspect_moe_profile import _stats
 from moe_experiment_tables import number, table
+from native_moe_artifacts import saved_case_file
 from reanalyze_native_moe_profiles import saved_case, saved_traces
 
 
@@ -303,7 +304,7 @@ def reanalyze(runs, output, report):
             if reference is not None and reference != expected:
                 raise ValueError("Python/native saved output references differ")
             reference = expected
-            counters = json.loads((root / f"{case}_profile_counters.json").read_text(encoding="utf-8"))
+            counters = json.loads(saved_case_file(root, case, "profile_counters.json").read_text(encoding="utf-8"))
             if bool(counters.get("native")) != (case in ("native", "native_full")):
                 raise ValueError(f"{case}: saved counters do not identify the expected update backend")
             report(f"START {case}: physical_npu={device}; trace={trace}")

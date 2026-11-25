@@ -15,6 +15,31 @@ import reanalyze_native_moe_profiles as runner
 
 
 class NativeReanalysisTests(unittest.TestCase):
+    def test_grouped_artifacts_support_reanalysis_and_do_not_fall_back_when_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            self.saved(root, "native")
+            artifacts = root / "native"
+            artifacts.mkdir()
+            for filename in ("profile_samples.json", "profile_counters.json"):
+                legacy = root / f"native_{filename}"
+                (artifacts / filename).write_bytes(legacy.read_bytes())
+                legacy.unlink()
+            before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            output = Path(directory) / "analysis"
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(output)]), 0)
+            self.assertTrue((output / "native/profile_report.json").is_file())
+            self.assertTrue((output / "native/bubble_details.log").is_file())
+            self.assertEqual(before, {p: p.read_bytes() for p in root.rglob("*") if p.is_file()})
+            # A stale legacy success must not mask an invalid current report.
+            (root / "native_profile_counters.json").write_bytes((artifacts / "profile_counters.json").read_bytes())
+            (artifacts / "profile_counters.json").write_text(
+                '{"count":3,"mstx_errors":0,"errors":0,"dropped":1}', encoding="utf-8"
+            )
+            with self.assertRaisesRegex(ValueError, "incomplete saved Host counters"):
+                runner.saved_case(root, "native")
+
     def saved(self, root, case):
         trace = root / f"profile/{case}/capture/ASCEND_PROFILER_OUTPUT/trace_view.json"
         trace.parent.mkdir(parents=True)

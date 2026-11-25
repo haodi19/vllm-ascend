@@ -7,6 +7,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from analyze_callback_gaps import MAX_INTERVALS, events, fields
+from native_moe_artifacts import saved_case_file
 
 MAX_EXAMPLES = 6
 MAX_TRACES = 8
@@ -123,7 +124,7 @@ def main(argv=None):
             print(f"TRACE case={case}; path={trace}", flush=True)
             try:
                 audit = audit_host_nesting(trace)
-                counters = args.run / f"{case}_profile_counters.json"
+                counters = saved_case_file(args.run, case, "profile_counters.json")
                 expected = json.loads(counters.read_text(encoding="utf-8"))["count"] if counters.exists() else None
                 print(
                     "HOST_NESTING_AUDIT "

@@ -122,7 +122,11 @@ class NativeRunnerTests(unittest.TestCase):
                 self.assertIn("cross-version output parity and speedup not evaluated", text)
                 self.assertNotIn("mean change=", text)
                 other = "python" if case == "native" else "native"
-                self.assertFalse((output / f"{other}_command.json").exists())
+                self.assertFalse((output / other).exists())
+                self.assertTrue((output / case / "inference.log").is_file())
+                self.assertTrue((output / case / "command.json").is_file())
+                self.assertFalse((output / f"{case}_command.json").exists())
+                self.assertEqual(json.loads((output / case / "timing_result.json").read_text()), rows[0])
                 # A single-case directory can also resume just its own profile.
                 records, commands, _, tokens = runner.load_completed_timing_run(output, 8157, (case,))
                 self.assertEqual(list(commands), [case])
@@ -139,6 +143,12 @@ class NativeRunnerTests(unittest.TestCase):
             text = (output / "summary.txt").read_text(encoding="utf-8")
             self.assertIn("native_full vs native", text)
             self.assertIn("native_full vs python", text)
+            self.assertEqual({p.name for p in output.iterdir() if p.is_dir()}, set(launched))
+            for case in launched:
+                row = json.loads((output / case / "timing_result.json").read_text())
+                self.assertEqual(row["case"], case)
+                config = json.loads(json.loads((output / case / "command.json").read_text())[-1])
+                self.assertEqual(config["expert_offload_config"]["host_update_backend"], case)
 
     def test_combined_run_still_launches_both_and_compares(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -159,6 +169,8 @@ class NativeRunnerTests(unittest.TestCase):
             text = (output / "summary.txt").read_text(encoding="utf-8")
             self.assertIn("outputs/usage differ between timed requests", text)
             self.assertNotIn("RESULT ", text)
+            self.assertTrue((output / "python/python_partial.json").is_file())
+            self.assertFalse((output / "python/timing_result.json").exists())
 
     def saved_timing_fixture(self, directory, tokens=128):
         library = directory / "libhost_sync_device.so"
@@ -236,6 +248,9 @@ class NativeRunnerTests(unittest.TestCase):
             summary = (output / "summary.txt").read_text(encoding="utf-8")
             self.assertIn("TIMING_SOURCE=", summary)
             self.assertIn("| native |", summary)
+            for case, command in commands.items():
+                self.assertEqual(json.loads((output / case / "command.json").read_text()), command)
+                self.assertEqual(json.loads((output / case / "timing_result.json").read_text())["case"], case)
 
     def test_profile_continuation_rejects_incomplete_and_mismatched_results(self):
         with tempfile.TemporaryDirectory() as temporary:

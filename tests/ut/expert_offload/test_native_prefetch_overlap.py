@@ -18,7 +18,7 @@ from analyze_prefetch_compute_overlap import bind_streams
 from diagnose_mte_wait_timeline import read_trace
 
 
-def capture(root, case, *, bad_tail=False):
+def capture(root, case, *, bad_tail=False, saved_reference=True):
     path = root / f"profile/{case}/capture/ASCEND_PROFILER_OUTPUT/trace_view.json"
     path.parent.mkdir(parents=True)
     origin = Decimal("1795507048074000.043")
@@ -75,6 +75,8 @@ def capture(root, case, *, bad_tail=False):
         ),
         encoding="utf-8",
     )
+    if not saved_reference:
+        return path
     sample = dict(digest="same", usage=dict(completion_tokens=5))
     (root / "summary.txt").write_text(
         "PROFILE_ONLY: physical_npu=6\nRESULT "
@@ -171,12 +173,9 @@ class NativePrefetchOverlapTests(unittest.TestCase):
                         )
                     return dict(samples=[])
 
-                def export(directory, _timeout, root=root, summary=summary):
-                    # Simulate the profiler writing a completed, aligned fixture;
-                    # keep the runner's timing summary, as a real exporter does.
-                    original = summary.read_bytes()
-                    capture(root, directory.name)
-                    summary.write_bytes(original)
+                def export(directory, _timeout, root=root):
+                    # The profiler writes only the capture, not saved service metadata.
+                    capture(root, directory.name, saved_reference=False)
 
                 with (
                     patch.object(profile.subprocess, "Popen", side_effect=launch),
@@ -198,6 +197,21 @@ class NativePrefetchOverlapTests(unittest.TestCase):
                 results = json.loads((root / "prefetch_overlap.json").read_text(encoding="utf-8"))
                 self.assertEqual(set(results), set(cases))
                 for case, result in results.items():
+                    artifacts = root / case
+                    self.assertTrue((root / "profile" / case / "capture").is_dir())
+                    for filename in (
+                        "profile.log",
+                        "profile_command.json",
+                        "clock_samples.json",
+                        "profile_samples.json",
+                        "profile_counters.json",
+                        "profile_report.json",
+                        "bubble_details.log",
+                    ):
+                        self.assertTrue((artifacts / filename).is_file(), filename)
+                        self.assertFalse((root / f"{case}_{filename}").exists(), filename)
+                    counters = json.loads((artifacts / "profile_counters.json").read_text())
+                    self.assertEqual(bool(counters["native"]), case != "python")
                     self.assertEqual(result["physical_npu"], 6)
                     values = result["direct"]["all_samples"]
                     self.assertEqual(values["original"]["count"], 2)
