@@ -6,6 +6,7 @@ execute native planning, ACL H2D and completion without calling Python/Torch.
 """
 
 import importlib
+import json
 
 
 def validate_native_update_config(config):
@@ -55,6 +56,8 @@ def validate_native_update_config(config):
 
 def dense_span(shape, strides):
     """Return dense per-slot element count, rejecting holes and aliasing."""
+    if len(shape) != len(strides):
+        raise ValueError("scale shape/stride rank mismatch")
     expected = 1
     for size, stride in sorted(zip(shape, strides), key=lambda pair: pair[1]):
         if size < 1 or stride < 0:
@@ -65,6 +68,43 @@ def dense_span(shape, strides):
             raise ValueError("native scale slot must be dense and non-overlapping")
         expected *= size
     return expected
+
+
+def allocate_scale_like(allocate, template):
+    """Allocate one backing buffer and expose the final dense scale layout."""
+    dense_span(template.shape, template.stride())
+    buffer = allocate(tuple(template.shape), template.dtype)
+    return buffer.as_strided(tuple(template.shape), tuple(template.stride()))
+
+
+def same_scale_layout(source, destination):
+    return tuple(source.shape) == tuple(destination.shape) and all(
+        size == 1 or src_stride == dst_stride
+        for size, src_stride, dst_stride in zip(destination.shape, source.stride(), destination.stride())
+    )
+
+
+def scale_copy_views(source, destination):
+    """Use byte copies for matching dense layouts; retain Tensor copy semantics otherwise.
+
+    Used during native eager/prefill only. Decode replay uses C++ ACL addresses.
+    Storage offsets are essential: a prefill expert is a slice of a larger pool.
+    """
+    if source.dtype != destination.dtype or not same_scale_layout(source, destination):
+        return source, destination
+    try:
+        elements = dense_span(source.shape, source.stride())
+    except ValueError:
+        return source, destination
+    views = []
+    for tensor in (source, destination):
+        size = elements * tensor.element_size()
+        start = tensor.storage_offset() * tensor.element_size()
+        storage = tensor.untyped_storage()
+        if start < 0 or start + size > storage.nbytes():
+            raise ValueError("native scale copy exceeds storage")
+        views.append(storage[start : start + size])
+    return tuple(views)
 
 
 def pack_scale(torch, source, destination):
@@ -83,16 +123,12 @@ def pack_scale(torch, source, destination):
     return packed
 
 
-def prepare_scale(torch, source, destination):
+def prepare_scale(torch, source, destination, *, require_reuse=False):
     """Reuse pinned physical bytes when safe; otherwise pack once at startup."""
     elements = dense_span(destination.shape, destination.stride())
     if source.device.type != "cpu" or source.numel() != elements:
         raise ValueError("native scale source must be an equal-sized CPU tensor")
-    same_layout = tuple(source.shape) == tuple(destination.shape) and all(
-        size == 1 or src_stride == dst_stride
-        for size, src_stride, dst_stride in zip(destination.shape, source.stride(), destination.stride())
-    )
-    compatible = same_layout or (source.is_contiguous() and destination.is_contiguous())
+    compatible = same_scale_layout(source, destination) or (source.is_contiguous() and destination.is_contiguous())
     if source.dtype == destination.dtype and source.is_pinned() and compatible:
         # data_ptr includes storage_offset. A source may be a view of a slab.
         nbytes = elements * source.element_size()
@@ -100,6 +136,8 @@ def prepare_scale(torch, source, destination):
         if offset < 0 or offset + nbytes > source.untyped_storage().nbytes():
             raise ValueError("native scale source range exceeds storage")
         return source, True
+    if require_reuse:
+        raise ValueError("native MXFP scale was not loaded in final pinned layout; refusing a duplicate bank")
     return pack_scale(torch, source, destination), False
 
 
@@ -127,6 +165,8 @@ class NativeUpdateRuntime:
         self.tables = []
         self.packed_bytes = 0
         self.reused_bytes = 0
+        self.replaced_bytes = 0
+        self.derived_bytes = 0
         self.targets = []
         self.profiler = None
         if manager.offload_config.callback_mstx_enabled:
@@ -141,8 +181,23 @@ class NativeUpdateRuntime:
             self.tables.append(self._prepare_layer(layer_idx, layer, expert_weight))
         print(
             f"[MOE-NATIVE] prepared layers={len(self.tables)} scale_buffer_bytes={self.packed_bytes} "
-            f"scale_reused_bytes={self.reused_bytes}; "
-            "graph callbacks=GIL-free; eager/prefill=original; Python callback timers disabled",
+            f"scale_reused_bytes={self.reused_bytes} scale_replaced_bytes={self.replaced_bytes} "
+            f"scale_derived_bytes={self.derived_bytes} scale_duplicate_bytes=0; "
+            "graph callbacks=GIL-free; eager/prefill=shared-scale-storage; Python callback timers disabled",
+            flush=True,
+        )
+        print(
+            "[MOE-NATIVE] SCALE_MEMORY "
+            + json.dumps(
+                {
+                    "policy": "shared_final_layout_v1",
+                    "layers": len(self.tables),
+                    "duplicate_bytes": 0,
+                    "reused_bytes": self.reused_bytes,
+                    "replaced_bytes": self.replaced_bytes,
+                    "derived_bytes": self.derived_bytes,
+                }
+            ),
             flush=True,
         )
 
@@ -178,18 +233,23 @@ class NativeUpdateRuntime:
                 if target is None or index >= len(layers):
                     continue
                 local_ids = [m._shard_local(eid) for eid in range(experts)]
-                if any(eid is None for eid in local_ids):
+                if local_ids != list(range(experts)) or len(layers[index]) != experts:
                     raise ValueError("native updates require all experts in local CPU buffers")
-                cpu_sources = [layers[index][eid] for eid in local_ids]
+                # This is the canonical manager list, also used by eager/prefill.
+                # If another quantization needs conversion, replace one source
+                # at a time instead of retaining a second expert-scale bank.
+                cpu_sources = layers[index]
                 targets[name] = (target, tensor_layout(target))
-                self._add_scale(target, cpu_sources, sources, destinations, sizes)
+                self._add_scale(
+                    target, cpu_sources, sources, destinations, sizes, require_reuse=target.dtype == self.torch.uint8
+                )
         if hasattr(layer, "w13_weight_scale_fp32"):
             # Match the old runtime .to(float32) on the logical scale values.
             cpu_sources = [
                 m.scale_cpu_buffers["w13_weight_scale"][index][m._shard_local(eid)].to(layer.w13_weight_scale.dtype)
                 for eid in range(experts)
             ]
-            self._add_scale(layer.w13_weight_scale_fp32, cpu_sources, sources, destinations, sizes)
+            self._add_scale(layer.w13_weight_scale_fp32, cpu_sources, sources, destinations, sizes, derived=True)
             targets["w13_weight_scale_fp32"] = (layer.w13_weight_scale_fp32, tensor_layout(layer.w13_weight_scale_fp32))
         self.targets.append(targets)
         table = self.native.NativeTransfers(sources, destinations, sizes, self.stream, "", False)
@@ -197,7 +257,7 @@ class NativeUpdateRuntime:
             table.set_profiler(self.profiler)
         return table
 
-    def _add_scale(self, target, cpu_sources, sources, destinations, sizes):
+    def _add_scale(self, target, cpu_sources, sources, destinations, sizes, *, require_reuse=False, derived=False):
         if self.npu.get_npu_format(target) not in (0, 2):
             raise ValueError("native scales require base NCHW/ND storage; packed device formats are unsupported")
         if target.shape[0] < len(destinations):
@@ -216,12 +276,18 @@ class NativeUpdateRuntime:
         sizes.append(size)
         self.owners.append(target)
         for eid, src in enumerate(cpu_sources):
-            packed, reused = prepare_scale(self.torch, src, template)
+            packed, reused = prepare_scale(self.torch, src, template, require_reuse=require_reuse)
+            cpu_sources[eid] = packed
             self.owners.append(packed)
-            if reused:
+            if derived:
+                # A separate fp32 value is required by this quantization, not a
+                # second physical-layout copy of the same scale representation.
+                self.derived_bytes += size
+                self.packed_bytes += size
+            elif reused:
                 self.reused_bytes += size
             else:
-                self.packed_bytes += size
+                self.replaced_bytes += size
             sources[eid].append(packed.data_ptr())
 
     def task(self, args):

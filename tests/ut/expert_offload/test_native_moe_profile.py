@@ -44,6 +44,34 @@ def fixture():
 
 
 class NativeProfileTests(unittest.TestCase):
+    def test_native_scale_allocation_contract_reported_and_enforced(self):
+        record = dict(
+            policy="shared_final_layout_v1",
+            layers=43,
+            duplicate_bytes=0,
+            reused_bytes=8657043456,
+            replaced_bytes=0,
+            derived_bytes=0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "native.log"
+            log.write_text("(EngineCore) [MOE-NATIVE] SCALE_MEMORY " + json.dumps(record), encoding="utf-8")
+            reports = []
+            self.assertEqual(profile.report_native_scale_memory(log, reports.append), [record])
+            self.assertIn('"duplicate_bytes": 0', reports[0])
+            for bad in (
+                dict(record, duplicate_bytes=123),
+                dict(record, policy="old"),
+                dict(record, layers=0),
+                dict(record, reused_bytes=-1),
+            ):
+                log.write_text("[MOE-NATIVE] SCALE_MEMORY " + json.dumps(bad), encoding="utf-8")
+                with self.assertRaises((ValueError, RuntimeError)):
+                    profile.report_native_scale_memory(log, reports.append)
+            log.write_text("[MOE-NATIVE] prepared layers=43 scale_buffer_bytes=8657043456", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "evidence missing"):
+                profile.report_native_scale_memory(log, reports.append)
+
     def test_profile_failure_summary_contains_engine_oom_before_api_tail(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "native_profile.log"

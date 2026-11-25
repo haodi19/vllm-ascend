@@ -3,6 +3,7 @@
 
 import importlib.util
 from pathlib import Path
+from unittest.mock import patch
 
 import _vllm_ascend_lrc as native
 import numpy as np
@@ -13,6 +14,64 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("native_update", ROOT / "vllm_ascend/expert_offload/native_update.py")
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
+
+
+def check_shared_mxfp_scale(n, k):
+    """One loaded CPU buffer: original reference, eager, prefill, native replay.
+
+    Include realistic per-expert byte sizes and nonzero destination offsets.
+    The CPU loader tests separately exercise both w1/w3 assembly orders.
+    """
+    raw = (torch.arange(n * k).reshape(n, k) % 251).to(torch.uint8)
+    logical = raw.reshape(n, k // 2, 2).transpose(0, 1)
+    shape, stride = tuple(logical.shape), tuple(logical.stride())
+    target = torch.empty_strided((2,) + shape, (n * k,) + stride, dtype=torch.uint8, device="npu")
+    pool = torch.empty_strided((3,) + shape, (n * k,) + stride, dtype=torch.uint8, device="npu")
+    original = torch.empty(shape, dtype=torch.uint8, device="npu")
+    original.copy_(logical.contiguous())
+    allocate = lambda shape, dtype: torch.empty(shape, dtype=dtype, pin_memory=True)
+    source = module.allocate_scale_like(allocate, logical)
+    source.copy_(logical)
+    pointer = source.data_ptr()
+    with patch.object(module, "pack_scale", side_effect=AssertionError("unexpected second scale buffer")):
+        reused, ok = module.prepare_scale(torch, source, target[1], require_reuse=True)
+    if not ok or reused is not source:
+        raise AssertionError("native runtime did not reuse the loaded scale")
+    stream = torch.npu.Stream()
+    with torch.npu.stream(stream):
+        # Exercise the actual Storage copy path used by eager/hot preload and prefill.
+        for tensor, slot in ((target, 1), (pool, 2)):
+            tensor.zero_()
+            src, dst = module.scale_copy_views(source, tensor[slot])
+            if isinstance(src, torch.Tensor) or isinstance(dst, torch.Tensor):
+                raise AssertionError("matching final layout fell back to Tensor.copy_")
+            if src.data_ptr() != pointer or dst.data_ptr() != tensor[slot].data_ptr():
+                raise AssertionError("scale storage offset was lost")
+            dst.copy_(src, non_blocking=True)
+        stream.synchronize()
+    for tensor, slot in ((target, 1), (pool, 2)):
+        torch.testing.assert_close(tensor[slot].cpu(), original.cpu(), rtol=0, atol=0)
+        if tensor[0].cpu().any():
+            raise AssertionError("scale copy overwrote another expert slot")
+    # C++ decode addresses must read those exact same CPU bytes.
+    table = native.NativeTransfers(
+        [[pointer], [pointer]], [[target[0].data_ptr()]], [n * k], int(stream.npu_stream), "", False
+    )
+    policy = native.Policy(1, 2, 32, 0.9, 1.0, 0.5, 0.3, 0.01, True)
+    task = native.native_update_task(
+        policy,
+        table,
+        0,
+        np.array([[1]], dtype=np.int64),
+        None,
+        np.array([0, -1], dtype=np.int32),
+        False,
+        1,
+        (source, target),
+    )
+    native.run_native_update_for_test(task)
+    torch.testing.assert_close(target[0].cpu(), original.cpu(), rtol=0, atol=0)
+    print(f"PASS shared scale loader/eager/prefill/native: bytes={n * k}; duplicate_bytes=0", flush=True)
 
 
 def main():
@@ -47,6 +106,8 @@ def main():
             native.run_native_update_for_test(task)
             torch.testing.assert_close(target.cpu(), reference.cpu(), rtol=0, atol=0)
             print(f"PASS native scale copy dtype={dtype} shape={shape} stride={stride}", flush=True)
+    for n, k in ((16, 8), (2048, 128), (4096, 128)):
+        check_shared_mxfp_scale(n, k)
 
 
 if __name__ == "__main__":

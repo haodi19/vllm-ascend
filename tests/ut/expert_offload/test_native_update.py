@@ -3,10 +3,12 @@
 
 import ast
 import ctypes
+import gc
 import importlib.util
 import sys
 import time
 import unittest
+import weakref
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
@@ -97,13 +99,28 @@ class ScaleLoading(unittest.TestCase):
             "_load_scale_shard",
             "_finalize_offload",
             "process_weights_after_loading",
+            "_alloc_prefill_pool_slot",
+            "_build_prefill_h2d_tasks",
+            "_build_quant_attr_h2d_tasks",
+            "_quant_copy_views",
         }
         manager.body = [n for n in manager.body if isinstance(n, ast.FunctionDef) and n.name in names]
-        scope = {"torch": torch}
+        scope = {
+            "torch": torch,
+            "torch_npu": SimpleNamespace(get_npu_format=lambda t: 2),
+            "_expert_weight": getattr,
+            "H2DCopyTask": SimpleNamespace,
+        }
         exec(compile(ast.Module(body=[manager], type_ignores=[]), "manager", "exec"), scope)
         cls.Manager = scope["ExpertOffloadManager"]
 
-    def test_native_packing_preserves_original_prefill_buffer_and_layout(self):
+    def setUp(self):
+        modules = {self.layout_module.__name__: self.layout_module, "vllm_ascend.expert_offload.native_update": config}
+        patcher = patch.dict(sys.modules, modules)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_native_loads_final_layout_once_and_original_backend_stays_contiguous(self):
         torch = self.torch
         with patch.dict(sys.modules, {self.layout_module.__name__: self.layout_module}):
             for assembled in (False, True):
@@ -127,25 +144,247 @@ class ScaleLoading(unittest.TestCase):
                     for target in (torch.empty_like(expected), torch.empty(expected.shape, dtype=torch.uint8)):
                         target.copy_(source.reshape(target.shape))
                         torch.testing.assert_close(target, expected)
-                    self.assertTrue(source.is_contiguous())
                     if backend == "native":
-
-                        class CpuFactory:
-                            @staticmethod
-                            def empty_strided(shape, strides, **kwargs):
-                                kwargs.pop("pin_memory")
-                                return torch.empty_strided(shape, strides, **kwargs)
-
-                        with patch.object(torch.Tensor, "is_pinned", return_value=True):
-                            packed, reused = config.prepare_scale(CpuFactory, source, expected)
-                        self.assertFalse(reused)
-                        self.assertNotEqual(packed.data_ptr(), source.data_ptr())
-                        self.assertTrue(source.is_contiguous())
-                        torch.testing.assert_close(source, expected)
+                        self.assertEqual(source.stride(), expected.stride())
+                        with (
+                            patch.object(torch.Tensor, "is_pinned", return_value=True),
+                            patch.object(config, "pack_scale", side_effect=AssertionError("second scale allocation")),
+                        ):
+                            packed, reused = config.prepare_scale(torch, source, expected, require_reuse=True)
+                        self.assertTrue(reused)
+                        self.assertIs(packed, source)
                         self.assertEqual(
                             ctypes.string_at(packed.data_ptr(), raw.numel()),
                             ctypes.string_at(raw.data_ptr(), raw.numel()),
                         )
+                    else:
+                        self.assertTrue(source.is_contiguous())
+
+    def test_eager_and_prefill_share_scale_storage_and_preserve_slot_offsets(self):
+        torch = self.torch
+        for backend in ("python", "native"):
+            with self.subTest(backend=backend):
+                manager = self.Manager()
+                manager.offload_config = SimpleNamespace(shard_per_rank=False, host_update_backend=backend)
+                manager.ep_size = 1
+                manager.scale_cpu_buffers, manager.offset_cpu_buffers, manager.scale_bias_cpu_buffers = {}, {}, {}
+                manager._allocate_expert_host_tensor = lambda shape, dtype: torch.empty(shape, dtype=dtype)
+                manager._shard_local = lambda eid: eid
+                raw = torch.arange(128, dtype=torch.uint8).reshape(16, 8)
+                layer = SimpleNamespace(
+                    w13_weight_scale=torch.empty((2, 16, 8), dtype=torch.uint8),
+                    w13_weight=torch.empty((2, 2, 4), dtype=torch.uint8),
+                    w2_weight=torch.empty((2, 2, 4), dtype=torch.uint8),
+                )
+                manager._init_layer_scale_buffers(layer, 0, 3)
+                for eid, source in enumerate(manager.scale_cpu_buffers["w13_weight_scale"][0]):
+                    manager._copy_scale_direct(source, raw + eid)
+                layer.w13_weight_scale = self.layout_module.apply_mxfp4_weight_scale_layout(layer.w13_weight_scale)
+                for name in (
+                    "w13",
+                    "w2",
+                    "w13_scale",
+                    "w13_scale_fp32",
+                    "w13_offset",
+                    "w2_scale",
+                    "w2_offset",
+                    "w13_scale_bias",
+                    "w2_scale_bias",
+                ):
+                    setattr(manager, "_prefill_" + name, [])
+                manager._alloc_prefill_pool_slot(layer, "cpu", torch.uint8, 3)
+                pool = manager._prefill_w13_scale[0]
+                if backend == "native":
+                    self.assertEqual(pool.stride(), layer.w13_weight_scale.stride())
+                else:
+                    self.assertTrue(pool.is_contiguous())
+                manager.w13_expert_size_bytes = manager.w2_expert_size_bytes = 8
+                weight = torch.ones(8, dtype=torch.uint8)
+                manager._expert_src_storage = lambda *args, weight=weight: weight.untyped_storage()
+                pool.zero_()
+                # Deliberately use different source expert and nonzero target slot.
+                tasks = manager._build_prefill_h2d_tasks(0, 0, 2, 1)
+                quant = tasks[-1]
+                src = manager.scale_cpu_buffers["w13_weight_scale"][0][2]
+                self.assertEqual(quant.source.data_ptr(), src.data_ptr())
+                self.assertEqual(quant.destination.data_ptr(), pool[1].data_ptr())
+                if backend == "native":
+                    self.assertIsInstance(quant.source, torch.UntypedStorage)
+                    self.assertIsInstance(quant.destination, torch.UntypedStorage)
+                    self.assertEqual(quant.source.nbytes(), 128)
+                else:
+                    self.assertIsInstance(quant.source, torch.Tensor)
+                quant.destination.copy_(quant.source)
+                expected = self.layout_module.apply_mxfp4_weight_scale_layout(raw + 2)
+                torch.testing.assert_close(pool[1], expected)
+                self.assertFalse(pool[0].any())
+                self.assertFalse(pool[2].any())
+                eager = manager._build_quant_attr_h2d_tasks(layer, 0, 2, 1)[0]
+                self.assertEqual(eager.source.data_ptr(), src.data_ptr())
+                eager.destination.copy_(eager.source)
+                torch.testing.assert_close(layer.w13_weight_scale[1], expected)
+
+    def test_checkpoint_shards_load_in_either_order_without_another_bank(self):
+        torch = self.torch
+        for order in (("w1", "w3"), ("w3", "w1")):
+            manager = self.Manager()
+            manager.offload_config = SimpleNamespace(shard_per_rank=False, host_update_backend="native")
+            manager.ep_size = 1
+            manager.scale_cpu_buffers, manager.offset_cpu_buffers, manager.scale_bias_cpu_buffers = {}, {}, {}
+            allocations = []
+
+            def allocate(shape, dtype, allocations=allocations):
+                result = torch.empty(shape, dtype=dtype)
+                allocations.append(result.data_ptr())
+                return result
+
+            manager._allocate_expert_host_tensor = allocate
+            layer = SimpleNamespace(
+                w13_weight_scale=torch.empty((2, 16, 8), dtype=torch.uint8),
+                w2_weight_scale=torch.empty((2, 8, 8), dtype=torch.uint8),
+            )
+            manager._init_layer_scale_buffers(layer, 0, 3)
+            self.assertEqual(len(allocations), 6)
+            manager._shard_local = lambda eid: eid
+            manager._weight_load_calls = 0
+            manager._scale_shard_temp = {}
+            # Queue work to ensure checkpoint views can be modified/unmapped
+            # before the actual copy. Each submitted job must own its inputs.
+            jobs = []
+            manager._get_load_pool = lambda jobs=jobs: SimpleNamespace(
+                submit=lambda function, *arguments: jobs.append((function, arguments))
+            )
+            manager._track_load_future = lambda future: None
+            raw = torch.arange(128, dtype=torch.uint8).reshape(16, 8)
+            for shard in order:
+                checkpoint = (raw[:8] if shard == "w1" else raw[8:]).clone()
+                manager._load_scale_shard(0, 1, "w13_weight_scale", shard, checkpoint)
+                checkpoint.zero_()
+            checkpoint = raw[:8].clone()
+            manager._load_scale_shard(0, 2, "w2_weight_scale", "w2", checkpoint)
+            checkpoint.zero_()
+            for fn, args in jobs:
+                fn(*args)
+            self.assertFalse(manager._scale_shard_temp)
+            for name, eid, expected in (("w13_weight_scale", 1, raw), ("w2_weight_scale", 2, raw[:8])):
+                tensor = manager.scale_cpu_buffers[name][0][eid]
+                self.assertIn(tensor.data_ptr(), allocations)
+                torch.testing.assert_close(tensor, self.layout_module.apply_mxfp4_weight_scale_layout(expected))
+                self.assertEqual(
+                    ctypes.string_at(tensor.data_ptr(), tensor.numel()),
+                    ctypes.string_at(expected.data_ptr(), expected.numel()),
+                )
+
+    def test_scale_byte_copy_rejects_mismatched_or_aliasing_layouts(self):
+        torch = self.torch
+        source = torch.arange(12).reshape(3, 4).t()
+        for target in (source.contiguous(), source.to(torch.float32), torch.empty(12, dtype=source.dtype)):
+            left, right = config.scale_copy_views(source, target)
+            self.assertIs(left, source)
+            self.assertIs(right, target)
+        source = torch.zeros(1).expand(3, 4)
+        target = torch.zeros(1).expand(3, 4)
+        self.assertIs(config.scale_copy_views(source, target)[0], source)
+
+    def test_mxfp_layout_mismatch_cannot_silently_allocate_duplicate(self):
+        torch = self.torch
+        source = torch.zeros((4, 3), dtype=torch.uint8)
+        target = torch.empty_strided((4, 3), (1, 4), dtype=torch.uint8)
+        with patch.object(torch.Tensor, "is_pinned", return_value=True), patch.object(config, "pack_scale") as pack:
+            with self.assertRaisesRegex(ValueError, "refusing a duplicate"):
+                config.prepare_scale(torch, source, target, require_reuse=True)
+            pack.assert_not_called()
+
+    @unittest.skipUnless(lrc is not None, "build lrc_policy extension")
+    def test_loaded_scale_addresses_survive_runtime_registration_and_native_execution(self):
+        torch = self.torch
+        manager = self.Manager()
+        manager.offload_config = SimpleNamespace(
+            shard_per_rank=False, host_update_backend="native", callback_mstx_enabled=False
+        )
+        manager.ep_size = 1
+        manager.scale_cpu_buffers, manager.offset_cpu_buffers, manager.scale_bias_cpu_buffers = {}, {}, {}
+        manager._allocate_expert_host_tensor = lambda shape, dtype: torch.empty(shape, dtype=dtype)
+        layer = SimpleNamespace(
+            w13_weight=torch.zeros((2, 4), dtype=torch.uint8),
+            w2_weight=torch.zeros((2, 4), dtype=torch.uint8),
+            w13_weight_scale=torch.empty((2, 16, 8), dtype=torch.uint8),
+        )
+        manager._init_layer_scale_buffers(layer, 0, 3)
+        raw = torch.arange(128, dtype=torch.uint8).reshape(16, 8)
+        for eid, tensor in enumerate(manager.scale_cpu_buffers["w13_weight_scale"][0]):
+            manager._copy_scale_direct(tensor, raw + eid)
+        layer.w13_weight_scale = self.layout_module.apply_mxfp4_weight_scale_layout(layer.w13_weight_scale)
+        manager.moe_layers = [layer]
+        manager.num_total_experts = 3
+        manager.num_device_experts_for_layer = lambda index: 2
+        manager.w13_expert_size_bytes = manager.w2_expert_size_bytes = 4
+        manager._shard_local = lambda eid: eid
+        weights = [torch.full((4,), eid + 10, dtype=torch.uint8) for eid in range(3)]
+        manager._expert_src_storage = lambda index, eid, name: weights[eid].untyped_storage()
+        manager.load_stream = SimpleNamespace(npu_stream=1, synchronize=lambda: None)
+        manager.prefetch_topk = 1
+        manager.cache_policy = SimpleNamespace(_native=lrc.Policy(1, 3, 32, 0.9, 1.0, 0.5, 0.3, 0.01, True))
+        before = [t.data_ptr() for t in manager.scale_cpu_buffers["w13_weight_scale"][0]]
+        tables = []
+
+        def transfers(src, dst, sizes, stream, library, cpu):
+            tables.append((src, dst, sizes))
+            return lrc.NativeTransfers(src, dst, sizes, 0, "", True)
+
+        modules = {
+            "torch": torch,
+            "torch_npu": SimpleNamespace(get_npu_format=lambda t: 2),
+            "_vllm_ascend_lrc": SimpleNamespace(native_update_task=lrc.native_update_task, NativeTransfers=transfers),
+        }
+        with (
+            patch.object(config.importlib, "import_module", side_effect=modules.__getitem__),
+            patch.object(torch.Tensor, "is_pinned", return_value=True),
+            patch.object(config, "pack_scale", side_effect=AssertionError("second scale bank")),
+        ):
+            runtime = config.NativeUpdateRuntime(manager, getattr)
+            ids = torch.tensor([[2]], dtype=torch.int64)
+            mapping = np.array([0, 1, -1], dtype=np.int32)
+            task = runtime.task((ids, mapping, layer, 0, None, False))
+            lrc.run_native_update_for_test(task)
+        self.assertEqual([row[-1] for row in tables[0][0]], before)
+        self.assertEqual(runtime.reused_bytes, 3 * raw.numel())
+        self.assertEqual(runtime.packed_bytes + runtime.replaced_bytes + runtime.derived_bytes, 0)
+        torch.testing.assert_close(layer.w13_weight[mapping[2]], weights[2])
+        torch.testing.assert_close(
+            layer.w13_weight_scale[mapping[2]], self.layout_module.apply_mxfp4_weight_scale_layout(raw + 2)
+        )
+
+    def test_generic_scale_repack_replaces_canonical_buffer_without_retaining_old(self):
+        torch = self.torch
+        runtime = config.NativeUpdateRuntime.__new__(config.NativeUpdateRuntime)
+        runtime.torch = torch
+        runtime.npu = SimpleNamespace(get_npu_format=lambda t: 2)
+        runtime.owners = []
+        runtime.packed_bytes = runtime.reused_bytes = runtime.replaced_bytes = runtime.derived_bytes = 0
+        old = torch.arange(12, dtype=torch.float32).reshape(4, 3).clone()
+        old_ref = weakref.ref(old)
+        canonical = [old]
+        target = torch.empty_strided((1, 4, 3), (12, 1, 4), dtype=torch.float32)
+        expected = old.clone()
+        sources, destinations, sizes = [[]], [[]], []
+        del old
+
+        def pack(factory, src, dst):
+            result = torch.empty_strided(dst.shape, dst.stride(), dtype=dst.dtype)
+            result.copy_(src.reshape(dst.shape))
+            return result
+
+        with patch.object(config, "pack_scale", side_effect=pack):
+            runtime._add_scale(target, canonical, sources, destinations, sizes)
+        gc.collect()
+        self.assertIsNone(old_ref())
+        torch.testing.assert_close(canonical[0], expected)
+        self.assertEqual(sources, [[canonical[0].data_ptr()]])
+        self.assertEqual(runtime.packed_bytes, 0)
+        self.assertEqual(runtime.replaced_bytes, 48)
+        ctypes.memmove(destinations[0][0], sources[0][0], sizes[0])
+        torch.testing.assert_close(target[0], expected)
 
     def test_scale_fallback_conversion_and_offset_reuse(self):
         torch = self.torch

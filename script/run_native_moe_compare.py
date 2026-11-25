@@ -29,6 +29,7 @@ from moe_host_memory import (
     log_memory,
 )
 from moe_tpot import streaming_completion, summarize_streams
+from native_moe_profile import report_native_scale_memory
 from run_host_sync_stage2 import target_cmake_args
 from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB
 
@@ -361,7 +362,7 @@ def main():
             return continue_profile(args, root, env, report)
         report(
             "MTE Python update -> MTE native update; same cache/config; timed requests have no profiler/MSTX. "
-            "Native graph replay only; original eager/prefill. This is initial correctness/performance validation."
+            "Native graph replay; eager/prefill share final-layout scales. This is correctness/performance validation."
         )
         report(
             "PRIMARY=decode_ms (first to last content); TPOT=decode/(actual output tokens-1); "
@@ -504,6 +505,8 @@ def main():
                         not in log_path.read_text(encoding="utf-8", errors="replace")
                     ):
                         raise RuntimeError("no confirmed native graph execution; refusing fallback-only comparison")
+                    if case == "native":
+                        report_native_scale_memory(log_path, report)
                     if reference is None:
                         reference = outputs
                     elif outputs != reference:

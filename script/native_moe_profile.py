@@ -27,6 +27,26 @@ FAILURE_LOG_CONTEXT = 2
 FAILURE_LOG_MAX_MATCHES = 8
 
 
+def report_native_scale_memory(log_path, report):
+    """Require the current allocation contract in both timing and profile services."""
+    prefix = "[MOE-NATIVE] SCALE_MEMORY "
+    records = [
+        json.loads(line.split(prefix, 1)[1])
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if prefix in line
+    ]
+    if not records:
+        raise RuntimeError("Native scale allocation evidence missing; verify the service uses current project sources")
+    for record in records:
+        if record.get("policy") != "shared_final_layout_v1" or record.get("duplicate_bytes") != 0:
+            raise RuntimeError("Native service retained duplicate scales or used an unknown allocation policy")
+        for key in ("layers", "reused_bytes", "replaced_bytes", "derived_bytes"):
+            if type(record.get(key)) is not int or record[key] < (1 if key == "layers" else 0):
+                raise ValueError(f"Invalid native scale memory field: {key}")
+        report("NATIVE_SCALE_MEMORY " + json.dumps(record))
+    return records
+
+
 def report_profile_failure(case, log_path, error, report):
     """Keep the engine failure visible in summary.txt before cleanup adds noise."""
     report(f"PROFILE_SERVICE_FAILURE case={case}; error={type(error).__name__}: {error}; service_log={log_path}")
@@ -227,6 +247,8 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                     encoding="utf-8", errors="replace"
                 ):
                     raise RuntimeError("Native profile did not execute native graph tasks")
+                if case == "native":
+                    report_native_scale_memory(log_path, report)
             except Exception as error:
                 try:
                     report_profile_failure(case, log_path, error, report)

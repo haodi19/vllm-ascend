@@ -593,6 +593,7 @@ class ExpertOffloadManager:
                 continue
             dev_tensor = getattr(layer, attr_name)
             dtype = dev_tensor.dtype
+            native_template = None
             if "scale_bias" in attr_name:
                 per_expert_shape = tuple(dev_tensor.shape[1:])
             elif dtype.itemsize == 1:
@@ -601,6 +602,8 @@ class ExpertOffloadManager:
                 dtype = torch.uint8
                 target_layout = apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8))
                 per_expert_shape = tuple(target_layout.shape)
+                if getattr(self.offload_config, "host_update_backend", "python") == "native":
+                    native_template = target_layout
             else:
                 per_expert_shape = (dev_tensor[0].numel(),)
             buffer_dict: dict = getattr(self, buffer_dict_name)
@@ -610,9 +613,13 @@ class ExpertOffloadManager:
             while len(buffers) <= layer_moe_idx:
                 buffers.append([])
             for _ in range(nalloc):
-                buffer = self._allocate_expert_host_tensor(per_expert_shape, dtype)
-                # Keep the original contiguous source for eager/prefill. Native
-                # decode packs a separate physical-layout buffer at finalization.
+                if native_template is not None:
+                    from vllm_ascend.expert_offload.native_update import allocate_scale_like
+                    # Load checkpoint shards directly into the final physical
+                    # layout. One owner serves decode, eager and prefill.
+                    buffer = allocate_scale_like(self._allocate_expert_host_tensor, native_template)
+                else:
+                    buffer = self._allocate_expert_host_tensor(per_expert_shape, dtype)
                 buffers[layer_moe_idx].append(buffer)
 
     def _assert_native_reload_safe(self, layer_idx=None):
@@ -1442,8 +1449,20 @@ class ExpertOffloadManager:
                 continue
             src_t = getattr(pool_layer, src)
             dtype = dtype_override if dtype_override is not None else src_t.dtype
-            getattr(self, tgt).append(torch.empty(
-                (ntotal,) + tuple(src_t.shape[1:]), dtype=dtype, device=dev))
+            shape = (ntotal,) + tuple(src_t.shape[1:])
+            if getattr(self.offload_config, "host_update_backend", "python") == "native":
+                from vllm_ascend.expert_offload.native_update import dense_span
+                elements = dense_span(src_t.shape[1:], src_t.stride()[1:])
+                # Match the decode slot's dense layout, with tightly packed
+                # experts. This avoids transposed CPU -> contiguous NPU copies
+                # and needs no second CPU scale bank or per-request repacking.
+                strides = (elements,) + src_t.stride()[1:]
+                pool = torch.empty_strided(shape, strides, dtype=dtype, device=dev)
+                if pool.stride() != strides:
+                    raise RuntimeError("native prefill scale allocator did not preserve final strides")
+            else:
+                pool = torch.empty(shape, dtype=dtype, device=dev)
+            getattr(self, tgt).append(pool)
 
     def _cast_prefill_pool_format(self, dev, dt):
         """Cast prefill-pool weight tensors to the on-device (kernel) format.
@@ -1552,6 +1571,7 @@ class ExpertOffloadManager:
                 source = self._shared_h2d_source(
                     layer_idx, source_eid, attr_name)
                 nbytes = dst.numel() * dst.element_size()
+            source, dst = self._quant_copy_views(source, dst)
             tasks.append(H2DCopyTask(
                 source=source,
                 destination=dst,
@@ -2434,6 +2454,15 @@ class ExpertOffloadManager:
             "[EXPERT-OFFLOAD-H2D] published %d SHARED source pointers "
             "across %d EP ranks", len(shared_sources), self.ep_size)
 
+    def _quant_copy_views(self, source, destination):
+        if getattr(self.offload_config, "host_update_backend", "python") == "native":
+            from vllm_ascend.expert_offload.native_update import scale_copy_views
+            # Native config permits only local CPU -> base-format NPU scales.
+            # Preserve Tensor semantics if another quantization needs a cast.
+            if torch_npu.get_npu_format(destination) in (0, 2):
+                return scale_copy_views(source, destination)
+        return source, destination
+
     def _build_quant_attr_h2d_tasks(self, layer, layer_idx, eid,
                                     slot) -> list[H2DCopyTask]:
         """Build scale/offset/scale_bias H2D tasks for one expert slot."""
@@ -2459,6 +2488,7 @@ class ExpertOffloadManager:
                     nbytes = dst.numel() * dst.element_size()
                 else:
                     continue
+                source, dst = self._quant_copy_views(source, dst)
                 tasks.append(H2DCopyTask(
                     source=source,
                     destination=dst,
