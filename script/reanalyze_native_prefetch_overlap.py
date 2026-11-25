@@ -44,15 +44,12 @@ def comparison_rows(left, right):
 def render_host_times(results, report):
     report("HOST_FUNCTION_TIMES：全部Host任务（含首尾及零加载），不受早/晚分类筛选；阶段嵌套，不能相加。")
     report("每格为有效n/应有n；原始均值μs；3×IQR后n/均值μs。缺失标记不当作0，明细与原始统计保留在JSON。")
+    cases = tuple(c for c in ("python", "native", "native_full") if c in results)
     rows = []
     for kind, label in (("all", "全部"), ("prefetch", "预取"), ("reactive", "按需")):
         for stage in ("host_callback", "update_weights", "load_submit", "copy_submit", "synchronize"):
-            cells, means = [], []
-            for case in ("python", "native"):
-                if case not in results:
-                    cells.append("—")
-                    means.append(None)
-                    continue
+            cells = []
+            for case in cases:
                 result = results[case]
                 stat = result["host_timings"][kind][stage]
                 expected = result["host_timing_expected_counts"][kind]
@@ -60,11 +57,8 @@ def render_host_times(results, report):
                 cells.append(
                     f"{stat['count']}/{expected}; {number(stat['mean_us'])}; {clean['n']}/{number(clean['mean'])}"
                 )
-                means.append(stat["mean_us"] if stat["count"] == expected else None)
-            a, b = means
-            change = number(100 * (b / a - 1)) + "%" if a and b is not None else "—"
-            rows.append([label, stage, *cells, change])
-    report(table(["范围", "Host函数/分项", "Python n/应有n; raw; IQR", "native n/应有n; raw; IQR", "原均值变化"], rows))
+            rows.append([label, stage, *cells])
+    report(table(["范围", "Host函数/分项", *(f"{c} n/应有n; raw; IQR" for c in cases)], rows))
 
 
 def host_span_stats(result):
@@ -233,22 +227,28 @@ def render(results, report):
             restats,
         )
     )
-    if set(results) != {"python", "native"}:
-        report("COMPARISON_UNAVAILABLE: need both saved captures to explain the change between versions.")
-        return
+    for left, right in (("python", "native"), ("python", "native_full"), ("native", "native_full")):
+        if left in results and right in results:
+            report(f"PAIR_COMPARISON {right} vs {left}")
+            render_pair(results, report, left, right)
+    if len(results) < 2:
+        report("COMPARISON_UNAVAILABLE: need two saved captures to explain the change between versions.")
+
+
+def render_pair(results, report, left_case, right_case):
     if (
-        results["python"]["physical_npu"] is None
-        or results["python"]["physical_npu"] != results["native"]["physical_npu"]
+        results[left_case]["physical_npu"] is None
+        or results[left_case]["physical_npu"] != results[right_case]["physical_npu"]
     ):
         report("COMPARISON_UNAVAILABLE: physical NPU missing or different; per-case restats retained.")
         return
     try:
         views = {case: r.get("coordinate_estimate", r) for case, r in results.items()}
-        pairs, excluded = comparison_rows(views["python"], views["native"])
+        pairs, excluded = comparison_rows(views[left_case], views[right_case])
     except ValueError as exc:
         report(f"COMPARISON_UNAVAILABLE: {exc}")
         return
-    estimated = any("coordinate_estimate" in r for r in results.values())
+    estimated = any("coordinate_estimate" in r for r in (results[left_case], results[right_case]))
     label = "PAIRED_COORDINATE_ESTIMATES" if estimated else "PAIRED_BOUNDARIES"
     report(f"{label} n={len(pairs)}; excluded={excluded}; conditional_on_aligned_coordinates={estimated}")
     if not pairs:
@@ -272,9 +272,14 @@ def render(results, report):
         metric_rows.append(
             [label, len(selected), number(a), number(b), number(b - a) if a is not None and b is not None else "—"]
         )
-    report(table(["同一批配对样本", "n", "Python μs", "native μs", "native−Python μs"], metric_rows))
+    report(
+        table(
+            ["同一批配对样本", "n", f"{left_case} μs", f"{right_case} μs", f"{right_case}−{left_case} μs"],
+            metric_rows,
+        )
+    )
     report("分解恒等式：间隔变化=计算相对到达变化−预取Host耗时变化＋(按需开始−计算到达)变化。")
-    for margin in (0, max(r["sensitivity_margin_us"] for r in results.values())):
+    for margin in (0, max(r["sensitivity_margin_us"] for r in (results[left_case], results[right_case]))):
         report("PAIRED_TRANSITIONS " + json.dumps(dict(margin_us=margin, transitions=transitions(pairs, margin))))
 
 
@@ -299,14 +304,18 @@ def reanalyze(runs, output, report):
                 raise ValueError("Python/native saved output references differ")
             reference = expected
             counters = json.loads((root / f"{case}_profile_counters.json").read_text(encoding="utf-8"))
-            if bool(counters.get("native")) != (case == "native"):
+            if bool(counters.get("native")) != (case in ("native", "native_full")):
                 raise ValueError(f"{case}: saved counters do not identify the expected update backend")
             report(f"START {case}: physical_npu={device}; trace={trace}")
             details.write(f"CASE={case}\n")
             try:
                 with contextlib.redirect_stdout(details):
                     result = analyze(
-                        trace, profile_report=counters, update_backend=case, exact_relative=True, retain_unmapped=True
+                        trace,
+                        profile_report=counters,
+                        update_backend="python" if case == "python" else "native",
+                        exact_relative=True,
+                        retain_unmapped=True,
                     )
                 result.update(physical_npu=device, expected_callbacks=count)
                 result["host_only_span"] = host_span_stats(result)
@@ -319,7 +328,7 @@ def reanalyze(runs, output, report):
                             estimate = analyze(
                                 trace,
                                 profile_report=counters,
-                                update_backend=case,
+                                update_backend="python" if case == "python" else "native",
                                 exact_relative=True,
                                 retain_unmapped=True,
                                 estimate_order_mismatches=True,

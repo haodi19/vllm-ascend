@@ -27,6 +27,12 @@ FAILURE_LOG_CONTEXT = 2
 FAILURE_LOG_MAX_MATCHES = 8
 
 
+def verify_full_submit(log_path):
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    if "[MOE-NATIVE] FULL_SUBMIT ready;" not in text or "[MOE-NATIVE] FULL_SUBMIT executed=" not in text:
+        raise RuntimeError("native_full submission was not exercised; refusing fallback-only comparison")
+
+
 def report_native_scale_memory(log_path, report):
     """Require the current allocation contract in both timing and profile services."""
     prefix = "[MOE-NATIVE] SCALE_MEMORY "
@@ -261,12 +267,17 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                     raise RuntimeError(f"Incomplete Host ranges: {counters}")
                 if any((s["digest"], s["usage"]) != expected_outputs[0] for s in samples):
                     raise RuntimeError("Profile output differs from timed requests")
-                if case == "native" and "first native graph task completed without Python" not in log_path.read_text(
+                if case in (
+                    "native",
+                    "native_full",
+                ) and "first native graph task completed without Python" not in log_path.read_text(
                     encoding="utf-8", errors="replace"
                 ):
                     raise RuntimeError("Native profile did not execute native graph tasks")
-                if case == "native":
+                if case in ("native", "native_full"):
                     report_native_scale_memory(log_path, report)
+                    if case == "native_full":
+                        verify_full_submit(log_path)
             except Exception as error:
                 try:
                     report_profile_failure(case, log_path, error, report)

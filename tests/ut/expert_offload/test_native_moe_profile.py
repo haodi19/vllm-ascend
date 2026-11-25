@@ -44,6 +44,18 @@ def fixture():
 
 
 class NativeProfileTests(unittest.TestCase):
+    def test_full_submission_must_be_exercised_not_just_registered(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "native_full.log"
+            for text in ("", "[MOE-NATIVE] FULL_SUBMIT ready;"):
+                log.write_text(text, encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "not exercised"):
+                    profile.verify_full_submit(log)
+            log.write_text(
+                "[MOE-NATIVE] FULL_SUBMIT ready;\n[MOE-NATIVE] FULL_SUBMIT executed=prefill;", encoding="utf-8"
+            )
+            profile.verify_full_submit(log)
+
     def test_native_scale_allocation_contract_reported_and_enforced(self):
         record = dict(
             policy="shared_final_layout_v1",

@@ -29,7 +29,7 @@ from moe_host_memory import (
     log_memory,
 )
 from moe_tpot import streaming_completion, summarize_streams
-from native_moe_profile import report_native_scale_memory
+from native_moe_profile import report_native_scale_memory, verify_full_submit
 from run_host_sync_stage2 import target_cmake_args
 from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB
 
@@ -101,6 +101,12 @@ def report_failed_step(log_path, start_offset, report):
     report("FAILED_STEP_LOG_END")
 
 
+def selected_cases(case):
+    if case == "all":
+        return ("python", "native", "native_full")
+    return ("python", "native") if case == "both" else (case,)
+
+
 def timing_row(case, timing, e2e_mean_ms):
     values = []
     for metric in ("decode_ms", "ttft_ms", "tpot_ms"):
@@ -120,7 +126,7 @@ def load_completed_timing_run(directory, port, required_cases=("python", "native
                 if case in records:
                     raise ValueError(f"Duplicate timing result for {case}")
                 records[case] = row
-    if not set(required_cases) <= set(records) or not set(records) <= {"python", "native"}:
+    if not set(required_cases) <= set(records) or not set(records) <= {"python", "native", "native_full"}:
         raise ValueError(f"Profile continuation requires completed timing results for {','.join(required_cases)}")
     reference = None
     for case in required_cases:
@@ -163,7 +169,7 @@ def continue_profile(args, root, env, report):
     from run_verified_cpp_tests import ensure_profile_storage
 
     source = args.profile_only_from.resolve(strict=True)
-    cases = ("python", "native") if args.profile_case == "both" else (args.profile_case,)
+    cases = selected_cases(args.profile_case)
     records, commands, reference, args.max_tokens = load_completed_timing_run(source, args.port, cases)
     report(f"TIMING_SOURCE={source}; completed earlier; timing requests and builds are NOT repeated")
     report(
@@ -253,9 +259,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--case",
-        choices=("both", "python", "native"),
-        default="both",
-        help="Run timing and profile for both versions (default) or one independent version",
+        choices=("all", "both", "python", "native", "native_full"),
+        default="all",
+        help="Run Python MTE, native baseline and native_full (default); both preserves the original two cases",
     )
     parser.add_argument("--npu", type=int, required=True)
     parser.add_argument("--port", type=int, default=8156)
@@ -277,7 +283,7 @@ def main():
     )
     parser.add_argument(
         "--profile-case",
-        choices=("both", "python", "native"),
+        choices=("all", "both", "python", "native", "native_full"),
         default="both",
         help="With --profile-only-from, collect just one case or both sequentially (default)",
     )
@@ -303,7 +309,7 @@ def main():
     args = parser.parse_args()
     if args.profile_case != "both" and not args.profile_only_from:
         parser.error("--profile-case python/native requires --profile-only-from")
-    if args.profile_only_from and args.case != "both":
+    if args.profile_only_from and args.case != "all":
         parser.error("--case selects a fresh complete run; use --profile-case with --profile-only-from")
     if not 0 < args.min_profile_free_gib < float("inf"):
         parser.error("--min-profile-free-gib must be positive and finite")
@@ -316,7 +322,7 @@ def main():
     if not 1 <= args.timing_port <= 65535 or args.timing_port == args.port or args.profile_timeout <= 0:
         parser.error("requires a separate valid timing port and a positive profile timeout")
     args.profile_requests = 1
-    cases = ("python", "native") if args.case == "both" else (args.case,)
+    cases = selected_cases(args.case)
     root = args.output_dir.resolve()
     root.mkdir(parents=True, exist_ok=False)
     env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(args.npu))
@@ -371,7 +377,8 @@ def main():
             return continue_profile(args, root, env, report)
         report(
             f"CASES={','.join(cases)}; MTE weight updates; timed requests have no profiler/MSTX. "
-            "Native graph replay; eager/prefill share final-layout scales. This is correctness/performance validation."
+            "python=Python MTE; native=current shared-scale baseline; "
+            "native_full=also C++ eager/prefill batch submission. All keep strict completion."
         )
         report(
             "PRIMARY=decode_ms (first to last content); TPOT=decode/(actual output tokens-1); "
@@ -439,7 +446,8 @@ def main():
                 "-c",
                 "import _vllm_ascend_lrc as l; "
                 "import vllm_ascend_host_sync as h; "
-                "assert hasattr(l,'native_update_task'); assert hasattr(h.Session,'install_native_task')",
+                "assert hasattr(l,'native_update_task'); assert hasattr(l.NativeTransfers,'enqueue_all'); "
+                "assert hasattr(h.Session,'install_native_task')",
             ],
         )
         step("native CPU regression", [sys.executable, "-B", "tests/ut/expert_offload/test_native_update.py"])
@@ -508,14 +516,17 @@ def main():
                             f"REQUEST {case} {i + 1}/{args.warmup_requests + args.requests}; "
                             f"e2e_ms={elapsed:.3f}; decode_ms={result['decode_us'] / 1000:.3f}"
                         )
-                    if (
-                        case == "native"
-                        and "first native graph task completed without Python"
-                        not in log_path.read_text(encoding="utf-8", errors="replace")
+                    if case in (
+                        "native",
+                        "native_full",
+                    ) and "first native graph task completed without Python" not in log_path.read_text(
+                        encoding="utf-8", errors="replace"
                     ):
                         raise RuntimeError("no confirmed native graph execution; refusing fallback-only comparison")
-                    if case == "native":
+                    if case in ("native", "native_full"):
                         report_native_scale_memory(log_path, report)
+                        if case == "native_full":
+                            verify_full_submit(log_path)
                     if any(output != outputs[0] for output in outputs):
                         raise RuntimeError(f"{case} outputs/usage differ between timed requests")
                     if reference is None:
@@ -559,15 +570,18 @@ def main():
         report("| --- | ---: | ---: | ---: | ---: |")
         for case in cases:
             report(timing_row(case, timings[case], means[case]))
-        if len(cases) == 2:
-            before = timings["python"]["decode_ms"]["raw"]["mean"]
-            after = timings["native"]["decode_ms"]["raw"]["mean"]
-            change = f"{(after / before - 1) * 100:.3f}%" if before > 0 else "undefined (single content chunk)"
-            report(
-                f"PASS finite output parity; decode mean change={change}; "
-                f"E2E mean change={(means['native'] / means['python'] - 1) * 100:.3f}%; "
-                "single service pair, not stability acceptance"
-            )
+        if len(cases) > 1:
+            for baseline, candidate in (("python", "native"), ("python", "native_full"), ("native", "native_full")):
+                if baseline not in timings or candidate not in timings:
+                    continue
+                before = timings[baseline]["decode_ms"]["raw"]["mean"]
+                after = timings[candidate]["decode_ms"]["raw"]["mean"]
+                change = f"{(after / before - 1) * 100:.3f}%" if before > 0 else "undefined (single content chunk)"
+                report(
+                    f"PASS finite output parity; {candidate} vs {baseline}; decode mean change={change}; "
+                    f"E2E mean change={(means[candidate] / means[baseline] - 1) * 100:.3f}%; "
+                    "single sequential service run, not stability acceptance"
+                )
         else:
             report(
                 f"SINGLE_CASE_TIMING_COMPLETE case={cases[0]}; within-case outputs match; "

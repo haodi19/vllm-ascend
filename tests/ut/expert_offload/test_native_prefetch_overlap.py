@@ -43,9 +43,9 @@ def capture(root, case, *, bad_tail=False):
         add("host_sync_wait_2", wait, end, tid)
 
     host("reactive", 0, 1, 10, 20)
-    host("prefetch", 1, 2, 100, 160 if case == "native" else 200)
+    host("prefetch", 1, 2, 100, 160 if case in ("native", "native_full") else 200)
     host("reactive", 1, 3, 212, 240)
-    host("prefetch", 2, 4, 300, 320 if case == "native" else 360)
+    host("prefetch", 2, 4, 300, 320 if case in ("native", "native_full") else 360)
     host("reactive", 2, 5, 375, 400)
     handshake("main", 5, 6, 22)
     handshake("prefetch", 80, 155, 205)
@@ -83,7 +83,7 @@ def capture(root, case, *, bad_tail=False):
     )
     (root / f"{case}_profile_samples.json").write_text(json.dumps([sample]), encoding="utf-8")
     counters = dict(count=5, mstx_errors=0, errors=0, dropped=0, mstx_enabled=True)
-    if case == "native":
+    if case in ("native", "native_full"):
         counters.update(native=True, groups=[])
     else:
         counters.update(
@@ -100,7 +100,13 @@ def capture(root, case, *, bad_tail=False):
 
 class NativePrefetchOverlapTests(unittest.TestCase):
     def test_profile_pipeline_automatically_reports_both_methods_for_single_and_combined_runs(self):
-        for cases in (("python",), ("native",), ("python", "native")):
+        for cases in (
+            ("python",),
+            ("native",),
+            ("native_full",),
+            ("python", "native"),
+            ("python", "native", "native_full"),
+        ):
             with self.subTest(cases=cases), tempfile.TemporaryDirectory() as temp:
                 root = Path(temp)
                 sample = dict(digest="same", usage=dict(completion_tokens=5))
@@ -143,7 +149,10 @@ class NativePrefetchOverlapTests(unittest.TestCase):
                     active["case"] = json.loads(command[command.index("--additional-config") + 1])[
                         "expert_offload_config"
                     ]["host_update_backend"]
-                    kwargs["stdout"].write("first native graph task completed without Python\n")
+                    kwargs["stdout"].write(
+                        "first native graph task completed without Python\n"
+                        "[MOE-NATIVE] FULL_SUBMIT ready;\n[MOE-NATIVE] FULL_SUBMIT executed=prefill;\n"
+                    )
                     kwargs["stdout"].flush()
                     return Mock(pid=123, poll=Mock(return_value=None))
 
@@ -153,7 +162,13 @@ class NativePrefetchOverlapTests(unittest.TestCase):
                     if path == "/status":
                         return dict(mstx_enabled=True)
                     if path == "/stop":
-                        return dict(count=5, errors=0, dropped=0, mstx_errors=0, native=active["case"] == "native")
+                        return dict(
+                            count=5,
+                            errors=0,
+                            dropped=0,
+                            mstx_errors=0,
+                            native=active["case"] in ("native", "native_full"),
+                        )
                     return dict(samples=[])
 
                 def export(directory, _timeout, root=root, summary=summary):
@@ -186,10 +201,15 @@ class NativePrefetchOverlapTests(unittest.TestCase):
                     self.assertEqual(result["physical_npu"], 6)
                     values = result["direct"]["all_samples"]
                     self.assertEqual(values["original"]["count"], 2)
-                    self.assertAlmostEqual(values["original"]["mean_us"], 53.5 if case == "native" else 13.5)
-                    self.assertAlmostEqual(values["method1_drop_late"]["mean_us"], 52 if case == "native" else 13.5)
                     self.assertAlmostEqual(
-                        values["method2_subtract_remaining_compute"]["mean_us"], 37.25 if case == "native" else 13.5
+                        values["original"]["mean_us"], 53.5 if case in ("native", "native_full") else 13.5
+                    )
+                    self.assertAlmostEqual(
+                        values["method1_drop_late"]["mean_us"], 52 if case in ("native", "native_full") else 13.5
+                    )
+                    self.assertAlmostEqual(
+                        values["method2_subtract_remaining_compute"]["mean_us"],
+                        37.25 if case in ("native", "native_full") else 13.5,
                     )
                 text = summary.read_text(encoding="utf-8")
                 self.assertEqual(text.count("PREFETCH_OVERLAP_BEGIN"), 1)
@@ -198,6 +218,9 @@ class NativePrefetchOverlapTests(unittest.TestCase):
                 self.assertIn("方案2 n/均值", text)
                 self.assertIn("保守判定", text)
                 self.assertNotIn("OVERLAP_FAILED", text)
+                if len(cases) == 3:
+                    self.assertIn("PAIR_COMPARISON native_full vs native", text)
+                    self.assertIn("native_full−native μs", text)
 
     def test_integrated_analysis_failure_is_explicit_and_keeps_original_measurements(self):
         with tempfile.TemporaryDirectory() as temp:

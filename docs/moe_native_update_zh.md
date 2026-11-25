@@ -9,6 +9,18 @@
 
 当前实现用于单卡 MTE、C++ LRC、普通加载流和消费者处严格等待的 decode 图重放。`host_update_backend` 默认仍为 `python`；选择 `native` 后，专家规划、ACL 搬运提交、同步与映射更新由原生线程执行，执行期间不调用 Python，也不获取 GIL。初始化和图注册仍由 Python 完成。
 
+2026-11-25 增加 `native_full`，补齐运行时 eager/prefill 的 C++ 批量搬运提交，保留当前 `native` 作独立基线。三组含义如下：
+
+| 配置组 | Decode 图重放 | eager/prefill 搬运提交 | scale CPU 缓冲 |
+| --- | --- | --- | --- |
+| `python`：Python MTE | Python 更新，C++ LRC | Python/Torch 逐项提交 | 原 Python 布局 |
+| `native`：当前 native | C++ 规划、ACL 提交与同步 | Python 构造任务、Storage 字节拷贝 | 共用最终布局缓冲 |
+| `native_full`：完整提交优化组 | 沿用当前 native | 初始化登记地址，C++ 整批 ACL 提交 | 复用同一份最终布局缓冲 |
+
+新增路径参考同事仓库 `csrc/lrc_policy/native_dma.h` 的常驻地址表和 `native_dispatch.h` 的逐专家、逐字段 ACL 提交方式。prefill 的完整专家列表也在 C++ 中预建；每次只按层选择表，不重新切 Tensor/Storage 或构造每个字段的 Python 任务。eager 一次传入 `(slot, expert)` 计划，进入 C++ 后释放 GIL，直到整批提交结束。所有字段先验证，现有 stream 同步位置继续保留，mapping 与消费者严格等待的协议不变。
+
+这里的“完整”限定为本轮权重/scale 搬运提交优化。模型初始化、eager 专家规划和图注册仍使用 Python；Decode 回调与当前 native 相同。预期可减少 eager/prefill 的提交开销，Decode 是否改善由实测决定。同事 CPU MoE 的计算准入策略、独立 DMA 队列和设备事件发布属于另一套调度协议，本轮没有移植，不能据此声称按需与预取之间的空泡已消除。
+
 截至 2026-11-25，本次实现包含以下配套修改：
 
 - MXFP scale 在 checkpoint 加载时直接写入最终 dtype/stride 的 pinned CPU 缓冲。native 注册地址时必须复用该缓冲，不再保留第二份 scale；不满足布局条件就报错，禁止静默分配副本。
@@ -22,9 +34,21 @@
 
 ## 验证与结果读取
 
-继续使用 `script/run_native_moe_compare.py`，无需新增开关。它先运行 CPU 回归、NPU scale 字节一致性、严格图重放及 GIL 独立推进检查，再运行 Python/native 两组性能请求和独立 profile。结果统一汇总到指定目录的 `summary.txt`，保留 Decode、HTTP E2E、TTFT、TPOT、Host 间隔及加载流空泡。
+继续使用 `script/run_native_moe_compare.py`，默认顺序运行 Python MTE、当前 native、native_full 三组。它先运行 CPU 回归、NPU scale 字节一致性、整批 eager/prefill 提交、严格图重放及 GIL 独立推进检查，再运行性能请求和独立 profile。结果统一汇总到指定目录的 `summary.txt`，保留 Decode、HTTP E2E、TTFT、TPOT、Host 函数耗时、Host 间隔及加载流空泡。
 
-需要分开运行时，分别传 `--case python` 和 `--case native`，使用两个新的结果目录。每条命令均独立完成该组计时和 profile，不依赖其他结果目录；省略 `--case` 仍顺序运行两组。单组摘要只验证该组请求一致性，不宣称跨版本输出一致或性能提升；比较时同时提供两组 `summary.txt`。单组计时完成后如需补采，可用 `--profile-only-from` 配合对应的 `--profile-case`。
+需要分开运行时，分别传 `--case python`、`--case native`、`--case native_full`，使用三个新的结果目录。每条命令均独立完成该组计时和 profile；`--case both` 保留原 Python/native 两组入口。单组摘要验证该组请求一致性，比较时同时提供三组 `summary.txt`。单组计时完成后如需补采，可用 `--profile-only-from` 配合对应的 `--profile-case`；三组补采传 `--profile-case all`。
+
+在容器内执行，下面的 `--npu 6` 为物理卡号，结果目录已存在时改为下一个编号：
+
+```bash
+source /data/w00919836/moeoffload/env.sh
+cd /data/w00919836/moeoffload/vllm-ascend
+python -u -B script/run_native_moe_compare.py --case all --npu 6 \
+  --port 8156 --timing-port 18156 --max-tokens 5 --min-profile-free-gib 5 \
+  --output-dir /home/w00919836/results/native_three_way_01
+```
+
+分开运行时用相同参数，将 `--case all` 分别替换为三个组名，并使用各自的新结果目录。计时阶段关闭 profiler/MSTX，5 次预热后测 20 次请求；每组随后独立采 profile、进行同次时钟对齐并自动识别加载流。`native_full` 必须同时出现原生图任务完成、共享 scale 校验和 `FULL_SUBMIT executed=` 记录，防止只注册但未执行新路径的测试被接受。
 
 每次完成 profile 后，脚本默认把以下分析追加到同一个 `summary.txt`，Python/native 分开运行时也一样，无需额外开关：
 

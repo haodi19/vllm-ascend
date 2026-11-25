@@ -23,6 +23,7 @@ class NativeTransfers {
   bool cpu;
   std::shared_ptr<NativeRanges> profiler;
   uint64_t batches = 0, copies = 0, bytes = 0;
+  std::vector<std::pair<Id, Id>> identity_loads;
   NativeTransfers(Addresses src, Addresses dst, std::vector<size_t> lengths,
                   uintptr_t stream_ptr, const std::string& library, bool cpu_test)
       : sources(std::move(src)), destinations(std::move(dst)), sizes(std::move(lengths)),
@@ -39,6 +40,8 @@ class NativeTransfers {
             throw std::invalid_argument("copy address range overflow");
         }
       }
+    for (size_t i = 0; i < std::min(sources.size(), destinations.size()); ++i)
+      identity_loads.emplace_back(i, i);
     if (cpu) return;
     if (!stream) throw std::invalid_argument("null ACL stream");
 #ifdef _WIN32
@@ -57,8 +60,18 @@ class NativeTransfers {
     if (library_) dlclose(library_);
 #endif
   }
-  void submit(const std::vector<std::pair<Id, Id>>& loads,
-              NativeRanges* ranges = nullptr, const std::string& context = "") {
+  // Python converts the small plan once at entry; this entire enqueue loop runs
+  // without the GIL. Callers retain the owners and the existing completion gate.
+  void enqueue(const std::vector<std::pair<Id, Id>>& loads) {
+    // Validate the whole batch before any transfer, including a late bad entry.
+    for (auto [slot, eid] : loads)
+      if (slot < 0 || static_cast<size_t>(slot) >= destinations.size() ||
+          eid < 0 || static_cast<size_t>(eid) >= sources.size())
+        throw std::runtime_error("native copy expert/slot outside table");
+    enqueue_impl(loads);
+  }
+  void enqueue_impl(const std::vector<std::pair<Id, Id>>& loads,
+                    NativeRanges* ranges = nullptr, const std::string& context = "") {
     {
       NativeRange load_range(ranges, "load_submit", context);
       NativeRange copy_range(ranges, "copy_submit", context);
@@ -76,6 +89,16 @@ class NativeTransfers {
         }
       }
     }
+  }
+  void enqueue_all() {
+    if (sources.size() != destinations.size())
+      throw std::runtime_error("full native overwrite requires one slot per expert");
+    enqueue(identity_loads);
+  }
+  void submit(const std::vector<std::pair<Id, Id>>& loads,
+              NativeRanges* ranges = nullptr, const std::string& context = "") {
+    // Keep the native graph baseline's validation order and measured ranges.
+    enqueue_impl(loads, ranges, context);
     // Preserve the completion barrier even when this batch has no loads.
     NativeRange wait_range(ranges, "synchronize", context);
     if (!cpu) check(wait_(stream, kCopyTimeoutMs), "aclrtSynchronizeStreamWithTimeout");
@@ -243,6 +266,11 @@ inline void bind_native_update(py::module_& m) {
   py::class_<NativeTransfers, std::shared_ptr<NativeTransfers>>(m, "NativeTransfers")
       .def(py::init<NativeTransfers::Addresses, NativeTransfers::Addresses, std::vector<size_t>,
                     uintptr_t, const std::string&, bool>())
+      .def("enqueue", [](NativeTransfers& t, const std::vector<std::pair<Id, Id>>& loads) {
+        py::gil_scoped_release release;
+        t.enqueue(loads);
+      })
+      .def("enqueue_all", &NativeTransfers::enqueue_all, py::call_guard<py::gil_scoped_release>())
       .def("set_profiler", [](NativeTransfers& t, std::shared_ptr<NativeRanges> p) { t.profiler = std::move(p); });
   m.def("native_update_task", [](std::shared_ptr<Policy> policy, std::shared_ptr<NativeTransfers> table,
                                  Id layer, py::array ids, py::object scores, py::array mapping,

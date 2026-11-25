@@ -59,7 +59,7 @@ class NativeRunnerTests(unittest.TestCase):
             if "vllm.entrypoints.cli.main" in command:
                 config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
                 launched.append(config["host_update_backend"])
-                if config["host_update_backend"] == "native":
+                if config["host_update_backend"] in ("native", "native_full"):
                     kwargs["stdout"].write("[MOE-NATIVE] first native graph task completed without Python\n")
                     kwargs["stdout"].write(
                         "[MOE-NATIVE] SCALE_MEMORY "
@@ -75,6 +75,9 @@ class NativeRunnerTests(unittest.TestCase):
                         )
                         + "\n"
                     )
+                    kwargs["stdout"].write(
+                        "[MOE-NATIVE] FULL_SUBMIT ready;\n[MOE-NATIVE] FULL_SUBMIT executed=prefill;\n"
+                    )
                     kwargs["stdout"].flush()
             return Mock(pid=1234, poll=lambda: None, wait=lambda **kwargs: 0)
 
@@ -82,7 +85,7 @@ class NativeRunnerTests(unittest.TestCase):
         opener.open.side_effect = lambda *args, **kwargs: contextlib.nullcontext(
             io.BytesIO(b'{"data":[{"id":"test-model"}]}')
         )
-        streamed = [dict(sample) for _ in range(6)]
+        streamed = [dict(sample) for _ in range(9)]
         if varied_outputs:
             streamed[2]["digest"] = "different"
         with (
@@ -103,7 +106,7 @@ class NativeRunnerTests(unittest.TestCase):
         return code, output, launched, requests.call_count, profiles
 
     def test_independent_complete_runs_preserve_timing_and_selected_profile(self):
-        for case in ("python", "native"):
+        for case in ("python", "native", "native_full"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 code, output, launched, requests, profiles = self.run_mock_comparison(Path(temporary), case)
                 self.assertEqual(code, 0)
@@ -125,6 +128,17 @@ class NativeRunnerTests(unittest.TestCase):
                 self.assertEqual(list(commands), [case])
                 self.assertEqual(tokens, 5)
                 self.assertEqual(records[case]["requests"], 2)
+
+    def test_three_way_run_and_profile_keep_distinct_baselines(self):
+        with tempfile.TemporaryDirectory() as temp:
+            code, output, launched, count, profiles = self.run_mock_comparison(Path(temp), "all")
+            self.assertEqual(code, 0)
+            self.assertEqual(launched, ["python", "native", "native_full"])
+            self.assertEqual(count, 9)
+            self.assertEqual(list(profiles.call_args.args[1]), launched)
+            text = (output / "summary.txt").read_text(encoding="utf-8")
+            self.assertIn("native_full vs native", text)
+            self.assertIn("native_full vs python", text)
 
     def test_combined_run_still_launches_both_and_compares(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -153,7 +167,7 @@ class NativeRunnerTests(unittest.TestCase):
             '{"expert_offload_config":{"num_device_experts":24}}'
         )
         records = []
-        for case in ("python", "native"):
+        for case in ("python", "native", "native_full"):
             command = runner.service_command(source, case, library, 8156)
             (directory / f"{case}_command.json").write_text(json.dumps(command), encoding="utf-8")
             sample = dict(
@@ -238,7 +252,7 @@ class NativeRunnerTests(unittest.TestCase):
                 runner.load_completed_timing_run(directory, 8156)
 
     def test_profile_continuation_runs_only_selected_case(self):
-        for case in ("python", "native"):
+        for case in ("python", "native", "native_full"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 source = Path(temporary) / "timing"
                 source.mkdir()
@@ -439,7 +453,7 @@ class NativeRunnerTests(unittest.TestCase):
 
     def test_repository_launch_script_with_and_without_final_newline(self):
         source = (ROOT / "script/test_graph2.sh").read_text(encoding="utf-8").rstrip("\n")
-        for case in ("python", "native"):
+        for case in ("python", "native", "native_full"):
             expected = runner.service_command(source + "\n", case, "/lib/handshake.so", 8156)
             self.assertEqual(runner.service_command(source, case, "/lib/handshake.so", 8156), expected)
             self.assertEqual(expected[:4], [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve"])
@@ -508,7 +522,7 @@ class NativeRunnerTests(unittest.TestCase):
         source += shlex.quote('{"num_speculative_tokens":2}')
         source += " --additional-config " + shlex.quote(json.dumps(config))
         source += " --profiler-config '{}'"
-        for case in ("python", "native"):
+        for case in ("python", "native", "native_full"):
             words = runner.service_command(source, case, "/lib/handshake.so", 8156)
             self.assertNotIn("rm", words)
             self.assertNotIn("--profiler-config", words)

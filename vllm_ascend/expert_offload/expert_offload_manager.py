@@ -602,7 +602,7 @@ class ExpertOffloadManager:
                 dtype = torch.uint8
                 target_layout = apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8))
                 per_expert_shape = tuple(target_layout.shape)
-                if getattr(self.offload_config, "host_update_backend", "python") == "native":
+                if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full"):
                     native_template = target_layout
             else:
                 per_expert_shape = (dev_tensor[0].numel(),)
@@ -827,7 +827,7 @@ class ExpertOffloadManager:
             "hot_preload=%.1fs prefill_pool=%.1fs gate=%.1fs | total=%.1fs",
             t2 - t1, t3 - t2, t4 - t3, t5 - t4, t_hot - t5, t6 - t_hot,
             t7 - t6, t7 - t0)
-        if getattr(self.offload_config, "host_update_backend", "python") == "native":
+        if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full"):
             from vllm_ascend.expert_offload.native_update import NativeUpdateRuntime
             self._native_update = NativeUpdateRuntime(self, _expert_weight)
         if self.offload_config.callback_timing_port:
@@ -1450,7 +1450,7 @@ class ExpertOffloadManager:
             src_t = getattr(pool_layer, src)
             dtype = dtype_override if dtype_override is not None else src_t.dtype
             shape = (ntotal,) + tuple(src_t.shape[1:])
-            if getattr(self.offload_config, "host_update_backend", "python") == "native":
+            if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full"):
                 from vllm_ascend.expert_offload.native_update import dense_span
                 elements = dense_span(src_t.shape[1:], src_t.stride()[1:])
                 # Match the decode slot's dense layout, with tightly packed
@@ -1633,6 +1633,11 @@ class ExpertOffloadManager:
                         layer_idx, pool_slot, ntotal, is_w8a8)
 
         with torch_npu.npu.stream(self.load_stream):
+            native = getattr(self, '_native_update', None)
+            if native is not None and native.full_submit:
+                native.enqueue_prefill(layer_idx)
+                self._synchronize_h2d()
+                return
             tasks = []
             for eid in range(ntotal):
                 tasks.extend(self._build_prefill_h2d_tasks(
@@ -2455,7 +2460,7 @@ class ExpertOffloadManager:
             "across %d EP ranks", len(shared_sources), self.ep_size)
 
     def _quant_copy_views(self, source, destination):
-        if getattr(self.offload_config, "host_update_backend", "python") == "native":
+        if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full"):
             from vllm_ascend.expert_offload.native_update import scale_copy_views
             # Native config permits only local CPU -> base-format NPU scales.
             # Preserve Tensor semantics if another quantization needs a cast.
@@ -2945,6 +2950,10 @@ class ExpertOffloadManager:
 
     def _load_expert_weights_into_slots(self, layer, layer_idx, loads):
         """Batch H2D-copy ``(slot, eid)`` loads, then refresh derived data."""
+        native = getattr(self, '_native_update', None)
+        if native is not None and native.full_submit:
+            native.enqueue_eager(layer_idx, list(loads))
+            return
         loads = list(loads)
         tasks = []
         for slot, eid in loads:

@@ -2,6 +2,7 @@
 """CPU contract tests; native tests require both optional extensions built."""
 
 import ast
+import contextlib
 import ctypes
 import gc
 import importlib.util
@@ -11,7 +12,7 @@ import unittest
 import weakref
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -44,6 +45,7 @@ class LayoutAndConfig(unittest.TestCase):
             host_update_backend="native", host_sync_backend="mte", cache_policy_backend="cpp", cache_policy_enabled=True
         )
         config.validate_native_update_config(good)
+        config.validate_native_update_config(dict(good, host_update_backend="native_full"))
         config.validate_native_update_config(dict(good, callback_timing_port=18156, callback_mstx_enabled=True))
         for key, value in (
             ("moe_offload_debug", True),
@@ -54,6 +56,8 @@ class LayoutAndConfig(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 config.validate_native_update_config(dict(good, **{key: value}))
+            with self.assertRaises(ValueError):
+                config.validate_native_update_config(dict(good, host_update_backend="native_full", **{key: value}))
 
     def test_packed_bytes_match_transposed_destination(self):
         import torch
@@ -103,11 +107,15 @@ class ScaleLoading(unittest.TestCase):
             "_build_prefill_h2d_tasks",
             "_build_quant_attr_h2d_tasks",
             "_quant_copy_views",
+            "_load_expert_weights_into_slots",
+            "_prefill_load_layer",
         }
         manager.body = [n for n in manager.body if isinstance(n, ast.FunctionDef) and n.name in names]
         scope = {
             "torch": torch,
-            "torch_npu": SimpleNamespace(get_npu_format=lambda t: 2),
+            "torch_npu": SimpleNamespace(
+                get_npu_format=lambda t: 2, npu=SimpleNamespace(stream=lambda s: contextlib.nullcontext())
+            ),
             "_expert_weight": getattr,
             "H2DCopyTask": SimpleNamespace,
         }
@@ -119,6 +127,35 @@ class ScaleLoading(unittest.TestCase):
         patcher = patch.dict(sys.modules, modules)
         patcher.start()
         self.addCleanup(patcher.stop)
+
+    def test_manager_uses_full_batch_only_for_the_new_backend_and_keeps_prefill_sync(self):
+        for enabled in (False, True):
+            m = self.Manager()
+            m._native_update = Mock(full_submit=enabled)
+            m.num_device_layers, m.num_total_experts = 1, 3
+            m._prefill_w13 = [self.torch.empty((3, 4), dtype=self.torch.uint8)]
+            m.load_stream, m._debug = object(), False
+            m._get_h2d_transport = Mock()
+            m._synchronize_h2d = Mock()
+            m._build_prefill_h2d_tasks = Mock(return_value=[object()])
+            m._refresh_prefill_fp32_scale = Mock()
+            m._build_expert_h2d_tasks = Mock(return_value=[object()])
+            m._refresh_expert_fp32_scale = Mock()
+            m._prefill_load_layer(0, None)
+            m._synchronize_h2d.assert_called_once()
+            m._load_expert_weights_into_slots(None, 0, [(1, 2)])
+            if enabled:
+                m._native_update.enqueue_prefill.assert_called_once_with(0)
+                m._native_update.enqueue_eager.assert_called_once_with(0, [(1, 2)])
+                m._get_h2d_transport.assert_not_called()
+                m._build_prefill_h2d_tasks.assert_not_called()
+                m._build_expert_h2d_tasks.assert_not_called()
+            else:
+                m._native_update.enqueue_prefill.assert_not_called()
+                m._native_update.enqueue_eager.assert_not_called()
+                self.assertEqual(m._build_prefill_h2d_tasks.call_count, 3)
+                m._build_expert_h2d_tasks.assert_called_once_with(None, 0, 2, 1)
+                self.assertEqual(m._get_h2d_transport().copy_batch.call_count, 2)
 
     def test_native_loads_final_layout_once_and_original_backend_stays_contiguous(self):
         torch = self.torch
@@ -297,10 +334,17 @@ class ScaleLoading(unittest.TestCase):
 
     @unittest.skipUnless(lrc is not None, "build lrc_policy extension")
     def test_loaded_scale_addresses_survive_runtime_registration_and_native_execution(self):
+        self.check_runtime("native")
+
+    @unittest.skipUnless(lrc is not None, "build lrc_policy extension")
+    def test_full_submission_reuses_sources_for_eager_prefill_and_graph(self):
+        self.check_runtime("native_full")
+
+    def check_runtime(self, backend):
         torch = self.torch
         manager = self.Manager()
         manager.offload_config = SimpleNamespace(
-            shard_per_rank=False, host_update_backend="native", callback_mstx_enabled=False
+            shard_per_rank=False, host_update_backend=backend, callback_mstx_enabled=False
         )
         manager.ep_size = 1
         manager.scale_cpu_buffers, manager.offset_cpu_buffers, manager.scale_bias_cpu_buffers = {}, {}, {}
@@ -316,6 +360,11 @@ class ScaleLoading(unittest.TestCase):
             manager._copy_scale_direct(tensor, raw + eid)
         layer.w13_weight_scale = self.layout_module.apply_mxfp4_weight_scale_layout(layer.w13_weight_scale)
         manager.moe_layers = [layer]
+        manager.num_device_layers = 1
+        manager._prefill_w13 = [torch.zeros((3, 4), dtype=torch.uint8)]
+        manager._prefill_w2 = [torch.zeros((3, 4), dtype=torch.uint8)]
+        shape, strides = layer.w13_weight_scale.shape[1:], layer.w13_weight_scale.stride()[1:]
+        manager._prefill_w13_scale = [torch.empty_strided((3, *shape), (128, *strides), dtype=torch.uint8)]
         manager.num_total_experts = 3
         manager.num_device_experts_for_layer = lambda index: 2
         manager.w13_expert_size_bytes = manager.w2_expert_size_bytes = 4
@@ -332,6 +381,7 @@ class ScaleLoading(unittest.TestCase):
             tables.append((src, dst, sizes))
             return lrc.NativeTransfers(src, dst, sizes, 0, "", True)
 
+        transfers.enqueue_all = True  # Proxy constructor retains the extension capability contract.
         modules = {
             "torch": torch,
             "torch_npu": SimpleNamespace(get_npu_format=lambda t: 2),
@@ -347,6 +397,26 @@ class ScaleLoading(unittest.TestCase):
             mapping = np.array([0, 1, -1], dtype=np.int32)
             task = runtime.task((ids, mapping, layer, 0, None, False))
             lrc.run_native_update_for_test(task)
+            if backend == "native_full":
+                runtime.enqueue_prefill(0)
+                for eid in range(3):
+                    torch.testing.assert_close(manager._prefill_w13[0][eid], weights[eid])
+                    torch.testing.assert_close(manager._prefill_w2[0][eid], weights[eid])
+                    torch.testing.assert_close(
+                        manager._prefill_w13_scale[0][eid],
+                        self.layout_module.apply_mxfp4_weight_scale_layout(raw + eid),
+                    )
+                # Repeated calls read the registered source, including a nonzero slot.
+                runtime.enqueue_eager(0, [(1, 2)])
+                torch.testing.assert_close(layer.w13_weight[1], weights[2])
+                unchanged = layer.w13_weight.clone()
+                with self.assertRaisesRegex(RuntimeError, "outside table"):
+                    runtime.enqueue_eager(0, [(0, 1), (2, 0)])
+                torch.testing.assert_close(layer.w13_weight, unchanged)
+                runtime.enqueue_eager(0, [])
+                manager._prefill_w13[0] = manager._prefill_w13[0].clone()
+                with self.assertRaisesRegex(RuntimeError, "destination changed"):
+                    runtime.enqueue_prefill(0)
         self.assertEqual([row[-1] for row in tables[0][0]], before)
         self.assertEqual(runtime.reused_bytes, 3 * raw.numel())
         self.assertEqual(runtime.packed_bytes + runtime.replaced_bytes + runtime.derived_bytes, 0)

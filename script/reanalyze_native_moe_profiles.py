@@ -15,7 +15,7 @@ from verify_memcpy_gaps import MAX_DISTRIBUTION_VALUES, read_copy_tracks
 def saved_traces(runs):
     seen = set()
     for root in runs:
-        for case in ("python", "native"):
+        for case in ("python", "native", "native_full"):
             directory = root / "profile" / case
             if not directory.is_dir():
                 continue
@@ -134,7 +134,7 @@ def reanalyze(runs, output, report, stream_name="auto"):
             dict(
                 cases=list(profiles),
                 physical_npus=devices,
-                same_physical_npu=len(devices) == 2
+                same_physical_npu=len(devices) >= 2
                 and None not in devices.values()
                 and len(set(devices.values())) == 1,
             )

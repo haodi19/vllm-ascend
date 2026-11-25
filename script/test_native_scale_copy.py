@@ -71,6 +71,39 @@ def check_shared_mxfp_scale(n, k):
     )
     native.run_native_update_for_test(task)
     torch.testing.assert_close(target[0].cpu(), original.cpu(), rtol=0, atol=0)
+    # native_full prefill: one C++ call, all experts, same original pinned bytes.
+    full = native.NativeTransfers(
+        [[pointer]] * 3,
+        [[pool[eid].data_ptr()] for eid in range(3)],
+        [n * k],
+        int(stream.npu_stream),
+        "",
+        False,
+    )
+    full.enqueue_all()
+    stream.synchronize()  # The manager retains this exact completion gate.
+    for eid in range(3):
+        torch.testing.assert_close(pool[eid].cpu(), original.cpu(), rtol=0, atol=0)
+    # A second eager batch reads updated contents, not a stale packed replica.
+    source.add_(1)
+    full.enqueue([(2, 1)])
+    full.enqueue([])
+    stream.synchronize()
+    torch.testing.assert_close(pool[2].cpu(), source, rtol=0, atol=0)
+    torch.testing.assert_close(pool[0].cpu(), original.cpu(), rtol=0, atol=0)
+    with torch.npu.stream(stream):
+        pool.zero_()
+        stream.synchronize()
+    try:
+        full.enqueue([(0, 0), (3, 0)])
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("invalid full batch accepted")
+    stream.synchronize()
+    if pool.cpu().any():
+        raise AssertionError("invalid full batch partially submitted")
+    print(f"PASS native_full eager/prefill batch: bytes={n * k}; duplicate_bytes=0", flush=True)
     print(f"PASS shared scale loader/eager/prefill/native: bytes={n * k}; duplicate_bytes=0", flush=True)
 
 

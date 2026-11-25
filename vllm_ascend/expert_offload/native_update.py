@@ -11,8 +11,8 @@ import json
 
 def validate_native_update_config(config):
     mode = config.get("host_update_backend", "python")
-    if mode not in ("python", "native"):
-        raise ValueError("host_update_backend must be python or native")
+    if mode not in ("python", "native", "native_full"):
+        raise ValueError("host_update_backend must be python, native or native_full")
     if mode == "python":
         return
     required = {
@@ -163,6 +163,13 @@ class NativeUpdateRuntime:
         self.expert_weight = expert_weight
         self.owners = []
         self.tables = []
+        self.full_submit = manager.offload_config.host_update_backend == "native_full"
+        self.descriptors = []
+        self.prefill_tables = []
+        self.prefill_targets = []
+        self._reported_submit = set()
+        if self.full_submit and not hasattr(self.native.NativeTransfers, "enqueue_all"):
+            raise RuntimeError("rebuild csrc/lrc_policy for native_full submission")
         self.packed_bytes = 0
         self.reused_bytes = 0
         self.replaced_bytes = 0
@@ -179,11 +186,17 @@ class NativeUpdateRuntime:
         self.stream = int(manager.load_stream.npu_stream)
         for layer_idx, layer in enumerate(manager.moe_layers):
             self.tables.append(self._prepare_layer(layer_idx, layer, expert_weight))
+        if self.full_submit:
+            for layer_idx in range(len(self.tables)):
+                self.prefill_tables.append(self._prepare_prefill_layer(layer_idx))
+            print("[MOE-NATIVE] FULL_SUBMIT ready; eager/prefill=registered-ACL; graph=existing-native", flush=True)
         print(
             f"[MOE-NATIVE] prepared layers={len(self.tables)} scale_buffer_bytes={self.packed_bytes} "
             f"scale_reused_bytes={self.reused_bytes} scale_replaced_bytes={self.replaced_bytes} "
             f"scale_derived_bytes={self.derived_bytes} scale_duplicate_bytes=0; "
-            "graph callbacks=GIL-free; eager/prefill=shared-scale-storage; Python callback timers disabled",
+            "graph callbacks=GIL-free; "
+            f"eager/prefill={'registered-ACL' if self.full_submit else 'shared-scale-storage'}; "
+            "Python callback timers disabled",
             flush=True,
         )
         print(
@@ -252,10 +265,83 @@ class NativeUpdateRuntime:
             self._add_scale(layer.w13_weight_scale_fp32, cpu_sources, sources, destinations, sizes, derived=True)
             targets["w13_weight_scale_fp32"] = (layer.w13_weight_scale_fp32, tensor_layout(layer.w13_weight_scale_fp32))
         self.targets.append(targets)
+        self.descriptors.append((sources, sizes, list(targets)))
         table = self.native.NativeTransfers(sources, destinations, sizes, self.stream, "", False)
         if self.profiler is not None:
             table.set_profiler(self.profiler)
         return table
+
+    def _prepare_prefill_layer(self, index):
+        """Register pool destinations once; reuse the decode source bank exactly."""
+        m = self.manager
+        pools = {
+            "w13_weight": "_prefill_w13",
+            "w2_weight": "_prefill_w2",
+            "w13_weight_scale": "_prefill_w13_scale",
+            "w2_weight_scale": "_prefill_w2_scale",
+            "w13_weight_offset": "_prefill_w13_offset",
+            "w2_weight_offset": "_prefill_w2_offset",
+            "w13_scale_bias": "_prefill_w13_scale_bias",
+            "w2_scale_bias": "_prefill_w2_scale_bias",
+            "w13_weight_scale_fp32": "_prefill_w13_scale_fp32",
+        }
+        if not getattr(m, "_prefill_w13", []):
+            self.prefill_targets.append({})
+            return None
+        pool_slot = index % m.num_device_layers
+        sources, sizes, names = self.descriptors[index]
+        destinations = [[] for _ in sources]
+        targets = {}
+        for name, size in zip(names, sizes):
+            tensor = getattr(m, pools[name])[pool_slot]
+            reference = self.targets[index][name][0]
+            if tensor.shape[0] != len(sources) or tensor.dtype != reference.dtype:
+                raise ValueError(f"native_full prefill shape/dtype mismatch: {name}")
+            if self.npu.get_npu_format(tensor) != self.npu.get_npu_format(reference):
+                raise ValueError(f"native_full prefill format mismatch: {name}")
+            storage = tensor.untyped_storage()
+            start = tensor.storage_offset() * tensor.element_size()
+            if name in ("w13_weight", "w2_weight"):
+                # NZ uses physical bytes; logical tensor strides are not a byte map.
+                if tuple(tensor.shape[1:]) != tuple(reference.shape[1:]):
+                    raise ValueError(f"native_full prefill weight shape mismatch: {name}")
+                stride = size
+            else:
+                if not same_scale_layout(reference[0], tensor[0]):
+                    raise ValueError(f"native_full prefill scale layout mismatch: {name}")
+                if dense_span(tensor.shape[1:], tensor.stride()[1:]) * tensor.element_size() != size:
+                    raise ValueError(f"native_full prefill scale size mismatch: {name}")
+                stride = tensor.stride(0) * tensor.element_size()
+            if stride < size or start < 0 or start + (len(sources) - 1) * stride + size > storage.nbytes():
+                raise ValueError(f"native_full prefill destination outside storage: {name}")
+            targets[name] = (pools[name], pool_slot, tensor, tensor_layout(tensor))
+            self.owners.extend((tensor, storage))
+            for eid, row in enumerate(destinations):
+                row.append(storage.data_ptr() + start + eid * stride)
+        self.prefill_targets.append(targets)
+        return self.native.NativeTransfers(sources, destinations, sizes, self.stream, "", False)
+
+    def enqueue_eager(self, layer_idx, loads):
+        """Only submission moves to C++; caller keeps its existing synchronization."""
+        self._validate_decode_targets(layer_idx, self.manager.moe_layers[layer_idx])
+        self.tables[layer_idx].enqueue(loads)
+        self._report_submit("eager")
+
+    def enqueue_prefill(self, layer_idx):
+        table = self.prefill_tables[layer_idx]
+        if table is None:
+            raise RuntimeError("native_full prefill pool was not registered")
+        for attr, slot, original, layout in self.prefill_targets[layer_idx].values():
+            current = getattr(self.manager, attr)[slot]
+            if current is not original or tensor_layout(current) != layout:
+                raise RuntimeError("native prefill destination changed after registration; restart")
+        table.enqueue_all()
+        self._report_submit("prefill")
+
+    def _report_submit(self, kind):
+        if kind not in self._reported_submit:
+            self._reported_submit.add(kind)
+            print(f"[MOE-NATIVE] FULL_SUBMIT executed={kind}; no per-expert Python/Tensor submission", flush=True)
 
     def _add_scale(self, target, cpu_sources, sources, destinations, sizes, *, require_reuse=False, derived=False):
         if self.npu.get_npu_format(target) not in (0, 2):
@@ -290,10 +376,7 @@ class NativeUpdateRuntime:
                 self.replaced_bytes += size
             sources[eid].append(packed.data_ptr())
 
-    def task(self, args):
-        if len(args) not in (6, 9) or (len(args) == 9 and (args[6] or args[8] is not None)):
-            raise ValueError("unsupported native callback arguments")
-        ids, mapping, layer, index, scores, prefetch = args[:6]
+    def _validate_decode_targets(self, index, layer):
         if not 0 <= index < len(self.tables):
             raise ValueError("native layer was not prepared at finalization; cannot capture unregistered buffers")
         if layer is not self.manager.moe_layers[index]:
@@ -302,6 +385,12 @@ class NativeUpdateRuntime:
             current = self.expert_weight(layer, name) if name in ("w13_weight", "w2_weight") else getattr(layer, name)
             if current is not original or tensor_layout(current) != layout:
                 raise RuntimeError("native destination changed after registration; restart with rebuilt descriptors")
+
+    def task(self, args):
+        if len(args) not in (6, 9) or (len(args) == 9 and (args[6] or args[8] is not None)):
+            raise ValueError("unsupported native callback arguments")
+        ids, mapping, layer, index, scores, prefetch = args[:6]
+        self._validate_decode_targets(index, layer)
         for tensor in (ids, scores):
             if tensor is not None and (tensor.device.type != "cpu" or not tensor.is_pinned()):
                 raise ValueError("native request buffers must be pinned CPU tensors")
