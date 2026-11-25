@@ -75,6 +75,79 @@ class LayoutAndConfig(unittest.TestCase):
         torch.testing.assert_close(destination, source.to(torch.float64))
 
 
+class PrefillRegistration(unittest.TestCase):
+    """Exercise the runtime registration guard, not only raw memcpy tables."""
+
+    @classmethod
+    def setUpClass(cls):
+        import torch
+
+        cls.torch = torch
+
+    def runtime(self, reference_format, pool_format, *, name="w13_weight_scale", pool=None):
+        torch = self.torch
+        reference = torch.empty_strided((2, 4, 3), (12, 1, 4), dtype=torch.float32)
+        backing = torch.full((64,), -1.0)
+        if pool is None:
+            # Nonzero offset and padding BETWEEN experts must remain intact.
+            pool = backing.as_strided((3, 4, 3), (16, 1, 4), storage_offset=5)
+        sources = [torch.empty_strided((4, 3), (1, 4)) for _ in range(3)]
+        for eid, source in enumerate(sources):
+            source.copy_(torch.arange(12).reshape(4, 3) + eid * 20)
+        runtime = config.NativeUpdateRuntime.__new__(config.NativeUpdateRuntime)
+        runtime.native = SimpleNamespace(NativeTransfers=Mock())
+        formats = {id(reference): reference_format, id(pool): pool_format}
+        runtime.npu = SimpleNamespace(get_npu_format=lambda tensor: formats[id(tensor)])
+        runtime.manager = SimpleNamespace(num_device_layers=1, _prefill_w13=[pool], _prefill_w13_scale=[pool])
+        runtime.targets = [{name: (reference, config.tensor_layout(reference))}]
+        runtime.descriptors = [([[s.data_ptr()] for s in sources], [48], [name])]
+        runtime.owners, runtime.prefill_targets = [], []
+        runtime.stream = 1
+        return runtime, sources, pool, backing
+
+    def test_base_format_aliases_copy_the_same_physical_scale_bytes(self):
+        for formats in ((2, 0), (0, 2), (2, 2), (0, 0)):
+            with self.subTest(formats=formats):
+                runtime, sources, pool, backing = self.runtime(*formats)
+                runtime._prepare_prefill_layer(0)
+                src, dst, sizes, *_ = runtime.native.NativeTransfers.call_args.args
+                self.assertEqual(sizes, [48])
+                for eid, source in enumerate(sources):
+                    self.assertEqual(src[eid][0], source.data_ptr())
+                    self.assertEqual(dst[eid][0], pool[eid].data_ptr())
+                    ctypes.memmove(dst[eid][0], src[eid][0], sizes[0])
+                    self.torch.testing.assert_close(pool[eid], source)
+                for begin, end in ((0, 5), (17, 21), (33, 37), (49, 64)):
+                    self.assertTrue((backing[begin:end] == -1).all())
+
+    def test_packed_or_unsupported_scale_formats_are_rejected(self):
+        for formats in ((2, 29), (29, 2), (29, 29), (0, 1), (1, 0)):
+            with self.subTest(formats=formats):
+                runtime, *_ = self.runtime(*formats)
+                with self.assertRaisesRegex(ValueError, "prefill scale format unsupported.*w13_weight_scale"):
+                    runtime._prepare_prefill_layer(0)
+                runtime.native.NativeTransfers.assert_not_called()
+
+    def test_base_format_aliases_do_not_bypass_layout_or_slot_checks(self):
+        torch = self.torch
+        for pool, message in (
+            (torch.empty((3, 4, 3)), "scale layout mismatch"),
+            (torch.empty_strided((3, 4, 3), (0, 1, 4)), "destination outside storage"),
+            (torch.empty_strided((3, 4, 3), (12, 1, 4), dtype=torch.float64), "shape/dtype mismatch"),
+        ):
+            with self.subTest(message=message):
+                runtime, *_ = self.runtime(2, 0, pool=pool)
+                with self.assertRaisesRegex(ValueError, message):
+                    runtime._prepare_prefill_layer(0)
+                runtime.native.NativeTransfers.assert_not_called()
+
+    def test_weight_formats_still_require_an_exact_match(self):
+        runtime, *_ = self.runtime(29, 2, name="w13_weight")
+        with self.assertRaisesRegex(ValueError, "prefill format mismatch.*w13_weight"):
+            runtime._prepare_prefill_layer(0)
+        runtime.native.NativeTransfers.assert_not_called()
+
+
 class ScaleLoading(unittest.TestCase):
     """Run actual loader/layout methods on CPU, without importing vLLM/NPU."""
 

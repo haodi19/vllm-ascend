@@ -3,6 +3,7 @@
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import _vllm_ascend_lrc as native
@@ -25,7 +26,10 @@ def check_shared_mxfp_scale(n, k):
     raw = (torch.arange(n * k).reshape(n, k) % 251).to(torch.uint8)
     logical = raw.reshape(n, k // 2, 2).transpose(0, 1)
     shape, stride = tuple(logical.shape), tuple(logical.stride())
-    target = torch.empty_strided((2,) + shape, (n * k,) + stride, dtype=torch.uint8, device="npu")
+    # Mirror model loading: a rank-3 decode allocation becomes a rank-4 view.
+    # The prefill allocator creates rank 4 directly. Some torch-npu versions
+    # give these different base format IDs despite identical per-slot bytes.
+    target = torch.empty((2, n, k), dtype=torch.uint8, device="npu").reshape(2, n, k // 2, 2).transpose(1, 2)
     pool = torch.empty_strided((3,) + shape, (n * k,) + stride, dtype=torch.uint8, device="npu")
     original = torch.empty(shape, dtype=torch.uint8, device="npu")
     original.copy_(logical.contiguous())
@@ -72,14 +76,20 @@ def check_shared_mxfp_scale(n, k):
     native.run_native_update_for_test(task)
     torch.testing.assert_close(target[0].cpu(), original.cpu(), rtol=0, atol=0)
     # native_full prefill: one C++ call, all experts, same original pinned bytes.
-    full = native.NativeTransfers(
-        [[pointer]] * 3,
-        [[pool[eid].data_ptr()] for eid in range(3)],
-        [n * k],
-        int(stream.npu_stream),
-        "",
-        False,
+    # Include the real registration path: testing NativeTransfers directly
+    # alone misses Python layout/format guards that run before any submission.
+    runtime = module.NativeUpdateRuntime.__new__(module.NativeUpdateRuntime)
+    runtime.manager = SimpleNamespace(
+        num_device_layers=1,
+        _prefill_w13=[torch.empty((3, 1), dtype=torch.uint8, device="npu")],
+        _prefill_w13_scale=[pool],
     )
+    runtime.native, runtime.npu = native, torch_npu
+    runtime.targets = [{"w13_weight_scale": (target, module.tensor_layout(target))}]
+    runtime.descriptors = [([[pointer]] * 3, [n * k], ["w13_weight_scale"])]
+    runtime.prefill_targets, runtime.owners = [], []
+    runtime.stream = int(stream.npu_stream)
+    full = runtime._prepare_prefill_layer(0)
     full.enqueue_all()
     stream.synchronize()  # The manager retains this exact completion gate.
     for eid in range(3):
@@ -103,7 +113,11 @@ def check_shared_mxfp_scale(n, k):
     stream.synchronize()
     if pool.cpu().any():
         raise AssertionError("invalid full batch partially submitted")
-    print(f"PASS native_full eager/prefill batch: bytes={n * k}; duplicate_bytes=0", flush=True)
+    print(
+        f"PASS native_full registration/eager/prefill batch: bytes={n * k}; duplicate_bytes=0; "
+        f"decode_format={torch_npu.get_npu_format(target)}; prefill_format={torch_npu.get_npu_format(pool)}",
+        flush=True,
+    )
     print(f"PASS shared scale loader/eager/prefill/native: bytes={n * k}; duplicate_bytes=0", flush=True)
 
 

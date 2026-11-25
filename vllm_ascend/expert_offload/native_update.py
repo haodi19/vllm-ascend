@@ -8,6 +8,8 @@ execute native planning, ACL H2D and completion without calling Python/Torch.
 import importlib
 import json
 
+NPU_BASE_SCALE_FORMATS = frozenset((0, 2))  # ACL_FORMAT_NCHW / ACL_FORMAT_ND, neither is padded.
+
 
 def validate_native_update_config(config):
     mode = config.get("host_update_backend", "python")
@@ -297,16 +299,29 @@ class NativeUpdateRuntime:
             reference = self.targets[index][name][0]
             if tensor.shape[0] != len(sources) or tensor.dtype != reference.dtype:
                 raise ValueError(f"native_full prefill shape/dtype mismatch: {name}")
-            if self.npu.get_npu_format(tensor) != self.npu.get_npu_format(reference):
-                raise ValueError(f"native_full prefill format mismatch: {name}")
+            pool_format = self.npu.get_npu_format(tensor)
+            reference_format = self.npu.get_npu_format(reference)
             storage = tensor.untyped_storage()
             start = tensor.storage_offset() * tensor.element_size()
             if name in ("w13_weight", "w2_weight"):
                 # NZ uses physical bytes; logical tensor strides are not a byte map.
+                if pool_format != reference_format:
+                    raise ValueError(
+                        f"native_full prefill format mismatch: {name}; decode={reference_format}, prefill={pool_format}"
+                    )
                 if tuple(tensor.shape[1:]) != tuple(reference.shape[1:]):
                     raise ValueError(f"native_full prefill weight shape mismatch: {name}")
                 stride = size
             else:
+                # Decode scales may retain ND on a reshaped allocation, while
+                # empty_strided allocates the 4-D prefill pool as NCHW. These
+                # base formats use the same bytes ONLY with the shape, dense
+                # strides, slot spacing and storage checks below satisfied.
+                if pool_format not in NPU_BASE_SCALE_FORMATS or reference_format not in NPU_BASE_SCALE_FORMATS:
+                    raise ValueError(
+                        f"native_full prefill scale format unsupported: {name}; "
+                        f"decode={reference_format}, prefill={pool_format}; require base NCHW/ND"
+                    )
                 if not same_scale_layout(reference[0], tensor[0]):
                     raise ValueError(f"native_full prefill scale layout mismatch: {name}")
                 if dense_span(tensor.shape[1:], tensor.stride()[1:]) * tensor.element_size() != size:
@@ -314,6 +329,12 @@ class NativeUpdateRuntime:
                 stride = tensor.stride(0) * tensor.element_size()
             if stride < size or start < 0 or start + (len(sources) - 1) * stride + size > storage.nbytes():
                 raise ValueError(f"native_full prefill destination outside storage: {name}")
+            if index == 0 and pool_format != reference_format:
+                print(
+                    f"[MOE-NATIVE] PREFILL_SCALE_LAYOUT {name}; decode_format={reference_format}; "
+                    f"prefill_format={pool_format}; bytes_per_expert={size}; layout_checks=PASS",
+                    flush=True,
+                )
             targets[name] = (pools[name], pool_slot, tensor, tensor_layout(tensor))
             self.owners.extend((tensor, storage))
             for eid, row in enumerate(destinations):
@@ -344,7 +365,7 @@ class NativeUpdateRuntime:
             print(f"[MOE-NATIVE] FULL_SUBMIT executed={kind}; no per-expert Python/Tensor submission", flush=True)
 
     def _add_scale(self, target, cpu_sources, sources, destinations, sizes, *, require_reuse=False, derived=False):
-        if self.npu.get_npu_format(target) not in (0, 2):
+        if self.npu.get_npu_format(target) not in NPU_BASE_SCALE_FORMATS:
             raise ValueError("native scales require base NCHW/ND storage; packed device formats are unsupported")
         if target.shape[0] < len(destinations):
             raise ValueError("native scale destination has too few slots")

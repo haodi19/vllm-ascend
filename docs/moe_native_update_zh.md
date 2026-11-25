@@ -19,6 +19,8 @@
 
 新增路径参考同事仓库 `csrc/lrc_policy/native_dma.h` 的常驻地址表和 `native_dispatch.h` 的逐专家、逐字段 ACL 提交方式。prefill 的完整专家列表也在 C++ 中预建；每次只按层选择表，不重新切 Tensor/Storage 或构造每个字段的 Python 任务。eager 一次传入 `(slot, expert)` 计划，进入 C++ 后释放 GIL，直到整批提交结束。所有字段先验证，现有 stream 同步位置继续保留，mapping 与消费者严格等待的协议不变。
 
+scale 注册允许 ND（2）与 NCHW（0）这两种基础格式编号不同，但必须通过 dtype、逐专家 shape/stride、无重叠密集布局及存储范围检查；打包格式仍不接受。权重的格式一致性检查保持严格。NPU 小张量测试同时覆盖真实的 Prefill 地址登记和字节搬运，以检查“Decode 三维分配后 reshape/transpose”与“Prefill 直接四维分配”产生的格式差异。
+
 这里的“完整”限定为本轮权重/scale 搬运提交优化。模型初始化、eager 专家规划和图注册仍使用 Python；Decode 回调与当前 native 相同。预期可减少 eager/prefill 的提交开销，Decode 是否改善由实测决定。同事 CPU MoE 的计算准入策略、独立 DMA 队列和设备事件发布属于另一套调度协议，本轮没有移植，不能据此声称按需与预取之间的空泡已消除。
 
 截至 2026-11-25，本次实现包含以下配套修改：
