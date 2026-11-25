@@ -12,6 +12,7 @@ Maintain [docs/moe_experiment_results_zh.md](docs/moe_experiment_results_zh.md) 
 - Add reanalysis to the original experiment entry, preserving raw results and identifying the source capture. Separate directly measured timing from estimates and conditional analyses.
 - Keep decode latency as the primary timing for new runs; retain HTTP E2E, TTFT, TPOT, Host intervals and loading-stream bubbles where available. State missing measurements explicitly.
 - Present Host callback intervals and loading-stream bubbles in separate sections and tables, each with its own measurement scope and conclusion.
+- New profile summaries must include the original prefetch-to-reactive Host gap, compute early/late/uncertain/unmapped counts and proportions, and both restats: drop clearly late samples, and subtract their exposed compute time. Include direct and conservative classifications, sample counts, means, and changes; retain unknown samples unchanged and label estimates or unavailable results explicitly. Apply this to Python/native single-case runs as well as combined runs, in the existing summary.txt without an opt-in flag.
 - Keep per-run summaries, logs and profiles in their result directories. Use unused sequential names such as `_01` and `_02`; this documentation convention does not merge or overwrite raw artifacts.
 - Technical guides may remain separate. Old experiment documents retain links to the master record and should not accumulate a second copy of new results.
 

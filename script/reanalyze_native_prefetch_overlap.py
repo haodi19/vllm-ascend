@@ -278,10 +278,22 @@ def render(results, report):
         report("PAIRED_TRANSITIONS " + json.dumps(dict(margin_us=margin, transitions=transitions(pairs, margin))))
 
 
+def report_scope(report):
+    report("分析预取Host是否更早结束、计算是否暴露到间隔中；早/晚均指计算相对于预取Host结束。")
+    report("方案1删除明确晚完成样本；方案2扣除其预取结束至计算到达的时间（边界区间中点）。")
+    report("两方案全样本口径：早、不确定、无法识别样本均保留原间隔；不做IQR、不设时长截断。")
+    report("直接判定不加余量；保守判定用同次校准包络宽度+1μs。边界范围不是完整时钟误差区间。")
+    report("重统计相对原均值的降低是描述性结果，不是新测Decode/TPOT收益；native缺少逐专家计数时不猜测零加载。")
+    report("跨Host/设备顺序不符只阻止相关样本的计算分类；Host函数耗时独立统计，不平移时间戳、不放宽1μs检查。")
+    report("LOAD_EVIDENCE只说明逐专家加载数能否核验；缺失加载后端元数据不等于Python加载路径运行失败。")
+    report("顺序残差未超过原校准敏感性余量时，另列条件坐标估算；严格检查失败记录原样保留，不宣称顺序已验证。")
+
+
 def reanalyze(runs, output, report):
-    results, reference = {}, None
-    with (output / "details.log").open("w", encoding="utf-8") as details:
+    results, reference, requested_cases = {}, None, set()
+    with (output / "prefetch_overlap_details.log").open("w", encoding="utf-8") as details:
         for root, case, trace in saved_traces(runs):
+            requested_cases.add(case)
             count, device, expected = saved_case(root, case)
             if reference is not None and reference != expected:
                 raise ValueError("Python/native saved output references differ")
@@ -326,16 +338,16 @@ def reanalyze(runs, output, report):
     render(results, report)
     if (
         not results
-        or "native" not in results
-        or (
-            results["native"].get("coordinate_estimate", results["native"])["classification"]["unmapped"]["count"]
-            == len(results["native"]["rows"])
+        or set(results) != requested_cases
+        or any(
+            r.get("coordinate_estimate", r)["classification"]["unmapped"]["count"] == len(r["rows"])
+            for r in results.values()
         )
     ):
-        raise ValueError("native compute boundary unavailable; no conclusion about exposed computation")
+        raise ValueError("compute boundary unavailable for requested case(s); no complete overlap result")
     if any("coordinate_estimate" in r for r in results.values()):
         return "OVERLAP_ESTIMATED"
-    partial = any(r["classification"]["unmapped"]["count"] for r in results.values()) or len(results) != 2
+    partial = any(r["classification"]["unmapped"]["count"] for r in results.values())
     return "OVERLAP_PARTIAL" if partial else "OVERLAP_COMPLETE"
 
 
@@ -353,16 +365,9 @@ def main(argv=None):
             destination.write(message + "\n")
 
     report(f"SUMMARY_FILE={output / 'summary.txt'}")
-    report("SCRIPT_REVISION=native_overlap_v3_coordinate_sensitivity")
+    report("SCRIPT_REVISION=native_overlap_v4_integrated_single_case")
     report("只读已有对齐profile/计数器/输出；不导入Torch、不启动模型/NPU、不改原采集；仅写本次分析目录。")
-    report("分析预取Host是否更早结束、计算是否暴露到间隔中；早/晚均指计算相对于预取Host结束。")
-    report("方案1删除明确晚完成样本；方案2扣除其预取结束至计算到达的时间（边界区间中点）。")
-    report("两方案全样本口径：早、不确定、无法识别样本均保留原间隔；不做IQR、不设时长截断。")
-    report("直接判定不加余量；保守判定用同次校准包络宽度+1μs。边界范围不是完整时钟误差区间。")
-    report("重统计相对原均值的降低是描述性结果，不是新测Decode/TPOT收益；native缺少逐专家计数时不猜测零加载。")
-    report("跨Host/设备顺序不符只阻止相关样本的计算分类；Host函数耗时独立统计，不平移时间戳、不放宽1μs检查。")
-    report("LOAD_EVIDENCE只说明逐专家加载数能否核验；缺失加载后端元数据不等于Python加载路径运行失败。")
-    report("顺序残差未超过原校准敏感性余量时，另列条件坐标估算；严格检查失败记录原样保留，不宣称顺序已验证。")
+    report_scope(report)
     try:
         status = reanalyze([p.resolve(strict=True) for p in args.runs], output, report)
     except Exception as exc:

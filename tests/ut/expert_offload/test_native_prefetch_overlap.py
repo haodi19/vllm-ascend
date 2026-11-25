@@ -8,9 +8,11 @@ import tempfile
 import unittest
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "script"))
+import native_moe_profile as profile
 import reanalyze_native_prefetch_overlap as runner
 from analyze_prefetch_compute_overlap import bind_streams
 from diagnose_mte_wait_timeline import read_trace
@@ -97,6 +99,129 @@ def capture(root, case, *, bad_tail=False):
 
 
 class NativePrefetchOverlapTests(unittest.TestCase):
+    def test_profile_pipeline_automatically_reports_both_methods_for_single_and_combined_runs(self):
+        for cases in (("python",), ("native",), ("python", "native")):
+            with self.subTest(cases=cases), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                sample = dict(digest="same", usage=dict(completion_tokens=5))
+                summary = root / "summary.txt"
+                summary.write_text(
+                    "RUNTIME_DEVICE: physical_npu=6; logical_npu=0\n"
+                    + "\n".join(
+                        "RESULT " + json.dumps(dict(case=c, output_match=True, stream_samples=[sample])) for c in cases
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                commands = {
+                    c: [
+                        "python",
+                        "--additional-config",
+                        json.dumps(dict(expert_offload_config=dict(host_update_backend=c))),
+                    ]
+                    for c in cases
+                }
+                args = SimpleNamespace(
+                    port=8156,
+                    timing_port=18156,
+                    min_profile_free_gib=5,
+                    startup_timeout=60,
+                    max_tokens=5,
+                    warmup_requests=1,
+                    request_timeout=60,
+                    profile_timeout=60,
+                    profile_requests=1,
+                    bubble_stream_name="auto",
+                )
+                active = {}
+
+                def report(line, summary=summary):
+                    with summary.open("a", encoding="utf-8") as out:
+                        out.write(line + "\n")
+
+                def launch(command, active=active, **kwargs):
+                    active["case"] = json.loads(command[command.index("--additional-config") + 1])[
+                        "expert_offload_config"
+                    ]["host_update_backend"]
+                    kwargs["stdout"].write("first native graph task completed without Python\n")
+                    kwargs["stdout"].flush()
+                    return Mock(pid=123, poll=Mock(return_value=None))
+
+                def request(_opener, _port, path, *unused, active=active, **kwargs):
+                    if path == "/v1/models":
+                        return dict(data=[dict(id="model")])
+                    if path == "/status":
+                        return dict(mstx_enabled=True)
+                    if path == "/stop":
+                        return dict(count=5, errors=0, dropped=0, mstx_errors=0, native=active["case"] == "native")
+                    return dict(samples=[])
+
+                def export(directory, _timeout, root=root, summary=summary):
+                    # Simulate the profiler writing a completed, aligned fixture;
+                    # keep the runner's timing summary, as a real exporter does.
+                    original = summary.read_bytes()
+                    capture(root, directory.name)
+                    summary.write_bytes(original)
+
+                with (
+                    patch.object(profile.subprocess, "Popen", side_effect=launch),
+                    patch.object(profile, "request", side_effect=request),
+                    patch.object(profile, "streaming_completion", return_value=sample),
+                    patch.object(profile, "ensure_profile_storage"),
+                    patch.object(profile, "check_host_memory"),
+                    patch.object(profile, "after_service_memory"),
+                    patch.object(profile, "report_native_scale_memory"),
+                    patch.object(profile, "wait_profile", side_effect=export),
+                    patch.object(profile, "discover_roots", side_effect=lambda ds: [ds[0] / "capture"]),
+                    patch.object(profile, "align_capture", return_value=dict(status="calibration_validated")),
+                    patch.object(profile, "publish_aligned_capture", return_value=dict(status="exported")),
+                    patch.object(profile, "analyze_profile", return_value=(dict(host_gaps=[]), "")),
+                ):
+                    profile.profile_cases(args, commands, root, {}, report, Mock(), Mock(), [("same", sample["usage"])])
+                status = json.loads((root / "prefetch_overlap_status.json").read_text(encoding="utf-8"))
+                self.assertEqual(status["status"], "OVERLAP_COMPLETE")
+                results = json.loads((root / "prefetch_overlap.json").read_text(encoding="utf-8"))
+                self.assertEqual(set(results), set(cases))
+                for case, result in results.items():
+                    self.assertEqual(result["physical_npu"], 6)
+                    values = result["direct"]["all_samples"]
+                    self.assertEqual(values["original"]["count"], 2)
+                    self.assertAlmostEqual(values["original"]["mean_us"], 53.5 if case == "native" else 13.5)
+                    self.assertAlmostEqual(values["method1_drop_late"]["mean_us"], 52 if case == "native" else 13.5)
+                    self.assertAlmostEqual(
+                        values["method2_subtract_remaining_compute"]["mean_us"], 37.25 if case == "native" else 13.5
+                    )
+                text = summary.read_text(encoding="utf-8")
+                self.assertEqual(text.count("PREFETCH_OVERLAP_BEGIN"), 1)
+                self.assertIn("HOST_FUNCTION_TIMES", text)
+                self.assertIn("方案1 n/均值", text)
+                self.assertIn("方案2 n/均值", text)
+                self.assertIn("保守判定", text)
+                self.assertNotIn("OVERLAP_FAILED", text)
+
+    def test_integrated_analysis_failure_is_explicit_and_keeps_original_measurements(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = capture(root, "native")
+            path.with_name("clock_alignment.json").write_text('{"status":"failed"}', encoding="utf-8")
+            before = {p: p.read_bytes() for p in root.rglob("*") if p.is_file()}
+            lines = []
+            status = profile.report_prefetch_overlap(root, lines.append)
+            self.assertEqual(status["status"], "OVERLAP_FAILED")
+            self.assertTrue(status["error"])
+            self.assertTrue(any("PROFILE_ANALYSIS_INCOMPLETE" in s for s in lines))
+            self.assertTrue(any("PREFETCH_OVERLAP_STATUS" in s for s in lines))
+            for p, content in before.items():
+                self.assertEqual(p.read_bytes(), content)
+
+    def test_python_only_offline_analysis_succeeds_without_a_native_case(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, out = Path(temp) / "python", Path(temp) / "analysis_01"
+            capture(root, "python")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.main([str(root), "--output-dir", str(out)]), 0)
+            self.assertIn("OVERLAP_COMPLETE", (out / "summary.txt").read_text(encoding="utf-8"))
+
     def test_publish_after_host_start_is_not_accepted_as_valid_boundary(self):
         with tempfile.TemporaryDirectory() as temp:
             root, out = Path(temp) / "native", Path(temp) / "analysis_01"

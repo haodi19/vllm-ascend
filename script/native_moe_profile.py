@@ -168,6 +168,24 @@ def report_gap_table(profiles, report):
             report(f"| {case} | Loading bubbles {scope} | {count} | {mean} | — | — |")
 
 
+def report_prefetch_overlap(root, report):
+    """Always append both restats to the run summary, including single-case runs."""
+    # Offline discovery imports this module for the gap reader; defer to avoid
+    # that circular import. Analysis runs only after all services have exited.
+    from reanalyze_native_prefetch_overlap import reanalyze, report_scope
+
+    report("PREFETCH_OVERLAP_BEGIN: saved aligned profiles; original gaps and both methods follow")
+    report_scope(report)
+    try:
+        status = dict(status=reanalyze([root], root, report))
+    except Exception as exc:
+        status = dict(status="OVERLAP_FAILED", error=f"{type(exc).__name__}: {exc}")
+        report("PROFILE_ANALYSIS_INCOMPLETE: overlap unavailable; measured timing/gaps and profiles retained")
+    (root / "prefetch_overlap_status.json").write_text(json.dumps(status, ensure_ascii=False), encoding="utf-8")
+    report("PREFETCH_OVERLAP_STATUS " + json.dumps(status, ensure_ascii=False))
+    return status
+
+
 def profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, expected_outputs):
     """No profiler/MSTX configuration is added to either timed service."""
     repo = Path(__file__).resolve().parents[1]
@@ -293,4 +311,5 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
         "all tasks including Transpose, 10<=gap<5000us."
     )
     report_gap_table(profiles, report)
+    report_prefetch_overlap(root, report)
     return profiles

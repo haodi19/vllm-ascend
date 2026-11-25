@@ -72,7 +72,7 @@ def saved_case(root, case):
                 row = json.loads(line[7:])
                 if row.get("case") == case:
                     records.append(row)
-            if line.startswith("PROFILE_ONLY:"):
+            if line.startswith(("PROFILE_ONLY:", "RUNTIME_DEVICE:")):
                 match = re.search(r"physical_npu=(\d+)", line)
                 if match:
                     physical_npus.add(int(match[1]))

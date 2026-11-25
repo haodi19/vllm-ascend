@@ -358,6 +358,7 @@ def main():
             return json.load(response)
 
     try:
+        report(f"RUNTIME_DEVICE: physical_npu={args.npu}; logical_npu=0")
         report(
             "HOST_MEMORY_POLICY: after successful Python service exit, run echo 1 > /proc/sys/vm/drop_caches "
             "once; no RAM threshold; outside all measurement windows"
@@ -580,6 +581,8 @@ def main():
                 "native C MSTX ranges, aligned visualization, Host gaps and loading bubbles"
             )
             profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, reference)
+        else:
+            report("OVERLAP_UNAVAILABLE: --skip-profile selected; no compute-boundary or Host interval samples")
     except Exception as exc:
         report(f"FAILED {type(exc).__name__}: {exc}")
         return 1

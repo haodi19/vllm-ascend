@@ -26,6 +26,26 @@
 
 需要分开运行时，分别传 `--case python` 和 `--case native`，使用两个新的结果目录。每条命令均独立完成该组计时和 profile，不依赖其他结果目录；省略 `--case` 仍顺序运行两组。单组摘要只验证该组请求一致性，不宣称跨版本输出一致或性能提升；比较时同时提供两组 `summary.txt`。单组计时完成后如需补采，可用 `--profile-only-from` 配合对应的 `--profile-case`。
 
+每次完成 profile 后，脚本默认把以下分析追加到同一个 `summary.txt`，Python/native 分开运行时也一样，无需额外开关：
+
+- Host 函数与分项耗时，以及原始预取→按需间隔。
+- 计算相对于预取 Host 结束的早/晚、不确定、无法识别样本数量、占比和间隔均值。
+- 方案 1：删除明确晚完成样本；方案 2：扣除这些样本从预取结束至计算到达的经过时间。
+- 两方案的保留样本数、均值及相对原始均值变化，分别保留直接判定和保守判定。早、不确定、无法识别样本保留原值，不另加 IQR 或时长截断。
+
+逐样本结果保存为 `prefetch_overlap.json`，详细解析输出为 `prefetch_overlap_details.log`。计算边界不足时明确输出 `OVERLAP_FAILED` 或部分覆盖状态，已有计时、间隔和 profile 保留；条件坐标估算继续标明顺序检查未通过，不能当成精确测量或新的 Decode 收益。`--skip-profile` 不产生这两种方案的数据，会明确标记缺失。
+
+已完成的旧结果可直接离线补算，无需重新加载模型或采集：
+
+```bash
+python -u -B script/reanalyze_native_prefetch_overlap.py \
+  /home/w00919836/results/native_shared_scale_python_01 \
+  /home/w00919836/results/native_shared_scale_native_01 \
+  --output-dir /home/w00919836/results/native_shared_scale_overlap_01
+```
+
+该命令把核心表格直接打印到终端，并保存到新分析目录的 `summary.txt`；不修改原 profile 和旧摘要。目录已存在时改用下一个未占用编号。
+
 新版 `NATIVE_SCALE_MEMORY` 记录会出现在计时与 profile 的摘要中：
 
 | 字段 | 含义 |
