@@ -11,6 +11,7 @@ Maintain [docs/moe_experiment_results_zh.md](docs/moe_experiment_results_zh.md) 
 - Distinguish the run date from offline reanalysis and documentation dates. Mark missing historical metadata as unknown; do not infer actual result paths from example commands.
 - Add reanalysis to the original experiment entry, preserving raw results and identifying the source capture. Separate directly measured timing from estimates and conditional analyses.
 - Keep decode latency as the primary timing for new runs; retain HTTP E2E, TTFT, TPOT, Host intervals and loading-stream bubbles where available. State missing measurements explicitly.
+- Present Host callback intervals and loading-stream bubbles in separate sections and tables, each with its own measurement scope and conclusion.
 - Keep per-run summaries, logs and profiles in their result directories. Use unused sequential names such as `_01` and `_02`; this documentation convention does not merge or overwrite raw artifacts.
 - Technical guides may remain separate. Old experiment documents retain links to the master record and should not accumulate a second copy of new results.
 
