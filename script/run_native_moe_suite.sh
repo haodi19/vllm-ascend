@@ -41,28 +41,56 @@ command -v python >/dev/null || { echo "Activate the project env.sh first" >&2; 
 
 if (( ! worker )); then
   mkdir -p "$(dirname "$output_root")"
-  mkdir "$output_root"  # Refuse reuse; do not overwrite previous experiments.
+  case "$case_name" in
+    all|both) mkdir "$output_root" ;;  # Complete suites still require a fresh root.
+    *) mkdir -p "$output_root" ;;     # Independent cases share the same root.
+  esac
   output_root=$(cd "$output_root" && pwd -P)
+  mkdir "$output_root/.suite.lock" 2>/dev/null || {
+    echo "This output root is locked by another suite: $output_root/.suite.lock" >&2
+    exit 2
+  }
+  trap 'rmdir "$output_root/.suite.lock"' EXIT
+  # Check both token directories before starting any work. Failed cases are
+  # retained too; rerunning a case requires a new experiment root.
+  for token_count in "${tokens[@]}"; do
+    for previous in "$output_root/token${token_count}/$case_name" \
+      "$output_root/token${token_count}/profile/$case_name" \
+      "$output_root/token${token_count}/${case_name}_command.json"; do
+      if [[ -e $previous ]]; then
+        echo "Case already exists; no files overwritten: $previous" >&2
+        exit 2
+      fi
+    done
+  done
   worker_args=(--worker --case "$case_name" --npu "$npu" --port "$port"
     --timing-port "$timing_port" --output-root "$output_root")
   if (( ${#tokens[@]} == 1 )); then worker_args+=(--tokens "${tokens[0]}"); fi
-  nohup bash "$script_path" "${worker_args[@]}" >"$output_root/run.log" 2>&1 </dev/null &
+  nohup bash "$script_path" "${worker_args[@]}" >>"$output_root/run.log" 2>&1 </dev/null &
   bg_pid=$!
   printf '%s\n' "$bg_pid" >"$output_root/background.pid"
   printf 'PID=%s\nCASES=%s; tokens=%s\nRESULTS=%s\n' "$bg_pid" "$case_name" "${tokens[*]}" "$output_root"
   printf 'Live output: tail -f %q\n' "$output_root/run.log"
   printf 'Return this file: %s/summary.txt\n' "$output_root"
+  trap - EXIT  # The background worker owns the lock until its EXIT handler.
   exit 0
 fi
 
 [[ -d $output_root ]] || { echo "Worker output directory is missing" >&2; exit 2; }
+[[ -d "$output_root/.suite.lock" ]] || { echo "Worker requires the launcher's output lock" >&2; exit 2; }
 finish() {
   code=$?
   trap - EXIT
+  batch_code=$code
+  if [[ -f "$output_root/status.txt" ]] && grep -Eq 'exit=[1-9][0-9]*' "$output_root/status.txt"; then
+    batch_code=1
+  fi
   {
-    printf 'BATCH_EXIT=%s; case=%s; physical_npu=%s; tokens=%s\n' "$code" "$case_name" "$npu" "${tokens[*]}"
+    printf 'BATCH_EXIT=%s; LAST_JOB_EXIT=%s; case=%s; physical_npu=%s; tokens=%s\n' \
+      "$batch_code" "$code" "$case_name" "$npu" "${tokens[*]}"
+    printf 'SCOPE=accumulated runs; untested groups are not a completed three-way comparison.\n'
     [[ ! -f "$output_root/status.txt" ]] || cat "$output_root/status.txt"
-    for token_count in "${tokens[@]}"; do
+    for token_count in 5 128; do
       printf '\n===== max_tokens=%s =====\n' "$token_count"
       if [[ -f "$output_root/token${token_count}/summary.txt" ]]; then
         cat "$output_root/token${token_count}/summary.txt"
@@ -71,7 +99,8 @@ finish() {
       fi
     done
   } >"$output_root/summary.txt"
-  printf 'BATCH_EXIT=%s; SUMMARY=%s/summary.txt\n' "$code" "$output_root"
+  printf 'BATCH_EXIT=%s; LAST_JOB_EXIT=%s; SUMMARY=%s/summary.txt\n' "$batch_code" "$code" "$output_root"
+  rmdir "$output_root/.suite.lock"
   exit "$code"
 }
 trap finish EXIT
@@ -91,6 +120,7 @@ for token_count in "${tokens[@]}"; do
     code=$?
     overall=1
   fi
-  printf 'max_tokens=%s; exit=%s\n' "$token_count" "$code" | tee -a "$output_root/status.txt"
+  printf 'max_tokens=%s; exit=%s; case=%s; physical_npu=%s\n' \
+    "$token_count" "$code" "$case_name" "$npu" | tee -a "$output_root/status.txt"
 done
 exit "$overall"

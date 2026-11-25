@@ -38,7 +38,7 @@ scale 注册允许 ND（2）与 NCHW（0）这两种基础格式编号不同，�
 
 继续使用 `script/run_native_moe_compare.py`，默认顺序运行 Python MTE、当前 native、native_full 三组。它先运行 CPU 回归、NPU scale 字节一致性、整批 eager/prefill 提交、严格图重放及 GIL 独立推进检查，再运行性能请求和独立 profile。结果统一汇总到指定目录的 `summary.txt`，保留 Decode、HTTP E2E、TTFT、TPOT、Host 函数耗时、Host 间隔及加载流空泡。
 
-需要分开运行时，分别传 `--case python`、`--case native`、`--case native_full`，使用三个新的结果目录。每条命令均独立完成该组计时和 profile；`--case both` 保留原 Python/native 两组入口。单组摘要验证该组请求一致性，比较时同时提供三组 `summary.txt`。单组计时完成后如需补采，可用 `--profile-only-from` 配合对应的 `--profile-case`；三组补采传 `--profile-case all`。
+需要分开运行时，分别传 `--case python`、`--case native`、`--case native_full`，三条命令可以使用同一结果目录，逐组追加。每条命令均独立完成该组计时和 profile；`--case both` 保留原 Python/native 两组入口。单组计时验证该组请求一致性，汇总保留各组测量来源，不能把分开启动称为同次配对测量。单组计时完成后如需补采，可用 `--profile-only-from` 配合对应的 `--profile-case` 和新输出目录；三组补采传 `--profile-case all`。
 
 完整测试使用 `script/run_native_moe_suite.sh`：后台依次运行 token 5、128，每轮均比较三组，每组 5 次预热、20 次正式请求并独立采 profile。它继承当前终端环境；在容器内执行，下面的 `--npu 6` 为物理卡号，结果目录已存在时改为下一个编号：
 
@@ -57,20 +57,22 @@ tail -f /home/w00919836/results/native_three_way_01/run.log
 cat /home/w00919836/results/native_three_way_01/summary.txt
 ```
 
-独立运行某一组也用此入口，默认仍测 token 5、128。以下三条是独立入口，同一张卡应等上一条完成再启动下一条：
+独立运行某一组也用此入口，默认仍测 token 5、128。以下三条共用 `native_three_way_02`，等上一条后台任务结束再执行下一条：
 
 ```bash
 bash script/run_native_moe_suite.sh --case python --npu 6 \
-  --output-root /home/w00919836/results/native_python_01
+  --output-root /home/w00919836/results/native_three_way_02
 
 bash script/run_native_moe_suite.sh --case native --npu 6 \
-  --output-root /home/w00919836/results/native_current_01
+  --output-root /home/w00919836/results/native_three_way_02
 
 bash script/run_native_moe_suite.sh --case native_full --npu 6 \
-  --output-root /home/w00919836/results/native_full_01
+  --output-root /home/w00919836/results/native_three_way_02
 ```
 
-仅测一种输出长度时，在相应命令追加 `--tokens 5` 或 `--tokens 128`，仍需使用新目录。默认服务端口为 8156、独立计时端口为 18156；占用时传入 `--port` 和 `--timing-port`。批量入口沿用 5 GiB 剩余空间检查，profile 导出最多等 600 秒。结果位于根目录的 `token5/`、`token128/`；`status.txt` 逐轮记录退出码，根目录 `summary.txt` 在后台结束时合并生成。第一轮失败后仍尝试第二轮，合并摘要明确标记失败，不能当成完整对照通过。
+仅测一种输出长度时，在相应命令追加 `--tokens 5` 或 `--tokens 128`。单组入口允许补上同一总目录中尚未运行的组或 token 长度；重复组（包括失败后留下的目录）会在启动前被拒绝。完整 `all/both` 入口仍要求新总目录。同一总目录用 `.suite.lock` 防止并发写入，后台结束时释放锁；`run.log` 和各 token 的摘要追加保留，根摘要每次重新汇总全部已有结果。
+
+默认服务端口为 8156、独立计时端口为 18156；占用时传入 `--port` 和 `--timing-port`。批量入口沿用 5 GiB 剩余空间检查，profile 导出最多等 600 秒。结果位于根目录的 `token5/`、`token128/`；`status.txt` 逐组逐轮记录退出码。`BATCH_EXIT` 保留历史失败，`LAST_JOB_EXIT` 表示刚结束的任务；没有测完三组时不能作为完整对照。第一种长度失败后仍尝试第二种长度。
 
 每个 token 目录内，三组日志、命令与数据分别归档，三组可视化集中放在 `profile/`。例如：
 

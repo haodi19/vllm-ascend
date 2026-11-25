@@ -108,6 +108,28 @@ def selected_cases(case):
     return ("python", "native") if case == "both" else (case,)
 
 
+def prepare_output(root, cases, *, append_single_case=False):
+    """A standalone case may join an existing run, but may never replace a case."""
+    if not append_single_case:
+        root.mkdir(parents=True, exist_ok=False)
+        return
+    case = cases[0]
+    occupied = (root / case, root / "profile" / case, root / f"{case}_command.json")
+    if any(path.exists() for path in occupied):
+        raise FileExistsError(f"Case {case} already exists in {root}; previous data retained")
+    summary = root / "summary.txt"
+    if summary.exists():
+        with summary.open(encoding="utf-8") as source:
+            for line in source:
+                if line.startswith("RESULT ") and json.loads(line[7:]).get("case") == case:
+                    raise FileExistsError(f"Completed result for {case} already exists in {root}")
+    elif root.exists() and any(root.iterdir()):
+        raise FileExistsError(f"Unrecognized nonempty output directory: {root}")
+    root.mkdir(parents=True, exist_ok=True)
+    # Reserve before build/preflight so even a failed attempt cannot be overwritten.
+    (root / case).mkdir()
+
+
 def timing_row(case, timing, e2e_mean_ms):
     values = []
     for metric in ("decode_ms", "ttft_ms", "tpot_ms"):
@@ -327,7 +349,7 @@ def main():
     args.profile_requests = 1
     cases = selected_cases(args.case)
     root = args.output_dir.resolve()
-    root.mkdir(parents=True, exist_ok=False)
+    prepare_output(root, cases, append_single_case=len(cases) == 1 and not args.profile_only_from)
     env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(args.npu))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     summary = root / "summary.txt"

@@ -40,9 +40,19 @@ while (($#)); do
     *) shift ;;
   esac
 done
-mkdir "$out"
+case "$case_name" in
+  all) mkdir "$out"; cases=(python native native_full) ;;
+  both) mkdir "$out"; cases=(python native) ;;
+  *) mkdir -p "$out"; cases=("$case_name") ;;
+esac
+for name in "${cases[@]}"; do
+  mkdir "$out/$name"
+  mkdir -p "$out/profile/$name"
+  echo "saved $name $tokens" > "$out/$name/timing_result.json"
+  echo "trace $name $tokens" > "$out/profile/$name/trace.json"
+done
 printf 'case=%s tokens=%s npu=%s\n' "$case_name" "$tokens" "$npu" >> calls.txt
-echo "FAKE_RESULT case=$case_name tokens=$tokens" > "$out/summary.txt"
+echo "FAKE_RESULT case=$case_name tokens=$tokens" >> "$out/summary.txt"
 echo "LIVE tokens=$tokens"
 if [[ -f fail_token$tokens ]]; then exit 3; fi
 """,
@@ -56,6 +66,8 @@ if [[ -f fail_token$tokens ]]; then exit 3; fi
 
     def invoke(self, *args):
         # Positional arguments preserve spaces; fake python applies only here.
+        if "--worker" in args:
+            (self.output / ".suite.lock").mkdir()
         return subprocess.run(
             [
                 self.bash,
@@ -77,6 +89,58 @@ if [[ -f fail_token$tokens ]]; then exit 3; fi
 
     def calls(self):
         return (self.root / "calls.txt").read_text(encoding="utf-8").splitlines()
+
+    def wait_background(self):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and (self.output / ".suite.lock").exists():
+            time.sleep(0.05)
+        self.assertFalse((self.output / ".suite.lock").exists())
+        self.assertTrue((self.output / "summary.txt").exists())
+
+    def test_separate_cases_share_both_token_directories_and_keep_previous_artifacts(self):
+        saved = {}
+        for case in ("python", "native", "native_full"):
+            result = self.invoke("--case", case)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.wait_background()
+            for path, content in saved.items():
+                self.assertEqual(path.read_bytes(), content)
+            for tokens in (5, 128):
+                paths = (
+                    self.output / f"token{tokens}/{case}/timing_result.json",
+                    self.output / f"token{tokens}/profile/{case}/trace.json",
+                )
+                saved.update({path: path.read_bytes() for path in paths})
+        summary = (self.output / "summary.txt").read_text()
+        for case in ("python", "native", "native_full"):
+            for tokens in (5, 128):
+                self.assertIn(f"FAKE_RESULT case={case} tokens={tokens}", summary)
+        self.assertEqual(len(self.calls()), 6)
+        self.assertIn("BATCH_EXIT=0", summary)
+        before = {p: p.read_bytes() for p in self.output.rglob("*") if p.is_file()}
+        self.assertNotEqual(self.invoke("--case", "python").returncode, 0)
+        self.assertEqual(before, {p: p.read_bytes() for p in self.output.rglob("*") if p.is_file()})
+
+    def test_locked_root_refuses_another_job_before_writing(self):
+        self.output.mkdir()
+        (self.output / ".suite.lock").mkdir()
+        (self.output / "run.log").write_text("running")
+        result = self.invoke("--case", "native")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("locked", result.stderr)
+        self.assertEqual((self.output / "run.log").read_text(), "running")
+        self.assertFalse((self.root / "calls.txt").exists())
+
+    def test_later_token_job_preserves_earlier_summary_and_failure_status(self):
+        (self.root / "fail_token5").touch()
+        self.assertEqual(self.invoke("--case", "python", "--tokens", "5").returncode, 0)
+        self.wait_background()
+        self.assertEqual(self.invoke("--case", "python", "--tokens", "128").returncode, 0)
+        self.wait_background()
+        summary = (self.output / "summary.txt").read_text()
+        self.assertIn("FAKE_RESULT case=python tokens=5", summary)
+        self.assertIn("FAKE_RESULT case=python tokens=128", summary)
+        self.assertIn("BATCH_EXIT=1; LAST_JOB_EXIT=0", summary)
 
     def test_all_cases_run_both_token_counts_serially_and_combine_results(self):
         self.output.mkdir()
@@ -114,10 +178,7 @@ if [[ -f fail_token$tokens ]]; then exit 3; fi
         result = self.invoke("--case", "native_full", "--tokens", "5")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Live output:", result.stdout)
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline and not (self.output / "summary.txt").exists():
-            time.sleep(0.05)
-        self.assertTrue((self.output / "summary.txt").exists())
+        self.wait_background()
         self.assertTrue((self.output / "background.pid").read_text().strip().isdigit())
         self.assertIn("LIVE tokens=5", (self.output / "run.log").read_text(encoding="utf-8"))
         again = self.invoke()

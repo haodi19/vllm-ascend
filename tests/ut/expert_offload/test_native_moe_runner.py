@@ -150,6 +150,41 @@ class NativeRunnerTests(unittest.TestCase):
                 config = json.loads(json.loads((output / case / "command.json").read_text())[-1])
                 self.assertEqual(config["expert_offload_config"]["host_update_backend"], case)
 
+    def test_independent_cases_append_to_same_output_without_replacing_previous_results(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            previous = {}
+            for case in ("python", "native", "native_full"):
+                code, output, launched, _, _ = self.run_mock_comparison(directory, case)
+                self.assertEqual(code, 0)
+                self.assertEqual(launched, [case])
+                for path, content in previous.items():
+                    self.assertEqual(path.read_bytes(), content)
+                previous.update({p: p.read_bytes() for p in (output / case).iterdir() if p.is_file()})
+            records, commands, _, _ = runner.load_completed_timing_run(
+                output, 8157, ("python", "native", "native_full")
+            )
+            self.assertEqual(set(records), {"python", "native", "native_full"})
+            self.assertEqual(set(commands), set(records))
+            before = {p: p.read_bytes() for p in output.rglob("*") if p.is_file()}
+            with self.assertRaisesRegex(FileExistsError, "already exists"):
+                self.run_mock_comparison(directory, "python")
+            self.assertEqual(before, {p: p.read_bytes() for p in output.rglob("*") if p.is_file()})
+
+    def test_shared_output_rejects_saved_profile_legacy_command_and_completed_result(self):
+        for evidence in ("profile", "legacy", "summary"):
+            with self.subTest(evidence=evidence), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                if evidence == "profile":
+                    (root / "profile/native").mkdir(parents=True)
+                elif evidence == "legacy":
+                    (root / "native_command.json").write_text("[]")
+                else:
+                    (root / "summary.txt").write_text('RESULT {"case":"native"}\n')
+                with self.assertRaises(FileExistsError):
+                    runner.prepare_output(root, ("native",), append_single_case=True)
+                self.assertFalse((root / "native").exists())
+
     def test_combined_run_still_launches_both_and_compares(self):
         with tempfile.TemporaryDirectory() as temporary:
             code, output, launched, requests, profiles = self.run_mock_comparison(Path(temporary))
