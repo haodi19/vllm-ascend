@@ -38,17 +38,39 @@
 
 需要分开运行时，分别传 `--case python`、`--case native`、`--case native_full`，使用三个新的结果目录。每条命令均独立完成该组计时和 profile；`--case both` 保留原 Python/native 两组入口。单组摘要验证该组请求一致性，比较时同时提供三组 `summary.txt`。单组计时完成后如需补采，可用 `--profile-only-from` 配合对应的 `--profile-case`；三组补采传 `--profile-case all`。
 
-在容器内执行，下面的 `--npu 6` 为物理卡号，结果目录已存在时改为下一个编号：
+完整测试使用 `script/run_native_moe_suite.sh`：后台依次运行 token 5、128，每轮均比较三组，每组 5 次预热、20 次正式请求并独立采 profile。它继承当前终端环境；在容器内执行，下面的 `--npu 6` 为物理卡号，结果目录已存在时改为下一个编号：
 
 ```bash
 source /data/w00919836/moeoffload/env.sh
 cd /data/w00919836/moeoffload/vllm-ascend
-python -u -B script/run_native_moe_compare.py --case all --npu 6 \
-  --port 8156 --timing-port 18156 --max-tokens 5 --min-profile-free-gib 5 \
-  --output-dir /home/w00919836/results/native_three_way_01
+bash script/run_native_moe_suite.sh --case all --npu 6 \
+  --output-root /home/w00919836/results/native_three_way_01
 ```
 
-分开运行时用相同参数，将 `--case all` 分别替换为三个组名，并使用各自的新结果目录。计时阶段关闭 profiler/MSTX，5 次预热后测 20 次请求；每组随后独立采 profile、进行同次时钟对齐并自动识别加载流。`native_full` 必须同时出现原生图任务完成、共享 scale 校验和 `FULL_SUBMIT executed=` 记录，防止只注册但未执行新路径的测试被接受。
+启动后立即返回 PID，关闭终端仍继续运行。查看实时输出及完成后的合并摘要：
+
+```bash
+tail -f /home/w00919836/results/native_three_way_01/run.log
+# 全部结束后复制这个文件即可，包含 token 5、128 两轮摘要。
+cat /home/w00919836/results/native_three_way_01/summary.txt
+```
+
+独立运行某一组也用此入口，默认仍测 token 5、128。以下三条是独立入口，同一张卡应等上一条完成再启动下一条：
+
+```bash
+bash script/run_native_moe_suite.sh --case python --npu 6 \
+  --output-root /home/w00919836/results/native_python_01
+
+bash script/run_native_moe_suite.sh --case native --npu 6 \
+  --output-root /home/w00919836/results/native_current_01
+
+bash script/run_native_moe_suite.sh --case native_full --npu 6 \
+  --output-root /home/w00919836/results/native_full_01
+```
+
+仅测一种输出长度时，在相应命令追加 `--tokens 5` 或 `--tokens 128`，仍需使用新目录。默认服务端口为 8156、独立计时端口为 18156；占用时传入 `--port` 和 `--timing-port`。批量入口沿用 5 GiB 剩余空间检查，profile 导出最多等 600 秒。结果位于根目录的 `token5/`、`token128/`；`status.txt` 逐轮记录退出码，根目录 `summary.txt` 在后台结束时合并生成。第一轮失败后仍尝试第二轮，合并摘要明确标记失败，不能当成完整对照通过。
+
+原 `run_native_moe_compare.py` 入口保留，可按 `--case`、`--max-tokens` 和 `--output-dir` 前台独立执行。计时阶段关闭 profiler/MSTX；profile 使用同次时钟对齐并自动识别加载流。`native_full` 必须同时出现原生图任务完成、共享 scale 校验和 `FULL_SUBMIT executed=` 记录，防止只注册但未执行新路径的测试被接受。
 
 每次完成 profile 后，脚本默认把以下分析追加到同一个 `summary.txt`，Python/native 分开运行时也一样，无需额外开关：
 
