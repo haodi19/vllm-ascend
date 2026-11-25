@@ -2,10 +2,22 @@
 
 This document provides instructions for contributors to the vLLM Ascend project. Please read and follow these guidelines to ensure code quality, maintainability, and consistency.
 
+## MoE Experiment Records
+
+Maintain [docs/moe_experiment_results_zh.md](docs/moe_experiment_results_zh.md) as the single MoE experiment record, with a linked table of contents. Do not create a new Markdown report for each run.
+
+- Each experiment must record its date, purpose, contents/configuration, and result directory names and paths, followed by its data and conclusions.
+- Distinguish the run date from offline reanalysis and documentation dates. Mark missing historical metadata as unknown; do not infer actual result paths from example commands.
+- Add reanalysis to the original experiment entry, preserving raw results and identifying the source capture. Separate directly measured timing from estimates and conditional analyses.
+- Keep decode latency as the primary timing for new runs; retain HTTP E2E, TTFT, TPOT, Host intervals and loading-stream bubbles where available. State missing measurements explicitly.
+- Keep per-run summaries, logs and profiles in their result directories. Use unused sequential names such as `_01` and `_02`; this documentation convention does not merge or overwrite raw artifacts.
+- Technical guides may remain separate. Old experiment documents retain links to the master record and should not accumulate a second copy of new results.
+
 ---
 
 ## Table of Contents
 
+- [MoE Experiment Records](#moe-experiment-records)
 - [Setup and Environment](#setup-and-environment)
     - [Environment Variables](#environment-variables)
     - [Environment Variable Review Requirement](#environment-variable-review-requirement)
@@ -92,7 +104,6 @@ Reviewers must verify:
 ### Running Tests
 
 ```bash
-
 
 # Run specific unit test file
 pytest -sv tests/ut/ops/test_prepare_finalize.py

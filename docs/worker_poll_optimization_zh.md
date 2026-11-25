@@ -1,426 +1,102 @@
 # 基于阻塞旧版的 worker 轮询改造
 
-## 基线与阅读准备
-
-从 `942868dd8cec9019dee04bee038bfcd678b6d66a` 新建分支 `dev/moeoffload-worker-poll`，
-不合入原开发分支中的布局适配、CPU 重排、活跃槽位前缀扫描。原开发分支和阻塞复现目录保留。
-目前已实现可选取消 yield、指定扫描集合、空闲原子预检查、工作线程绑核及配套计时。
-MoE dispatcher 已接入三个可选开关，默认仍保持旧行为；绑核只保留在独立测试中。
-以下各节保留独立单测及早期接入时的状态。预取晚等待现已在有限实际请求上绕过旧阻塞，
-当前以MTE普通加载流开展模型内对照，见第7节；不是继续使用早期阻塞状态测性能。
-
-**交接槽位（slot）**是 CPU 与 NPU 交接一个 Host 任务所用的控制记录，
-不是存放专家权重的显存槽位。每个交接槽位对应一个注册的 Python 函数，保存请求代号
-`request generation`、完成代号 `done generation`、状态及错误信息。
-NPU 更新请求代号表示“请执行这一轮任务”，CPU 执行对应函数后更新完成代号，NPU 读到后继续。
-同一槽位可反复使用，通过递增 generation 区分轮次；2048 个槽位不代表 2048 个工作线程。
-
-配套的 worker 内部计时记录：领取锁、发现任务到获取 GIL 前、获取 GIL、执行回调、释放 GIL、
-完成锁及完成发布各阶段时间，并抽样记录空闲整轮扫描、累计获取锁及空闲动作时间。
-GIL 是执行 Python 代码所需的解释器锁。计时默认关闭，停止后汇总，不在工作循环逐条打印。
-内部打点会扰动运行，性能收益看关闭组，开启组用于解释原因；计时不单独算作性能优化项。
+本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-yield-20261027)。
 
-## 一、取消空闲 yield
-
-### 原逻辑与修改内容
-
-原来的 C++ 工作线程不断从头到尾扫描全部交接槽位。每检查一个槽位，先获取 mutex，
-读取请求代号，判断是否有尚未完成的任务。有任务就标记运行中、释放 mutex，获取 GIL，
-调用对应的 Python 函数；返回后释放 GIL，再获取 mutex，发布完成代号或错误状态，继续扫描。
-
-**只有整轮扫描没有执行任何任务时，才调用 `std::this_thread::yield()`，然后开始下一轮。**
-它主动向调度器让出运行机会，但不保证真的切换到其他线程。不是检查一个槽位就 yield，
-也不是每执行完一个任务必定 yield。
-
-新增 `Session.configure_polling(idle_mode, timing)`，在工作线程启动前配置。
-`idle_mode="spin"` 只跳过上述 yield，扫描完后立即从头继续检查；
-`idle_mode="yield"` 保留原行为，也是默认值。两种模式都循环检查全部槽位，区别在无任务整轮结束处：
+<a id="基线与阅读准备"></a>
 
-```text
-yield：检查槽位 0 → 1 → … → 最后一个
-       本轮没有执行任务：调用 yield → 下一轮
-       本轮执行过任务：直接下一轮
+[基线与阅读准备](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-3)
 
-spin： 检查槽位 0 → 1 → … → 最后一个 → 直接下一轮
-```
-
-逐槽 mutex、全槽扫描、GIL、完成通知和设备算子均未改变。
-spin 仍可能被操作系统抢占，也不保证获得 GIL 时不等待，因此不等于消除所有系统调用或调度开销。
-持续忙轮询可能增加 CPU 占用，本轮尚未测量 CPU 使用率和上下文切换次数。
-
-### 测试方法
-
-入口为 `script/run_worker_poll_tests.py`。脚本构建 Host 扩展与 MTE 算子，
-先执行 CPU 生命周期和轮询配置测试，再用独立子进程运行图重放实验。
-不加载模型、不搬运权重、不采集 profiler，因此本实验不验证旧版 scale 搬运阻塞。
-
-每次图内交接包含三个步骤：
+<a id="一取消空闲-yield"></a>
 
-1. NPU 发布算子把请求代号写入注册的 CPU 控制内存。
-2. CPU 工作线程发现请求，获取 GIL，执行只更新计数并测量短区间的 Python 函数。
-3. CPU 写入完成代号，NPU 等待算子读到匹配值后继续。
-
-先执行一次普通交接，再捕获设备流程，确认捕获本身没有额外执行任务；
-随后预热重放 20 次、正式测量 200 次，每个子进程应执行 221 次 Python 任务。
-每次重放后检查回调次数和设备 generation 等状态，校验读取在外部计时区间之外。
-
-分别分配 1 和 2048 个槽位，仅向最后一个槽位发布任务，用于观察扫描容量的影响。
-为满足旧版设备访问接口约束，全部槽位预先注册函数，其他槽位若误执行则报错。
-这不是 2048 个并发任务，也不是已实现的缩小扫描范围优化。
-
-每个槽位数测试四种组合，每种重复两轮；第一轮先 yield 后 spin，第二轮反转顺序：
-
-| 模式 | 内部计时关闭 | 内部计时开启 |
-| --- | --- | --- |
-| yield | 性能基线 | 原逻辑分项诊断 |
-| spin | 与基线比较收益 | 改动后分项诊断 |
-
-无论内部计时开关如何，外部都记录：
-
-- `event_interval`：同一 NPU 流上图重放前后两个 Event 的时间差，包含设备发布、Host 处理、
-  设备等待及区间内可能的空闲，不是纯共享内存通知时延。
-- `replay_sync_host`：CPU 发起重放到结束 Event 同步返回的墙钟时间，包含提交与等待。
-- `callback_body`：Python 函数内部短代码段时间，不含完整 C++/Python 调用包装。
-
-两个外部指标的区别是计时位置。Event 是插在 NPU 流中的时间标记，不是 CPU 函数：
-
-```text
-CPU 提交线程：记录起点 Event → 开始 Host 计时 → replay() → 记录终点 Event
-                                                  → 等终点完成 → 结束 Host 计时
-NPU 流：     起点 Event → 发布请求 → 等 CPU 完成任务 → 终点 Event
-CPU worker：                         发现请求 → 执行任务 → 写完成代号
-```
-
-Event 区间是 NPU 实际经过两个标记的时间差，包含 NPU 等待 CPU 的时间，**不是纯 NPU 计算时间**。
-Host 重放同步是提交线程从准备调用 replay 到确认终点已完成并返回的墙钟时间，
-还受提交、结束标记入队及同步返回等开销影响；它不是 worker 执行 Python 任务的时间。
-两个区间互相重叠，不能相加。由于起点 Event 在 Host 计时开始前就提交了，
-二者也不是严格同起点，差值不能直接解释为纯提交开销。
-本实验图中没有模型计算或权重拷贝，两个指标都是轻量交接的观测，不是一次推理请求时延。
-
-具体说，CPU 调用 `replay()` 是向运行时提交图，NPU 随后执行图中的设备任务。
-Event 覆盖的是设备两个标记之间经过的时间，不会把 CPU 的整个 replay 函数调用包进去。
-若设备已经经过起点标记而 CPU 还没有提交完任务，相关等待可能落在 Event 内；
-起点执行之前的提交等待和终点执行之后的同步返回则不属于 Event 区间。
-Host 计时通常更长，是因为还观察到上述提交与返回过程，而不是因为 worker 比设备多执行了一遍任务。
-例如示意性的时间线：CPU 在 0 μs 开始计时，设备在 10 μs 经过起点、32 μs 经过终点，
-CPU 在 45 μs 从同步调用返回，则 Event 为 22 μs，Host 为 45 μs。
-这只是解释计时边界的例子，不是实测的阶段拆分，也不保证所有样本都是这种先后关系。
-
-内部计时开启时，任务样本排除普通执行及预热，只统计正式 200 次；空闲扫描每 1024 轮抽样，
-只保存抽中且整轮没有任务的样本，范围覆盖整个 Session 生命周期，并非每个请求的唤醒时间。
-以下均值按两轮等量样本汇总，P95 是两轮 P95 的平均，不是合并样本的 P95。
-
-### 测试结果：关闭内部计时，判断收益
-
-2026-10-27，单槽记录来自 `worker_poll_320046f0`，2048 槽补测来自 `worker_poll_eed4d083`。
-后者 18 项生命周期测试、4 项轮询测试和全部 8 个设备测试组通过。
-
-2048 槽、内部计时关闭：
-
-| 指标（μs） | yield | spin | spin − yield |
-| --- | ---: | ---: | ---: |
-| 事件区间均值 | 35.584 | 34.493 | -1.090 |
-| 事件区间 P95 | 40.629 | 40.314 | -0.315 |
-| Host 重放及同步均值 | 60.569 | 59.440 | -1.129 |
-| Host 重放及同步 P95 | 67.130 | 66.705 | -0.425 |
-
-事件区间均值下降约 3.1%，但两轮分别下降 2.086 μs 和 0.094 μs；
-Host 区间第二轮还从 60.549 μs 增至 60.808 μs。因此只能说观察到小幅平均改善，
-尚不能认定稳定显著收益，更不能解释真实 MoE 的约 400 μs 间隔。
-
-单槽关闭计时时，yield 两轮事件区间中位数为 22.67、22.15 μs，spin 为 22.84、21.25 μs，
-同样没有稳定大幅改善，两种模式均出现约 1.8 ms 长尾。
-多槽常见区间约为 35～37 μs，但单槽与多槽分两次运行，差值不能直接当作纯扫描开销。
-
-### 测试结果：开启内部计时，分析原因与测量扰动
-
-2048 槽、内部计时开启：
-
-| 指标（μs） | yield | spin | spin − yield |
-| --- | ---: | ---: | ---: |
-| 事件区间均值 | 60.440 | 55.838 | -4.603 |
-| 事件区间 P95 | 59.297 | 78.706 | +19.409 |
-| Host 重放及同步均值 | 85.090 | 79.856 | -5.233 |
-| Host 重放及同步 P95 | 103.710 | 104.106 | +0.395 |
-
-开启组虽然 spin 均值较低，但事件区间 P95 反而更高，不能据此认定 spin 全面改善。
-yield 第一轮事件区间最大值达到 1781 μs，均值被长尾拉高；spin 第二轮 P95 达到 101.306 μs，
-也有明显波动。因此不能用这一组的均值差宣称去掉 yield 节省了约 4.6 μs。
-
-与各自关闭组相比，开启内部计时后 yield 事件均值从 35.584 增至 60.440 μs，
-spin 从 34.493 增至 55.838 μs；各轮中位数也由约 35～37 增至约 51～57 μs。
-说明逐槽读取时钟带来明显扰动，不只是个别极端值影响均值；差值仍包含运行波动，
-不能全部精确归因给读时钟本身。这也是收益只采用关闭组的原因。
-
-内部任务分项如下，每个数值为该模式两轮均值的平均：
-
-| worker 分项（μs） | yield | spin |
-| --- | ---: | ---: |
-| 领取任务时获取 mutex | 0.0225 | 0.0223 |
-| 发现任务后到获取 GIL 前 | 0.0186 | 0.0183 |
-| 获取 GIL | 0.7406 | 0.7237 |
-| C++ 侧回调区间 | 3.2875 | 3.5600 |
-| 释放 GIL | 3.5905 | 3.5002 |
-| 获取完成状态锁 | 0.0238 | 0.0231 |
-| 发布完成状态 | 0.0196 | 0.0192 |
-
-获取 GIL 及锁的分项差异较小，没有显示 spin 稳定消除了某个大的等待。
-C++ 侧回调约 3 μs，而 Python 函数内部短区间约 0.6～0.8 μs，二者范围不同：
-前者还含调用包装、其他函数内操作与异常检查。释放 GIL 区间约 3.5 μs，也属于交接成本。
-这些结果仅描述本次轻量任务，不代表真实模型下的竞争情况。
-
-领取锁的分项只记录发现任务的那个槽位，不包含此前扫描其他槽位的累计锁操作；
-发布分项也不包含之后解锁、通知和样本保存。不能把这些任务分项直接相加当作完整交接时延。
-
-2048 槽所有开启组的 `idle={}`，表示未采到满足条件的空闲轮次，**不是扫描或 yield 耗时为零**，
-当前无法给出多槽整轮扫描的实测均值。此前单槽抽样中 yield 区间均值约 0.105～0.125 μs，
-spin 对应空区间约 0.018～0.019 μs，只说明被抽到的调用成本，不能解释全部请求间隔。
-
-### 结论
-
-取消 yield 的功能验证通过，独立交接测试仅观察到小幅且不稳定的平均改善，暂不改变 MoE 默认配置。
-下一步优先独立验证扫描范围；真实权重搬运阻塞尚未由本实验验证或解决。
-
-## 二、减少扫描范围：静态集合的独立测试
-
-### 原逻辑与修改内容
-
-原逻辑扫描全部容量，不论每个槽位是否会收到请求。新增可选方法
-`Session.configure_scan_slots([槽位编号, ...])`，必须在启动前调用，列表不能为空、重复或越界。
-方法保存按编号排序的集合，启动时检查集合中每个槽位都已注册任务；运行期间不允许更改。
-工作线程随后仅按这个集合扫描，保留逐槽 mutex、yield、GIL、generation 协议及全部退出清理逻辑。
-未调用此方法时仍检查全部槽位。不是减少内存分配，也不是改成直接获取下一任务编号的通知协议。
-
-调用者必须保证设备只向声明的集合发布请求。Host 测试提交会拒绝集合外槽位；
-设备写共享内存无法由这个 Host API 逐次拦截，误向集合外发布会导致该任务不被处理。
-因此这个静态集合接口只用于独立测试；MoE 使用第六节的动态前缀接口。
-图中每个任务节点的槽位固定，不等于整个模型只用一个槽位；未来接入需要声明所有可能使用的槽位。
-
-集合目前由测试脚本确定，不是 worker 自动发现，也不是根据本轮路由选中的专家计算。
-`host_sync_benchmark.py` 明确只向末槽发布请求，因此设定 `active_slot = slots - 1`，
-然后调用 `session.configure_scan_slots([active_slot])`。容量 2048 时集合就是 `[2047]`。
-原逻辑反复检查 0～2047，实验逻辑反复只检查 2047，省掉其余 2047 个槽位的加锁、读取和状态判断。
-若确实会向 2、7、85 三个任务槽位发布请求，集合就必须包含这三个编号，不能只选本轮看起来活跃的一个。
-
-实际旧版 `MteHostDispatcher` 的情况不同：初始化预分配 2048 个槽位，并全部注册包装函数；
-槽位 0 用于初始化握手，`launch()` 从 `next_slot=1` 起逐次为真实任务分配槽位，
-写入 `entries[slot]`，让该节点的设备发布/等待算子使用相应地址。图重放复用捕获节点的槽位。
-所以“已注册函数的槽位”在这里仍然是全部 2048 个，不能据此缩小扫描；
-应依据真正分配的任务记录，并包含所有可能重放的图及初始化握手使用的槽位。
-静态集合接口只能在工作线程启动前配置，而实际任务槽位在启动后仍会分配，
-因此模型接入另行采用第六节的安全增长前缀，不能直接套用这个静态接口。
-
-### 测试方法
-
-```bash
-python -B script/run_worker_poll_tests.py --experiment scan --npu 7
-```
-
-脚本复用第一节的构建、正确性检查、图捕获、20 次预热和 200 次正式重放流程。
-分别测试容量为 1 和 2048，同一容量内始终只向末槽发布同样的请求：
-
-- `all`：检查全部槽位，作为基线。
-- `active`：内存容量、注册函数和设备算子完全相同，只把扫描集合设为末槽。
-
-两组固定 yield，关闭内部计时；第一轮先 all 后 active，第二轮反序，共 8 个设备测试子进程。
-单槽组检查新增集合索引本身的影响，多槽组隔离避免无效扫描的收益，
-不重复跑 spin 对照。输出 Event 区间与 Host 重放同步时间的均值、中位数及 P95，统计口径与第一节一致。
-
-新增 CPU 测试：容量 2048，在槽位 0、17、2047 之间交替发起共 60 个任务，
-分别验证全扫描与指定集合时的执行顺序、计数；检查空集合、重复、越界、未注册任务、
-启动后改配置、集合外提交以及回调异常。设备测试仍是单个活动槽位的图重放，
-不能当作真实多层、多图并发验收。
-
-### 当前结果
-
-2026-10-27，结果来自 `worker_poll_cc78a062`。18 项生命周期测试、7 项轮询测试及全部
-8 个设备测试子进程通过；每组 221 次任务与 generation 校验正常。
-固定 yield，关闭内部计时，容量 2048，仅末槽接收请求：
-
-| 指标（μs） | 全槽 all | 指定集合 active | active − all |
-| --- | ---: | ---: | ---: |
-| Event 区间均值 | 34.282 | 23.439 | -10.843 |
-| Event 区间 P50 | 33.162 | 21.969 | -11.193 |
-| Event 区间 P95 | 51.962 | 25.495 | -26.467 |
-| Host 重放同步均值 | 58.666 | 45.458 | -13.209 |
-| Host 重放同步 P50 | 56.222 | 43.014 | -13.207 |
-| Host 重放同步 P95 | 78.532 | 50.716 | -27.816 |
-
-Event 均值下降约 31.6%，两轮分别从 30.867 降至 23.217 μs、从 37.697 降至 23.661 μs，
-改善方向一致，中位数也下降，支持避免大量无效扫描能减少交接等待。
-但 active 第二轮仍有约 443 μs 的极端值，不能宣称消除了所有长尾。
-上述是仅一个有效槽位的对照，实际 MoE 有多个有效槽位，不能直接套用这个收益比例；
-也不能据此认定真实 MoE 的约 400 μs 间隔已经被解释或解决。
-
-容量 1 时两组其实都只检查槽位 0，P50 为 23.574/23.040 μs，P95 为 30.142/29.634 μs，
-常见时延接近。all 第二轮出现约 5698 μs 的单个最大值，导致两轮汇总均值达到 38.755 μs，
-不能把它与 active 的 24.651 μs 之差解释为缩小扫描范围的收益：两组根本没有减少槽位数量。
-此处保留原统计，不删除异常样本，只明确均值受长尾影响。
-
-结论：独立测试已验证跳过无效槽位的作用；真实 MoE 接入及收益尚未验证。
-本轮没有改权重搬运，也没有解决或验证原 scale 阻塞。
-
-## 三、减少空闲扫描 mutex：独立测试已验证
-
-### 原逻辑与修改内容
-
-原逻辑检查每个槽位都先获取 mutex，再读取请求代号及完成状态。即使一轮没有任何新任务，
-2048 个槽位也要分别执行加锁和解锁。此次仅减少没有任务时的锁操作，不删除全部 mutex。
-
-新增 `Session.configure_idle_probe("atomic")`，必须在工作线程启动前配置，默认仍为 `locked`。
-atomic 模式对每个槽位先读取原子 request generation：为 0 表示尚无请求；
-非零则用原子的 done/error generation 判断是否已经完成。没有待处理任务时直接继续扫描，不获取 mutex。
-发现疑似新任务时，进入原来的锁区，重新读取并检查请求、完成和停止状态，再领取任务。
-执行回调、发布完成/错误、通知等待者、停止取消与资源释放流程保持不变。
-
-```text
-locked：加锁 → 读取状态 → 没任务则解锁并检查下一个；有任务则领取
-atomic：原子读取状态 → 没任务则直接检查下一个
-                      有任务则加锁 → 重新检查状态 → 领取
-```
-
-预检查只访问协议中已有的原子字段，不在锁外读写 Python 函数、错误字符串等普通对象。
-如果第一次检查后才有新请求到达，下一轮仍会再次检查；若第一次检查的状态过时，锁内复查负责确认。
-运行期间只有一个工作线程执行任务。控制内存在工作线程退出、设备访问结束前不能释放，这一原有约束不变。
-设备侧发布、可见性机制及 generation 协议没有变化，也没有去掉 GIL 或完成通知。
-
-### 测试方法
-
-```bash
-python -B script/run_worker_poll_tests.py --experiment mutex --npu 7
-```
-
-脚本构建扩展与设备算子，运行原生命周期测试及新增测试，然后分别在容量 1、2048 下比较
-`locked` 和 `atomic`。两组都检查全部槽位、只向末槽发布请求、保留 yield、关闭内部计时，
-不启用前一节的指定扫描集合优化。每组预热 20 次、测量 200 次，两轮反转模式顺序，共 8 个设备子进程。
-设备握手、逐次 generation 校验和外部时延统计沿用第一节方法。
-
-CPU 测试复用原生命周期测试类，在通过测试工厂创建的 Session 上启用 atomic，
-覆盖多轮多槽、等待超时、未完成任务、回调异常、停止和关闭等逻辑；
-该类中直接创建 Session 或子进程的原测试仍保留默认模式，不冒充 atomic 覆盖。
-另增加配置约束和末槽失败后连续 100 次成功请求的检查，确保错误代号不会阻止后续代号处理。
-
-### 当前结果
-
-2026-10-28，记录来自 `worker_poll_bb176185`。18 项原生命周期测试、26 项轮询及复用生命周期测试，
-以及全部 8 个设备子进程通过。容量 2048、全槽扫描、保留 yield、内部计时关闭：
-
-| 指标（μs） | locked | atomic | atomic − locked |
-| --- | ---: | ---: | ---: |
-| Event 区间均值 | 34.952 | 22.631 | -12.322 |
-| Event 区间 P50 | 33.352 | 21.927 | -11.425 |
-| Event 区间 P95 | 41.390 | 27.182 | -14.209 |
-| Host 重放同步均值 | 60.301 | 49.742 | -10.559 |
-| Host 重放同步 P50 | 58.418 | 48.135 | -10.283 |
-| Host 重放同步 P95 | 69.680 | 61.928 | -7.752 |
-
-Event 均值下降约 35.3%。两轮分别从 39.299 降至 22.203 μs、从 30.606 降至 23.058 μs，
-方向一致，中位数和 P95 也改善。locked 第一轮有约 616 μs 长尾，但改善不只体现在均值。
-容量 1 时 Event 均值为 25.072/24.163 μs，P95 为 26.365/26.964 μs，
-Host 均值为 48.416/48.779 μs，并无稳定整体收益。这符合主要减少大量空闲槽位重复加锁成本的解释，
-不能将本次收益直接解释为系统调用或中断减少量。
-
-本项与缩小扫描集合都减少空闲槽位检查成本，二者收益不能直接相加；不同轮实验不能按数值直接排名。
-本节数据仍来自轻量交接测试，不验证或修复 scale 拷贝阻塞；可选模型接入见第六节。
-
-## 四、工作线程绑核：功能通过，当前 CPU 未显示稳定收益
-
-### 原逻辑与修改内容
-
-原工作线程继承创建线程允许的 CPU 集合，由操作系统选择在哪个 CPU 上运行。
-新增 `Session.configure_worker_cpu(cpu)`，必须在启动前设置；默认 -1 保留继承的亲和性。
-指定编号时，工作线程在启动阶段通过 `pthread_setaffinity_np` 仅修改自身亲和性，
-限制到该 CPU，并读取实际集合核对结果。未修改 CPU 提交线程或其他线程的亲和性。
-
-CPU 编号必须位于继承的允许集合和当前实现支持的 `CPU_SETSIZE` 范围内；不符合或绑定失败会报错，
-不静默回退。绑定只在启动阶段执行，不在每次交接中调用。绑核不代表独占 CPU、禁止抢占或绕过 GIL，
-其他线程仍可能被调度到同一个 CPU。
-
-### 测试方法
-
-```bash
-python -B script/run_worker_poll_tests.py --experiment affinity --npu 7
-```
-
-脚本默认选允许集合中最大 CPU 编号，不代表它最空闲或 NUMA 最优；输出允许集合、所选编号和
-每组工作线程实际亲和性。可用 `--worker-cpu 具体编号` 指定另一个允许 CPU，CPU 编号与 NPU 编号不同。
-至少需要两个允许 CPU，否则无法形成有效的不绑/绑单核对照。
-
-对照固定全槽扫描、locked、yield、内部计时关闭，不叠加前两项优化。
-容量分别为 1 和 2048，每组预热 20 次、测量 200 次，两轮反转顺序，共 8 个设备子进程。
-仅切换 worker 的亲和性，保留提交线程允许集合。实际是否发生抢占、CPU 迁移及同核竞争未逐次采样，
-时延结果只说明当前所选 CPU 的效果，不能推广到所有 CPU。
-
-新增 CPU 测试核对回调在线程的指定 CPU 集合中执行、提交线程允许集合不变，
-检查非法配置、启动后修改配置和不允许 CPU 的启动失败。实际绑定失败立即停止比较。
-
-### 当前结果
-
-2026-10-28，记录来自 `worker_poll_7976de90`。18 项原生命周期测试、29 项轮询及生命周期测试，
-以及全部 8 个设备子进程通过。未绑定组允许 CPU 0～255，绑定组实际集合为 `[255]`，配置确实生效。
-
-| 容量 | 指标（μs） | 不绑定 | 绑定 CPU 255 |
-| --- | --- | ---: | ---: |
-| 1 | Event 均值 | 22.653 | 25.639 |
-| 1 | Event P50 | 21.911 | 22.565 |
-| 1 | Host 重放同步均值 | 49.553 | 50.236 |
-| 2048 | Event 均值 | 32.832 | 35.091 |
-| 2048 | Event P50 | 33.381 | 34.978 |
-| 2048 | Event P95 | 40.271 | 43.350 |
-| 2048 | Host 重放同步均值 | 56.742 | 58.070 |
-
-2048 槽第一轮绑定使 Event 均值从 30.204 增至 42.411 μs，第二轮却从 35.460 降至 27.772 μs，
-方向不一致。总体没有观察到稳定收益，暂不选用绑定 CPU 255。
-这不证明绑核永远无效；没有采集 CPU 负载、迁移或 NUMA 因果数据，不能把变慢归因为某个确定的调度原因。
-其中一个绑定组的 Python 短函数计时较低，也不能替代完整交接区间的判断。
-
-## 五、有效项组合对照：已完成，未观察到叠加收益
-
-前面缩小扫描集合和跳过空闲锁均在 2048 槽测试中有效，但二者可能消除同一部分成本，
-不能把约 11 μs 和约 12 μs 的收益相加。本轮不新增 worker 机制，只增加组合测试：
-
-```bash
-python -B script/run_worker_poll_tests.py --experiment combined --slots 2048 --npu 7
-```
-
-固定 yield、不绑核、内部计时关闭，同一容量和末槽请求下比较四组：
-全扫描+原锁、缩小集合+原锁、全扫描+原子预检查、缩小集合+原子预检查。
-各预热 20 次、测量 200 次，两轮顺序反转，共 8 个设备子进程，先执行完整 CPU 回归。
-输出四组 Event/Host 时间及组合相对两个单项的增量，判断组合是否还有额外价值。
-现有默认行为不变。本轮仍不验证真实模型或权重搬运阻塞，完成后再选择实际接入方案。
-
-### 本次结果
-
-2026-10-28，记录来自 `worker_poll_11030f36`。CPU 回归及 8 个设备子进程完成，
-每组回调次数为 221，未报告 generation 或任务计数错误。容量 2048，只有末槽接收请求：
-
-| 指标（μs） | 全扫描+原锁 | 缩小集合+原锁 | 全扫描+原子预检查 | 缩小集合+原子预检查 |
-| --- | ---: | ---: | ---: | ---: |
-| Event 均值 | 29.157 | 22.742 | 106.025 | 22.458 |
-| Event P50 | 25.671 | 21.754 | 23.347 | 21.799 |
-| Event P95 | 41.686 | 26.369 | 497.764 | 26.325 |
-| Host 重放同步均值 | 53.608 | 45.321 | 141.497 | 49.047 |
-| Host 重放同步 P50 | 50.931 | 43.954 | 48.247 | 48.047 |
-
-组合相比“缩小集合+原锁”，Event 均值仅低 0.284 μs，P50 高 0.045 μs，P95 低约 0.045 μs，
-Host 均值反而高 3.726 μs。因此没有观察到组合的稳定额外收益；两项不能按此前独立实验的收益相加。
-在已经只扫描一个有效槽位时，没有大量空闲槽位的锁操作可再省，符合这种结果。
-
-“全扫描+原子预检查”第二轮出现明显长尾：Event P50 23.590 μs，但 P95 965.100 μs，
-最大 10943.057 μs，均值 183.447 μs；第一轮均值 28.603 μs，最大约 889 μs。
-这不是只有一个极端值影响均值，第二轮 P95 也明显升高。当前没有调度、CPU 负载或设备争用证据，
-不能断定是外部干扰，也不能断定为 atomic 逻辑造成的阻塞。
-保留这些样本；不把组合相对该组的 83.567 μs 均值下降报告为正常优化收益。
-正常完成并通过 generation 检查，说明这次没有观察到功能性死锁，不代表尾延迟问题已经解释。
-
-### 阶段判断
-
-独立测试阶段收敛：去掉 yield、绑定 CPU 255 未显示稳定收益；缩小扫描集合的改善较一致，
-组合没有明显额外价值；原子预检查曾有改善，但本轮出现原因未明的长尾，暂不作为优先组合启用。
-下一阶段优先考虑“缩小实际有效槽位范围、保留原锁和 yield、不绑核”的 MoE 可选接入，
-重点处理启动后动态分配任务槽位的可见性与时序，而不是把测试中的 `[2047]` 硬编码到模型。
-该阶段结论作为第六节模型接入的依据；权重搬运阻塞仍未修复，不用轻量单槽测试代替模型验收。
+[一、取消空闲 yield](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-23)
+
+<a id="原逻辑与修改内容"></a>
+
+[原逻辑与修改内容](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-25)
+
+<a id="测试方法"></a>
+
+[测试方法](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-51)
+
+<a id="测试结果关闭内部计时判断收益"></a>
+
+[测试结果：关闭内部计时，判断收益](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-114)
+
+<a id="测试结果开启内部计时分析原因与测量扰动"></a>
+
+[测试结果：开启内部计时，分析原因与测量扰动](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-136)
+
+<a id="结论"></a>
+
+[结论](moe_experiment_results_zh.md#worker-yield-20261027-worker_poll_optimization_zh-180)
+
+本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-scan-20261027)。
+
+<a id="二减少扫描范围静态集合的独立测试"></a>
+
+[二、减少扫描范围：静态集合的独立测试](moe_experiment_results_zh.md#worker-scan-20261027-worker_poll_optimization_zh-185)
+
+<a id="原逻辑与修改内容-1"></a>
+
+[原逻辑与修改内容](moe_experiment_results_zh.md#worker-scan-20261027-worker_poll_optimization_zh-187)
+
+<a id="测试方法-1"></a>
+
+[测试方法](moe_experiment_results_zh.md#worker-scan-20261027-worker_poll_optimization_zh-214)
+
+<a id="当前结果"></a>
+
+[当前结果](moe_experiment_results_zh.md#worker-scan-20261027-worker_poll_optimization_zh-235)
+
+本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-atomic-20261028)。
+
+<a id="三减少空闲扫描-mutex独立测试已验证"></a>
+
+[三、减少空闲扫描 mutex：独立测试已验证](moe_experiment_results_zh.md#worker-atomic-20261028-worker_poll_optimization_zh-264)
+
+<a id="原逻辑与修改内容-2"></a>
+
+[原逻辑与修改内容](moe_experiment_results_zh.md#worker-atomic-20261028-worker_poll_optimization_zh-266)
+
+<a id="测试方法-2"></a>
+
+[测试方法](moe_experiment_results_zh.md#worker-atomic-20261028-worker_poll_optimization_zh-288)
+
+<a id="当前结果-1"></a>
+
+[当前结果](moe_experiment_results_zh.md#worker-atomic-20261028-worker_poll_optimization_zh-304)
+
+本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-affinity-20261028)。
+
+<a id="四工作线程绑核功能通过当前-cpu-未显示稳定收益"></a>
+
+[四、工作线程绑核：功能通过，当前 CPU 未显示稳定收益](moe_experiment_results_zh.md#worker-affinity-20261028-worker_poll_optimization_zh-327)
+
+<a id="原逻辑与修改内容-3"></a>
+
+[原逻辑与修改内容](moe_experiment_results_zh.md#worker-affinity-20261028-worker_poll_optimization_zh-329)
+
+<a id="测试方法-3"></a>
+
+[测试方法](moe_experiment_results_zh.md#worker-affinity-20261028-worker_poll_optimization_zh-340)
+
+<a id="当前结果-2"></a>
+
+[当前结果](moe_experiment_results_zh.md#worker-affinity-20261028-worker_poll_optimization_zh-358)
+
+本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-combined-20261028)。
+
+<a id="五有效项组合对照已完成未观察到叠加收益"></a>
+
+[五、有效项组合对照：已完成，未观察到叠加收益](moe_experiment_results_zh.md#worker-combined-20261028-worker_poll_optimization_zh-378)
+
+<a id="本次结果"></a>
+
+[本次结果](moe_experiment_results_zh.md#worker-combined-20261028-worker_poll_optimization_zh-393)
+
+<a id="阶段判断"></a>
+
+[阶段判断](moe_experiment_results_zh.md#worker-combined-20261028-worker_poll_optimization_zh-417)
 
 ## 六、MoE 可选接入：动态有效前缀与三个独立开关
 
@@ -491,306 +167,55 @@ profile 保存在本轮结果目录的 `profile/mte`，控制台给出 summary �
 以及任务记录先于前缀发布、前缀发布先于设备提交、配置映射和默认兼容的 CPU 测试。
 蓝区只验证 Python 调度逻辑；原生扩展及实际模型尚待绿区执行。
 
-## 7. MTE普通流下逐项验证真实模型收益（2026-10-31）
+本段实验正文与数据已移至 [实验总记录](moe_experiment_results_zh.md#worker-model-20261031)。
 
-### 当前基线与实验范围
+<a id="7-mte普通流下逐项验证真实模型收益2026-10-31"></a>
 
-此前三组实测中，callback、MTE SyncLaunchStream、MTE普通流均完成短请求，
-输出摘要、token用量及卸载工作量一致。MTE普通流的copy_submit更接近回调版：
-预取48.317对42.030μs，按需210.776对191.663μs；但提交＋等待仍略高，
-请求3347.880对3322.022ms，不能把改普通流写成已经获得稳定端到端收益。
+[7. MTE普通流下逐项验证真实模型收益（2026-10-31）](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-494)
 
-现在将MTE的默认加载流改为普通Stream，保留显式sync_launch对照；callback入口仍可用。
-本轮统一使用消费者处严格等待、原始权重拷贝、cpp LRC及test_graph2.sh的模型配置。
-不改变完成信号发布条件，不跳过加载流同步。三个worker开关的产品默认仍为all/locked/yield，
-先测效果，再决定是否默认启用某项；工作线程绑核暂不纳入，因之前没有稳定收益且尚未接入模型。
+<a id="当前基线与实验范围"></a>
 
-回顾独立单测：缩小扫描集合的Event均值34.282→23.439μs，原子预检查在一轮全槽对照中
-34.952→22.631μs，但后续组合对照出现长尾；去掉yield约35.584→34.493μs且轮间不稳定。
-这些是合成握手结果，不是模型内收益，尤其实际allocated会扫描所有已分配交接槽位，
-并非独立单测中只扫描一个槽位。
+[当前基线与实验范围](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-496)
 
-### 五组顺序实验
+<a id="五组顺序实验"></a>
 
-| 顺序/目录名 | 扫描范围 | 空闲检查 | 空闲策略 | 相对基线唯一变化 |
-| --- | --- | --- | --- | --- |
-| baseline | all | locked | yield | 基线 |
-| allocated | allocated | locked | yield | 跳过从未分配的槽位 |
-| atomic | all | atomic | yield | 无任务时先检查原子状态，免去空闲领取锁 |
-| spin | all | locked | spin | 空扫描后不调用yield |
-| baseline_repeat | all | locked | yield | 重复基线，观察运行波动 |
+[五组顺序实验](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-513)
 
-allocated的范围从槽位0开始，随着图捕获中登记的新任务向后扩展；任务记录先写好，
-再发布新边界，最后才让设备提交请求。旧图的槽位不会被排除。
-atomic仍在实际领取任务和发布完成时加锁，并不是完全无锁。
-spin仍逐个扫描当前范围，仅取消无任务扫描后的yield；也不保证不会被操作系统抢占。
+<a id="绿区一次执行-1"></a>
 
-每组独立启动同一模型，默认3次预热、1次测量请求、max_tokens=5，预热不在采集区间内。
-五组都开启原有回调分项计时、MSTX及profiler，不开启C++ worker循环内部计时，
-避免之前已观察到的逐槽打点扰动。扩展和算子只构建一次，运行CPU生命周期及worker回归后再启动模型。
-脚本从服务日志核对实际加载流和worker开关，不仅检查传入参数。
-候选请求超时、输出与首组不同或回调计时丢失即停止后续组，保留已完成结果；
-只有profile停止或导出失败时按已有策略限时清理并继续，失效的时间线不会参与空泡结论。
+[绿区一次执行](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-535)
 
-### 绿区一次执行
+<a id="结果判断与当前状态"></a>
 
-在已更新的`/home/l00992607/vllm-ascend-worker-poll`目录执行，NPU编号按实际空闲设备修改：
+[结果判断与当前状态](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-551)
 
-```bash
-python -B script/run_moe_worker_profile.py --npu 7 \
-  --runtime-source /home/l00992607/vllm-ascend \
-  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
-  --request-timeout 120 --profile-timeout 120 \
-  --output-dir bench_results/moe_worker_profile_01
-```
+<a id="首轮采集缺失与重测要求"></a>
 
-返回`bench_results/moe_worker_profile_01/summary.txt`的文本即可。详细服务日志留在各组目录，
-MindStudio数据分别在`profile/<组名>/cpp/`下的worker目录，五组都保留。
-重新运行需使用新的输出目录名，脚本不覆盖旧实验。
+[首轮采集缺失与重测要求](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-567)
 
-### 结果判断与当前状态
+<a id="多请求整体时延与单请求profile分开测量"></a>
 
-汇总并列预取/按需各项的均值、p95，包括load_prepare、copy_submit、load_submit、synchronize、
-observe、choose_victims及外围时间；另外比较load_submit＋synchronize的均值。
-同时记录请求墙钟时间、两个方向的host_callback间隔和MEMCPY大间隔（默认阈值100μs）。
-完整逐流统计也保存在每组profile_report.json，流编号须结合本轮可视化核对，
-不能据拷贝数量自动判断权重流身份。
+[多请求整体时延与单请求profile分开测量](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-584)
 
-先核对输出和卸载工作量，再结合前后两次基线判断候选变化。
-如果基线自身波动已接近候选收益，不据这轮判定有效；单个短请求加profiler也不能代表无采集生产性能。
-本轮要验证的是交接与搬运相关间隔是否改善，不只看请求总时延，
-也不能将copy_submit下降而synchronize上升的时间转移算作搬运整体提速。
+<a id="atomic-独立服务交替复验"></a>
 
-首次交付已完成蓝区编排与默认流修改，152项相关CPU回归通过。
-此前的独立单测结果保留；首轮绿区采集的限制见下节，不据缺失时间线预填收益。
+[atomic 独立服务交替复验](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-622)
 
-### 首轮采集缺失与重测要求
+<a id="allocated-与-atomic-组合验证"></a>
 
-`moe_worker_profile_01`五组完成请求、输出一致，但后三组设备时间线不可用。
-只读检查确认atomic、spin、baseline_repeat的CANN目录均缺少start_info、end_info和Host/Device原始data；
-解析器在开始解析时已报start info路径不存在，trace_view.json也未完整导出。
-保留下来的FRAMEWORK记录不能替代设备原始数据，因此仅凭这些目录不能离线恢复完整设备时间线。
+[allocated 与 atomic 组合验证](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-647)
 
-检查时输出文件系统仅剩0.14GiB，空间不足是首要排查方向；该快照本身不能证明采集时已写满。
-成功基线也有External init callback警告，不能单凭该警告解释后三组失败。
-这不是已经证明worker优化导致推理阻塞；原始设备采集缺失与CPU分项计时需分别判断。
+<a id="组合测试结果2026-10-31"></a>
 
-比较入口现在在构建前、每组服务启动前、预热完成后开始采集前检查实际输出文件系统，
-要求至少20GiB余量且inode未耗尽。不满足时停止后续组，保留已完成结果。
-20GiB是预留门槛，不是每组实测占用；检查也不能阻止其他进程在采集期间消耗空间。
-可释放旧实验占用或选择另一有足够空间的文件系统，重新采集时使用新输出目录。
-不要复制其他组的start_info或给截断JSON补括号后用于性能比较。
+[组合测试结果（2026-10-31）](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-684)
 
-### 多请求整体时延与单请求profile分开测量
+<a id="回调mte-默认与-mte-组合三组对照"></a>
 
-前两轮每组只有3次预热和1次带profiler的测量请求。单次结果没有请求间分布，
-不足以区分微秒级交接改善和毫秒级运行波动。第二轮五组profile均通过检查；
-allocated两方向Host间隔均值降低，但请求时间反而升高，不能把局部收益当作整体收益。
+[回调、MTE 默认与 MTE 组合三组对照](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-724)
 
-新增`--timing-requests`，默认0保持旧实验；设为20时，每个独立服务按以下顺序执行：
+<a id="增加-python-lrc-与-debug-开启的早期配置对照"></a>
 
-1. 预热指定次数，所有组使用相同prompt、max_tokens=5和相同推理配置。
-2. 顺序发送20个请求测HTTP端到端墙钟时间。profiler尚未启动，回调分项计时未开启，
-   本项目的回调MSTX范围也未激活；包装函数及状态检查仍存在，不能称为完全无插桩。
-3. 单独开始profiler及回调计时，执行`--requests`指定的采集请求（建议维持1次）。
-4. 限时停止采集，检查profile并清理服务，再执行下一组。
-
-多请求窗口的逐次时间、输出摘要和token用量先保存在各组`request_window.json`，
-后续导出失败不丢失已取得的请求数据。summary中的`REQUEST_NO_PROFILE`报告均值、
-中位数、p95、最小/最大值、标准差和前后半段均值，`REQUEST_SAMPLES_MS`保留请求顺序。
-原`REQUEST`行仍是另一窗口的带profile请求，不能和无采集数据混算。
-脚本检查不同组多请求窗口的请求配置、输出摘要和用量一致。
-
-```bash
-python -B script/run_moe_worker_profile.py --npu 7 \
-  --runtime-source /home/l00992607/vllm-ascend \
-  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
-  --warmup-requests 5 --timing-requests 20 --requests 1 \
-  --request-timeout 120 --profile-timeout 120 \
-  --output-dir bench_results2/moe_worker_stability_01
-```
-
-仍为baseline、allocated、atomic、spin、baseline_repeat五个独立服务，扩展构建一次。
-profile只包含最后的采集请求，不包含前面的20次整体计时；这避免把请求间停顿混入层间间隔，
-也避免将profile体积扩大20倍。更多请求会进一步改变/预热缓存状态，新的profile不与旧轮逐层混算。
-
-判断收益时分别看局部交接与整体分布。局部统计包含设备计算和依赖等待，不是纯轮询代码耗时；
-整体看候选对前后基线的均值、中位数和尾部变化。20次请求有助于评估服务内波动，
-但同一服务中的样本并非20次独立服务实验，仍不能完全排除固定运行顺序及服务间环境差异。
-若收益很小或前后基线仍不一致，再针对候选交替重启复测，不宣称已获统计显著收益。
-
-### atomic 独立服务交替复验
-
-多请求实验中 atomic 的无采集请求均值比首次基线低约 1.28%，但每种配置仅启动了一次服务，
-仍需区分策略收益与服务间环境差异。增加 `--atomic-trials 3` 后只比较原子预检查，
-扫描范围仍为 all，空闲行为仍为 yield，保持 MTE 普通流、消费者处严格等待和 C++ LRC。
-
-三轮按 `baseline → atomic`、`atomic → baseline`、`baseline → atomic` 顺序运行，
-共启动六个独立服务；每个服务预热 5 次、无采集计时 20 次，再单独采集 1 次 profile。
-交换顺序可以检查运行先后影响，但三轮不能完全消除环境漂移，也不代表统计显著性证明。
-
-```bash
-python -B script/run_moe_worker_profile.py --npu 7 \
-  --runtime-source /home/l00992607/vllm-ascend \
-  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
-  --atomic-trials 3 --warmup-requests 5 --timing-requests 20 --requests 1 \
-  --request-timeout 120 --profile-timeout 120 \
-  --output-dir bench_results2/moe_atomic_stability_01
-```
-
-汇总逐轮比较请求分布、输出一致性和交接间隔，末尾的 `ATOMIC_TRIAL` 给出每轮均值、
-中位数变化；`ATOMIC_TRIAL_SUMMARY` 统计变快轮数及各轮百分比变化范围。
-所有组的请求输出都与首组核对；构建一次，服务顺序启动和清理。
-profile 保存在该结果目录的 `profile/<组名>/cpp`，不包含之前的无采集请求。
-当前默认 worker 策略不变；绿区实测结果返回后再判断是否稳定改善。
-
-### allocated 与 atomic 组合验证
-
-2026-10-31 的三轮 atomic 复验中，按需→预取 Host 回调间隔均值分别减少 5.33、10.44、
-11.53 μs，但无采集请求均值变化为 -0.654%、+0.095%、+0.477%，未复现稳定整体加速。
-此前 allocated 也观察到局部间隔改善；spin 尚无明确稳定收益。因此选择组合 allocated 与
-atomic，保持 yield，不预设两者收益可以相加。缩小扫描范围后，原子预检查的增量可能变小。
-
-通过 `--combination-trials 2` 运行六个独立服务：
-
-| 组别 | 扫描范围 | 空槽预检查 | 空闲行为 |
-| --- | --- | --- | --- |
-| baseline | all | locked | yield |
-| allocated | allocated | locked | yield |
-| combined | allocated | atomic | yield |
-
-第一轮 baseline → allocated → combined，第二轮 combined → allocated → baseline。
-每个服务预热 5 次、无采集计时 20 次，随后单独采集 1 次 profile，max_tokens=5。
-保持 MTE 普通流、消费者处严格等待、C++ LRC、原始权重拷贝；不绑核、不启用 C++ 内部计时。
-本次只新增实验编排，运行时组合开关已有实现，默认策略保持原样。
-
-```bash
-python -B script/run_moe_worker_profile.py --npu 7 \
-  --runtime-source /home/l00992607/vllm-ascend \
-  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
-  --combination-trials 2 --warmup-requests 5 --timing-requests 20 --requests 1 \
-  --request-timeout 120 --profile-timeout 120 \
-  --output-dir bench_results2/moe_worker_combination_01
-```
-
-`summary.txt` 逐轮保留请求分布、两个方向的 Host 回调间隔、MEMCPY 间隔和分项时延。
-末尾 `COMBINATION_TRIAL` 分别计算 allocated 相对基线、组合相对基线、组合相对 allocated
-的整体变化。判断首先看交接间隔是否改善、两轮方向是否一致，再看整体时延和尾部有无退化。
-搬运分项作为辅助信息，不作为这几项轮询改动的主要验收指标。
-两个独立轮次只能检查初步重复性；profile 每个服务仅采集一次，不与 20 次无采集请求混算。
-所有组核对输出及运行策略；失败保留已完成数据，profile 导出失败仍按原有逻辑限时跳过。
-不更改默认配置。
-
-#### 组合测试结果（2026-10-31）
-
-绿区结果目录为 `/mnt/data/l00992607/bench_results/moe_worker_profile_04`。
-六组请求输出摘要、token 用量及采集窗口工作量摘要一致，无清理前引擎错误；
-六组 profile 均通过当前可用性检查，状态为 complete_with_warnings，仍有线程初始化警告。
-未复现原阻塞；这只验证本轮短请求，不代表完整模型精度验收。
-
-下表为每服务 20 次无 profiler 请求均值，单位 ms：
-
-| 轮次 | baseline | allocated | combined | 组合相对基线 | 组合相对 allocated |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 正序 | 3102.195 | 3091.089 | 3091.649 | -0.340% | +0.018% |
-| 反序 | 3087.679 | 3098.290 | 3093.500 | +0.189% | -0.155% |
-
-两轮均值等权合并：baseline 3094.937 ms、allocated 3094.690 ms、combined 3092.575 ms。
-组合仅比基线少约 2.36 ms（0.076%），方向未跨轮保持一致，不认定稳定端到端收益。
-
-下表为每服务单独一次 profile 的 Host 回调间隔均值，单位 μs，每个方向 84 个间隔：
-
-| 轮次/方向 | baseline | allocated | combined |
-| --- | ---: | ---: | ---: |
-| 正序预取→按需 | 98.485 | 111.152 | 94.122 |
-| 正序按需→预取 | 66.244 | 51.321 | 55.580 |
-| 反序预取→按需 | 107.500 | 99.866 | 97.021 |
-| 反序按需→预取 | 62.089 | 56.170 | 56.015 |
-
-组合相对基线两个方向均值均下降；预取→按需减少约 4.4～10.5 μs，按需→预取减少
-约 6.1～10.7 μs。但相比单独 allocated，额外收益主要出现在预取→按需；
-按需→预取一轮增加 4.26 μs，另一轮仅减少 0.16 μs，不能认为两项收益可以相加。
-组合的预取→按需 P95 仍约 375～379 μs，长间隔未被消除。
-两方向间隔累计相对基线减少约 1.26/1.39 ms，仅为局部量级参照，不当作端到端节省量。
-
-结论：组合是有局部改善迹象的可选配置，尚无稳定整体加速证据；保留基线默认值。
-本轮无需继续重复相同短请求矩阵以追逐百分之一级收益。
-若继续研究剩余长间隔，应利用已有 profile 对齐设备任务和等待依赖，区分必要计算与交接延迟。
-
-原汇总部分三组 `DELTA` 行误沿用 callback/sync_launch/ordinary 标签，实际对应
-baseline/allocated/combined（第二轮为相应 `_2` 组）。表格表头、数值及运行配置正确；
-已修复为动态组名，无需重跑采集。
-
-### 回调、MTE 默认与 MTE 组合三组对照
-
-2026-11-02补充：本节此前实验表保留原始统计。对已返回完整逐请求序列的
-`moe_worker_profile_02/03/04`及四组对照，已按统一3×IQR规则重算请求分布，见
-[历史实验异常值复核](moe_mte_handoff_flow_zh.md#137-历史实验异常值复核范围与重算结果2026-11-02)。
-Host/MEMCPY间隔与分项没有完整样本，仍未剔除异常值，不能把请求时延的筛选结论套用到它们。
-
-入口为 `script/run_moe_callback_worker_compare.py`，按 callback → mte_default → mte_combined
-顺序运行三个独立服务，构建扩展一次。三组均使用 C++ LRC、普通加载流、原始权重拷贝，
-模型和推理配置读取同一个 `script/test_graph2.sh`。
-
-| 组名 | CPU/NPU 交接 | worker 配置 |
-| --- | --- | --- |
-| callback | 原回调路径 | 不使用 MTE worker |
-| mte_default | MTE 发布，消费者处严格等待 | all / locked / yield |
-| mte_combined | 同上 | allocated / atomic / yield |
-
-这里的 MTE 默认版指已验证可运行的普通流、晚等待版本，不是早期发生阻塞的版本。
-选择组合是为了对照其局部交接改善，不代表已确认端到端加速；spin 不开启，不绑核。
-每组默认预热 5 次、20 次无 profiler 请求、另采集 1 次 profile 请求，max_tokens=5。
-无采集窗口不开回调分项计时，采集窗口开启 MSTX 与分项计时；C++ 轮询内部计时关闭。
-
-```bash
-python -B script/run_moe_callback_worker_compare.py --npu 7 \
-  --runtime-source /home/l00992607/vllm-ascend \
-  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
-  --warmup-requests 5 --timing-requests 20 --requests 1 \
-  --request-timeout 120 --profile-timeout 120 \
-  --output-dir bench_results2/moe_callback_mte_compare_01
-```
-
-汇总为结果目录的 `summary.txt`，可视化分别在 `profile/callback/cpp`、
-`profile/mte_default/cpp`、`profile/mte_combined/cpp` 的 worker 子目录中。
-汇总同时提供无采集请求分布、两方向 Host 回调间隔、同流 MEMCPY 间隔、回调分项计时。
-`NO_PROFILE_COMBINED_VS_DEFAULT` 单独展示组合相对 MTE 默认版的整体变化。
-输出/用量不一致、实际策略不符、请求失败或清理前引擎错误会停止后续组；profile 导出失败
-保留已有计时并限时清理后继续，不能将失败 profile 当成有效可视化。
-本次每种配置仅一次服务启动，是当前三种方案的横向对照，不代替之前的独立服务重复实验。
-
-#### 增加 Python LRC 与 debug 开启的早期配置对照
-
-同一入口增加 `--include-legacy-callback` 后，最先执行 `callback_legacy`，其余三组保持原样：
-
-| 组名 | 交接方式 | LRC | moe_offload_debug | MTE worker |
-| --- | --- | --- | --- | --- |
-| callback_legacy | 原回调 | Python | true | 不使用 |
-| callback | 原回调 | C++ | false | 不使用 |
-| mte_default | MTE 晚等待 | C++ | false | all / locked / yield |
-| mte_combined | MTE 晚等待 | C++ | false | allocated / atomic / yield |
-
-早期组是在当前代码上恢复指定配置，不切换历史提交；仍保留相同的测量包装和 profiler。
-该组与 callback 同时改变了 LRC 实现和 debug 开关，只用于观察合计差异，不能将时延差全部
-归因于 C++ 迁移或者关闭 debug。debug 工作在无 profiler 请求中也保持开启，其成本计入结果。
-启动脚本先做公共配置清理，再单独将该组 debug 显式设置为 true；其他三组显式为 false。
-
-```bash
-python -B script/run_moe_callback_worker_compare.py --npu 7 \
-  --include-legacy-callback \
-  --runtime-source /home/l00992607/vllm-ascend \
-  --test-script /home/l00992607/vllm-ascend/script/test_graph2.sh \
-  --warmup-requests 5 --timing-requests 20 --requests 1 \
-  --request-timeout 120 --profile-timeout 120 \
-  --output-dir bench_results2/moe_callback_mte_four_way_01
-```
-
-各组均预热 5 次，测 20 次无 profiler 请求，再采集 1 次 profile，max_tokens=5。
-新增组的可视化在 `profile/callback_legacy/python/`；其他三组仍在各自 `cpp/` 子目录。
-所有组请求输出和用量与最先完成的组核对，原有计时、失败保护和停止采集超时处理保持不变。
-`summary.txt` 明确输出各组 LRC 与 debug 设置，四列表格提供分项值和实际组名的差值。
-默认不带该参数仍执行三组，不改变产品默认配置。
+[增加 Python LRC 与 debug 开启的早期配置对照](moe_experiment_results_zh.md#worker-model-20261031-worker_poll_optimization_zh-763)
 
 ## 独立测试的绿区执行
 
