@@ -30,6 +30,7 @@ from moe_host_memory import (
 )
 from moe_tpot import streaming_completion, summarize_streams
 from native_moe_artifacts import case_directory, saved_case_file
+from native_moe_build import build_fingerprint, build_lock, cached_library, installed_artifacts, remember_build
 from native_moe_profile import report_native_scale_memory, verify_full_submit
 from run_host_sync_stage2 import target_cmake_args
 from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB
@@ -88,6 +89,95 @@ def fresh_handshake_build(parent):
             return candidate
         except FileExistsError:
             number += 1
+
+
+def validate_native_components(library, args, step):
+    if not library.is_file():
+        raise FileNotFoundError(library)
+    # These checks still run when reusing binaries, before starting the model.
+    step(
+        "native API check",
+        [
+            sys.executable,
+            "-c",
+            "import _vllm_ascend_lrc as l; import vllm_ascend_host_sync as h; "
+            "assert hasattr(l,'native_update_task'); assert hasattr(l.NativeTransfers,'enqueue_all'); "
+            "assert hasattr(h.Session,'install_native_task')",
+        ],
+    )
+    step("native CPU regression", [sys.executable, "-B", "tests/ut/expert_offload/test_native_update.py"])
+    step("original worker regression", [sys.executable, "-B", "tests/ut/expert_offload/test_worker_polling.py"])
+    step("NPU scale byte-layout parity", [sys.executable, "-B", "script/test_native_scale_copy.py"])
+    step(
+        "NPU native strict graph and GIL independence",
+        [
+            sys.executable,
+            "-B",
+            "script/test_native_update_graph.py",
+            "--library",
+            str(library),
+            *([] if args.skip_profile else ["--native-profile"]),
+        ],
+        timeout=180,
+    )
+
+
+def prepare_native_components(args, env, step, report):
+    if args.skip_build:
+        if args.library is None:
+            raise ValueError("--skip-build requires --library")
+        library = args.library.resolve()
+        validate_native_components(library, args, step)
+        return library
+    parent = args.build_dir.resolve()
+    with build_lock(parent):
+        result = subprocess.run(
+            [sys.executable, "-c", "import torch,torch_npu; print('SOC='+torch.npu.get_device_name(0).lower())"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=True,
+        )
+        soc = next(line[4:] for line in result.stdout.splitlines() if line.startswith("SOC="))
+        fingerprint = build_fingerprint(ROOT, args.cann_root, soc, env)
+        library = cached_library(parent, fingerprint)
+        if library is not None:
+            report(f"BUILD_CACHE_HIT: validated native binaries reused; no pip install/CMake build; library={library}")
+        else:
+            report("BUILD_CACHE_MISS: no matching validated binaries; build once for current sources/environment")
+            # Never rebuild AscendC's already-merged .o files in place.
+            build = fresh_handshake_build(parent)
+            library = build / "lib/libhost_sync_device.so"
+            report(f"HANDSHAKE_BUILD={build}; fresh directory; existing builds retained")
+            for extension in ("lrc_policy", "host_sync"):
+                step(
+                    f"build {extension}",
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        f"./csrc/{extension}",
+                        "--no-build-isolation",
+                        "--no-deps",
+                        "--force-reinstall",
+                    ],
+                )
+            step("configure handshake", handshake_configure_command(build, args.cann_root, soc))
+            step("build handshake", ["cmake", "--build", str(build), "--verbose", "-j", "2"])
+        report(f"HANDSHAKE_LIBRARY={library}; persistent path outside experiment results")
+        artifacts = installed_artifacts(library)
+        validate_native_components(library, args, step)
+        if (
+            build_fingerprint(ROOT, args.cann_root, soc, env) != fingerprint
+            or installed_artifacts(library) != artifacts
+        ):
+            raise RuntimeError("Native sources/environment/binaries changed during preflight; no model started")
+        # Only publish after all checks pass. Failed builds never become a cache hit.
+        remember_build(parent, fingerprint, library)
+        report("BUILD_CACHE_VERIFIED: sources/environment and binary hashes checked; runtime preflight passed")
+        return library
 
 
 def report_failed_step(log_path, start_offset, report):
@@ -424,72 +514,8 @@ def main():
         if not args.skip_profile:
             wait_port_free(args.timing_port)
         report(f"PASS initial port check: {args.port}")
-        if not args.skip_build:
-            # CANN merge_obj_text may rewrite intermediate .o files in place.
-            # Reusing those objects has produced 'unknown file type' on rebuild.
-            # Reserve a new directory; retain all previous artifacts/evidence.
-            build = fresh_handshake_build(args.build_dir)
-            library = build / "lib/libhost_sync_device.so"
-            commands = {case: service_command(source, case, library, args.port) for case in cases}
-            report(f"HANDSHAKE_BUILD={build}; fresh directory; existing builds retained")
-            report(f"HANDSHAKE_LIBRARY={library}; persistent path outside experiment results")
-            for extension in ("lrc_policy", "host_sync"):
-                step(
-                    f"build {extension}",
-                    [
-                        sys.executable,
-                        "-m",
-                        "pip",
-                        "install",
-                        f"./csrc/{extension}",
-                        "--no-build-isolation",
-                        "--no-deps",
-                        "--force-reinstall",
-                    ],
-                )
-            result = subprocess.run(
-                [sys.executable, "-c", "import torch,torch_npu; print('SOC='+torch.npu.get_device_name(0).lower())"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=True,
-            )
-            soc = next(line[4:] for line in result.stdout.splitlines() if line.startswith("SOC="))
-            step(
-                "configure handshake",
-                handshake_configure_command(build, args.cann_root, soc),
-            )
-            step("build handshake", ["cmake", "--build", str(build), "--verbose", "-j", "2"])
-        if not library.is_file():
-            raise FileNotFoundError(library)
-        # Missing extensions/APIs are fatal, not unittest skips.
-        step(
-            "native API check",
-            [
-                sys.executable,
-                "-c",
-                "import _vllm_ascend_lrc as l; "
-                "import vllm_ascend_host_sync as h; "
-                "assert hasattr(l,'native_update_task'); assert hasattr(l.NativeTransfers,'enqueue_all'); "
-                "assert hasattr(h.Session,'install_native_task')",
-            ],
-        )
-        step("native CPU regression", [sys.executable, "-B", "tests/ut/expert_offload/test_native_update.py"])
-        step("original worker regression", [sys.executable, "-B", "tests/ut/expert_offload/test_worker_polling.py"])
-        step("NPU scale byte-layout parity", [sys.executable, "-B", "script/test_native_scale_copy.py"])
-        step(
-            "NPU native strict graph and GIL independence",
-            [
-                sys.executable,
-                "-B",
-                "script/test_native_update_graph.py",
-                "--library",
-                str(library),
-                *([] if args.skip_profile else ["--native-profile"]),
-            ],
-            timeout=180,
-        )
+        library = prepare_native_components(args, env, step, report)
+        commands = {case: service_command(source, case, library, args.port) for case in cases}
         reference = None
         means = {}
         timings = {}

@@ -38,6 +38,10 @@ scale 注册允许 ND（2）与 NCHW（0）这两种基础格式编号不同，�
 
 继续使用 `script/run_native_moe_compare.py`，默认顺序运行 Python MTE、当前 native、native_full 三组。它先运行 CPU 回归、NPU scale 字节一致性、整批 eager/prefill 提交、严格图重放及 GIL 独立推进检查，再运行性能请求和独立 profile。结果统一汇总到指定目录的 `summary.txt`，保留 Decode、HTTP E2E、TTFT、TPOT、Host 函数耗时、Host 间隔及加载流空泡。
 
+构建自动复用：首次生成并通过检查后，在仓库的 `build/native_moe_handshake/verified_build.json` 保存源码、Python/依赖、CANN/工具链和 SoC 的指纹，以及已安装扩展和握手库的哈希。后续组、token5/token128 及新实验目录复用这套产物，打印 `BUILD_CACHE_HIT`，不再执行 pip 重装和 CMake 构建；CPU/NPU 前置检查仍会执行并写入 `build.log`。缓存位于持久构建目录，不依赖任何旧实验目录。
+
+指纹变化、库缺失或已安装扩展被替换时才重新构建，仍使用新的 `build_XX`，避免重复链接被 AscendC 改写过的中间文件。失败构建或未通过检查的产物不会登记为可复用缓存。更新到此版本后，尚无校验记录的旧产物会触发一次构建；之后测试命令不用增加参数。
+
 需要分开运行时，分别传 `--case python`、`--case native`、`--case native_full`，三条命令可以使用同一结果目录，逐组追加。每条命令均独立完成该组计时和 profile；`--case both` 保留原 Python/native 两组入口。单组计时验证该组请求一致性，汇总保留各组测量来源，不能把分开启动称为同次配对测量。单组计时完成后如需补采，可用 `--profile-only-from` 配合对应的 `--profile-case` 和新输出目录；三组补采传 `--profile-case all`。
 
 完整测试使用 `script/run_native_moe_suite.sh`：后台依次运行 token 5、128，每轮均比较三组，每组 5 次预热、20 次正式请求并独立采 profile。它继承当前终端环境；在容器内执行，下面的 `--npu 6` 为物理卡号，结果目录已存在时改为下一个编号：
