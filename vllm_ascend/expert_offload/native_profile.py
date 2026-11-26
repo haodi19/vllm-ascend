@@ -12,6 +12,20 @@ class NativeTimings(CallbackTimings):
         self.transport = "acl"
         self.load_backend = "native"
 
+    def status(self):
+        result = super().status()
+        native = self.profiler.status()
+        result.update(
+            active=self.active or native["active"],
+            mstx_active=self.active or native["active"],
+            inflight=native["inflight"],
+            mstx_marker_attempts=self.marker_attempts + native["marker_attempts"],
+            native=True,
+            native_count=native["count"],
+            native_marker_errors=native["marker_errors"],
+        )
+        return result
+
     def start(self):
         self.profiler.start()
         self.marker_errors = 0

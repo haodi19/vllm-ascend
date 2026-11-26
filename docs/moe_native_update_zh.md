@@ -36,7 +36,9 @@ scale 注册允许 ND（2）与 NCHW（0）这两种基础格式编号不同，�
 
 ## 验证与结果读取
 
-继续使用 `script/run_native_moe_compare.py`，默认顺序运行 Python MTE、当前 native、native_full 三组。它先运行 CPU 回归、NPU scale 字节一致性、整批 eager/prefill 提交、严格图重放及 GIL 独立推进检查，再运行性能请求和独立 profile。结果统一汇总到指定目录的 `summary.txt`，保留 Decode、HTTP E2E、TTFT、TPOT、Host 函数耗时、Host 间隔及加载流空泡。
+继续使用 `script/run_native_moe_compare.py`，默认顺序运行 Python MTE、当前 native、native_full 三组。它先运行 CPU 回归、NPU scale 字节一致性、整批 eager/prefill 提交、严格图重放及 GIL 独立推进检查，再运行性能请求和同服务内的 profile。结果统一汇总到指定目录的 `summary.txt`，保留 Decode、HTTP E2E、TTFT、TPOT、Host 函数耗时、Host 间隔及加载流空泡。
+
+每组只启动一次模型服务：预热 → 正式计时 → 同一服务开启 profile/MSTX → 采集 → 关闭服务。计时前后检查采集状态及 Python/C++ 标记计数，要求采集关闭、标记计数不增长；原有包装与开关检查仍保留。采集阶段不重新加载权重、不重新捕获模型图，也不做第二轮预热。NPU 前置检查包含同一张图上关闭→开启→关闭原生标记的验证。显式使用 `--profile-only-from` 补采旧结果时，才单独启动采集服务。
 
 构建自动复用：首次生成并通过检查后，在仓库的 `build/native_moe_handshake/verified_build.json` 保存源码、Python/依赖、CANN/工具链和 SoC 的指纹，以及已安装扩展和握手库的哈希。后续组、token5/token128 及新实验目录复用这套产物，打印 `BUILD_CACHE_HIT`，不再执行 pip 重装和 CMake 构建；CPU/NPU 前置检查仍会执行并写入 `build.log`。缓存位于持久构建目录，不依赖任何旧实验目录。
 
@@ -101,6 +103,8 @@ native_three_way_01/
 ```
 
 导入对应组的 `<采集目录>` 即可查看已对齐的可视化。单组测试也使用相同结构，只生成所选组。旧版平铺的日志目录仍支持补采及离线分析，不需要手动搬文件。
+
+常规测试的服务输出全程写入本组 `inference.log`，`profile.log` 记录采集阶段的控制与分析信息；它不再表示第二次模型启动。返回结果仍只需根目录的 `summary.txt`。
 
 原 `run_native_moe_compare.py` 入口保留，可按 `--case`、`--max-tokens` 和 `--output-dir` 前台独立执行。计时阶段关闭 profiler/MSTX；profile 使用同次时钟对齐并自动识别加载流。`native_full` 必须同时出现原生图任务完成、共享 scale 校验和 `FULL_SUBMIT executed=` 记录，防止只注册但未执行新路径的测试被接受。
 

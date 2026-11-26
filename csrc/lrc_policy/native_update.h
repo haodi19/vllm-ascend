@@ -257,6 +257,12 @@ inline void bind_native_update(py::module_& m) {
   py::class_<NativeRanges, std::shared_ptr<NativeRanges>>(m, "NativeRanges")
       .def(py::init<>())
       .def("start", &NativeRanges::start)
+      .def("status", [](NativeRanges& p) {
+        const auto s = p.status();
+        py::dict out; out["active"] = s.active; out["count"] = s.count;
+        out["marker_errors"] = s.errors; out["inflight"] = s.inflight;
+        out["marker_attempts"] = s.marker_attempts; return out;
+      })
       .def("stop", [](NativeRanges& p) {
         std::pair<uint64_t, uint64_t> result;
         { py::gil_scoped_release release; result = p.stop(); }

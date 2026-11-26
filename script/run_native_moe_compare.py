@@ -31,9 +31,17 @@ from moe_host_memory import (
 from moe_tpot import streaming_completion, summarize_streams
 from native_moe_artifacts import case_directory, saved_case_file, saved_timing_records
 from native_moe_build import build_fingerprint, build_lock, cached_library, installed_artifacts, remember_build
-from native_moe_profile import report_native_scale_memory, verify_full_submit
+from native_moe_profile import (
+    check_timing_status,
+    profile_cases,
+    profile_command,
+    report_native_scale_memory,
+    report_profiles,
+    verify_full_submit,
+)
 from run_host_sync_stage2 import target_cmake_args
-from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB
+from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB, ensure_profile_storage
+from run_verified_cpp_tests import request as control_request
 from summarize_native_moe_results import SUMMARY_HEADER, rebuild, write_summary
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -252,14 +260,14 @@ def load_completed_timing_run(directory, port, required_cases=("python", "native
         if Path(command[0]).resolve() != Path(sys.executable).resolve():
             raise ValueError("Activate the original Python environment before continuing profiling")
         config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
-        if (
-            config.get("host_update_backend") != case
-            or config.get("host_sync_backend") != "mte"
-            or config.get("callback_timing_port")
-            or config.get("callback_mstx_enabled")
-            or "--profiler-config" in command
-        ):
+        if config.get("host_update_backend") != case or config.get("host_sync_backend") != "mte":
             raise ValueError("Saved command does not describe an unprofiled Python/native MTE timing case")
+        if config.get("callback_timing_port") or config.get("callback_mstx_enabled") or "--profiler-config" in command:
+            evidence = row.get("instrumentation", {})
+            if evidence.get("mode") != "same_service_gated_v1":
+                raise ValueError("Saved timing with profiling configured has no verified inactive measurement window")
+            check_timing_status(evidence["before"], case)
+            check_timing_status(evidence["after"], case, evidence["before"])
         if not Path(config["host_sync_library"]).is_file():
             raise FileNotFoundError(f"Saved handshake library is missing: {config['host_sync_library']}")
         command[command.index("--port") + 1] = str(port)
@@ -383,7 +391,7 @@ def main():
     parser.add_argument("--request-timeout", type=int, default=600)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--library", type=Path, help="existing handshake library, required with --skip-build")
-    parser.add_argument("--skip-profile", action="store_true", help="Timing only; omit separate diagnostic services")
+    parser.add_argument("--skip-profile", action="store_true", help="Timing only; omit the diagnostic capture phase")
     parser.add_argument(
         "--profile-only-from",
         type=Path,
@@ -488,7 +496,7 @@ def main():
             error = "" if exit_code == 0 else "profile 补采未完成"
             return exit_code
         report(
-            f"CASES={','.join(cases)}; MTE weight updates; timed requests have no profiler/MSTX. "
+            f"CASES={','.join(cases)}; one service per case; profiler/MSTX inactive during timed requests. "
             "python=Python MTE; native=current shared-scale baseline; "
             "native_full=also C++ eager/prefill batch submission. All keep strict completion."
         )
@@ -516,11 +524,20 @@ def main():
         reference = None
         means = {}
         timings = {}
+        profiles = {}
         for case in cases:
             wait_port_free(args.port)
             check_host_memory(f"before timing/{case}", report)
             command = commands[case]
             artifacts = case_directory(root, case)
+            if not args.skip_profile:
+                directory = root / "profile" / case
+                directory.mkdir(parents=True)
+                ensure_profile_storage(
+                    directory, stage=f"before service {case}", min_free_gib=args.min_profile_free_gib
+                )
+                command = profile_command(command, directory, args.timing_port)
+                commands[case] = command
             # This exact argv preserves the original model and MTP settings.
             (artifacts / "command.json").write_text(json.dumps(command, ensure_ascii=False, indent=2), encoding="utf-8")
             log_path = artifacts / "inference.log"
@@ -529,7 +546,7 @@ def main():
                 proc = subprocess.Popen(
                     command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
                 )
-                samples, completed = [], 0
+                samples, completed, phase = [], 0, "timing"
                 try:
                     deadline = time.monotonic() + args.startup_timeout
                     while True:
@@ -537,6 +554,9 @@ def main():
                             raise RuntimeError(f"{case} service exited: {proc.returncode}; see {log_path}")
                         try:
                             models = request("/v1/models")
+                            if not args.skip_profile:
+                                status = control_request(opener, args.timing_port, "/status")
+                                check_timing_status(status, case)
                             break
                         except (OSError, ValueError, urllib.error.URLError):
                             if time.monotonic() >= deadline:
@@ -550,7 +570,11 @@ def main():
                         temperature=0,
                         ignore_eos=True,
                     )
+                    timing_before = timing_after = None
                     for i in range(args.warmup_requests + args.requests):
+                        if i == args.warmup_requests and not args.skip_profile:
+                            timing_before = control_request(opener, args.timing_port, "/status")
+                            check_timing_status(timing_before, case)
                         result = streaming_completion(opener, args.port, body, timeout=args.request_timeout)
                         elapsed = result["http_wall_us"] / 1000
                         if result["usage"]["completion_tokens"] != args.max_tokens:
@@ -563,6 +587,10 @@ def main():
                             f"REQUEST {case} {i + 1}/{args.warmup_requests + args.requests}; "
                             f"e2e_ms={elapsed:.3f}; decode_ms={result['decode_us'] / 1000:.3f}"
                         )
+                    if not args.skip_profile:
+                        timing_after = control_request(opener, args.timing_port, "/status")
+                        check_timing_status(timing_after, case, timing_before)
+                        report(f"TIMING_MSTX_ZERO {case}: collector_pid={timing_after['pid']}; marker_delta=0")
                     if case in (
                         "native",
                         "native_full",
@@ -592,16 +620,39 @@ def main():
                         mean_ms=means[case],
                         stream_samples=samples,
                         timing=timings[case],
+                        instrumentation=dict(mode="same_service_gated_v1", before=timing_before, after=timing_after)
+                        if not args.skip_profile
+                        else dict(mode="disabled_at_launch"),
                         output_match=True,
                         output_match_scope="within_case" if len(cases) == 1 else "paired_run",
                         digest=hashlib.sha256(json.dumps(outputs).encode()).hexdigest(),
                     )
                     (artifacts / "timing_result.json").write_text(json.dumps(result), encoding="utf-8")
                     report("RESULT " + json.dumps(result))
+                    if not args.skip_profile:
+                        phase = "profile"
+                        report(f"PROFILE_PHASE {case}: reuse service pid={proc.pid}; timed requests saved")
+                        profiles.update(
+                            profile_cases(
+                                args,
+                                {case: command},
+                                root,
+                                env,
+                                report,
+                                wait_port_free,
+                                stop_process_group,
+                                outputs,
+                                live_service=proc,
+                                timing_status=timing_after,
+                            )
+                        )
                 except Exception as exc:
                     try:
-                        report_service_failure(case, log_path, samples, completed, proc, exc, report)
-                        log_memory(f"failure timing/{case}/before_cleanup", report)
+                        if phase == "timing":
+                            report_service_failure(case, log_path, samples, completed, proc, exc, report)
+                        else:
+                            report(f"PROFILE_FAILED {case}: {exc}; completed timing_result.json retained")
+                        log_memory(f"failure {phase}/{case}/before_cleanup", report)
                     except Exception as diagnostic_error:
                         report(f"FAILURE_DIAGNOSTICS_UNAVAILABLE {type(diagnostic_error).__name__}: {diagnostic_error}")
                     raise
@@ -610,6 +661,8 @@ def main():
                     after_service_memory(f"after timing/{case}", report, proc.pid, drop_cache=case == "python")
             report(f"WAIT port release after service={case}; port={args.port}; timeout={PORT_RELEASE_TIMEOUT}s")
             wait_port_free(args.port, timeout=PORT_RELEASE_TIMEOUT)
+            if not args.skip_profile:
+                wait_port_free(args.timing_port, timeout=PORT_RELEASE_TIMEOUT)
             report(f"STOP service={case}; port={args.port} reusable")
         report("| Version | Decode mean ms (primary) | TTFT mean ms | TPOT mean ms/token | HTTP E2E mean ms |")
         report("| --- | ---: | ---: | ---: | ---: |")
@@ -633,13 +686,7 @@ def main():
                 "cross-version output parity and speedup not evaluated"
             )
         if not args.skip_profile:
-            from native_moe_profile import profile_cases
-
-            report(
-                f"PROFILE_PHASE: fresh {','.join(cases)} services after timing; one request each after warmup; "
-                "native C MSTX ranges, aligned visualization, Host gaps and loading bubbles"
-            )
-            profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, reference)
+            report_profiles(profiles, root, report)
         else:
             report("OVERLAP_UNAVAILABLE: --skip-profile selected; no compute-boundary or Host interval samples")
         exit_code, error = 0, ""

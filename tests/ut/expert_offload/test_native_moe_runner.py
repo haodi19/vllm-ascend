@@ -21,7 +21,9 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
-    def run_mock_comparison(self, directory, case="both", *, varied_outputs=False):
+    def run_mock_comparison(
+        self, directory, case="both", *, varied_outputs=False, marker_leak=False, profile_error=False
+    ):
         """Exercise the complete runner without processes, Torch or NPU."""
         library = directory / "libhost_sync_device.so"
         library.write_bytes(b"fixture, never loaded")
@@ -54,9 +56,13 @@ class NativeRunnerTests(unittest.TestCase):
             http_wall_us=5100,
         )
         launched = []
+        services = []
+        stopped = []
 
         def start(command, **kwargs):
+            child = Mock(pid=1234, poll=lambda: None, wait=lambda **kwargs: 0)
             if "vllm.entrypoints.cli.main" in command:
+                services.append(child)
                 config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
                 launched.append(config["host_update_backend"])
                 if config["host_update_backend"] in ("native", "native_full"):
@@ -79,7 +85,16 @@ class NativeRunnerTests(unittest.TestCase):
                         "[MOE-NATIVE] FULL_SUBMIT ready;\n[MOE-NATIVE] FULL_SUBMIT executed=prefill;\n"
                     )
                     kwargs["stdout"].flush()
-            return Mock(pid=1234, poll=lambda: None, wait=lambda **kwargs: 0)
+            return child
+
+        def capture(*args, **kwargs):
+            self.assertIs(kwargs["live_service"], services[-1])
+            self.assertNotIn(services[-1], stopped)
+            self.assertEqual(requests.call_count, len(services) * 3)
+            self.assertEqual(kwargs["timing_status"]["mstx_marker_attempts"], 0)
+            if profile_error:
+                raise TimeoutError("profile export failed")
+            return {}
 
         opener = Mock()
         opener.open.side_effect = lambda *args, **kwargs: contextlib.nullcontext(
@@ -88,6 +103,20 @@ class NativeRunnerTests(unittest.TestCase):
         streamed = [dict(sample) for _ in range(9)]
         if varied_outputs:
             streamed[2]["digest"] = "different"
+        status = dict(
+            pid=4321,
+            active=False,
+            mstx_active=False,
+            mstx_enabled=True,
+            mstx_marker_attempts=0,
+            inflight=0,
+            native=True,
+            native_count=0,
+            native_marker_errors=0,
+        )
+        statuses = [dict(status) for _ in range(9)]
+        if marker_leak:
+            statuses[2]["mstx_marker_attempts"] = 1
         with (
             patch.object(sys, "argv", argv),
             patch.object(sys, "platform", "linux"),
@@ -95,15 +124,52 @@ class NativeRunnerTests(unittest.TestCase):
             patch.object(runner.subprocess, "Popen", side_effect=start),
             patch.object(runner, "streaming_completion", side_effect=streamed) as requests,
             patch.object(runner, "wait_port_free"),
-            patch.object(runner, "stop_process_group"),
+            patch.object(runner, "stop_process_group", side_effect=stopped.append),
             patch.object(runner, "check_host_memory"),
             patch.object(runner, "after_service_memory"),
             patch.object(runner, "log_memory"),
-            patch("native_moe_profile.profile_cases") as profiles,
+            patch.object(runner, "control_request", side_effect=statuses),
+            patch.object(runner, "ensure_profile_storage"),
+            patch.object(runner, "profile_cases", side_effect=capture) as profiles,
+            patch.object(runner, "report_profiles"),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             code = runner.main()
+        self.assertEqual(stopped, services)
         return code, output, launched, requests.call_count, profiles
+
+    def test_marker_leak_rejects_timing_before_profile_or_result_acceptance(self):
+        for case in ("python", "native", "native_full"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                code, output, launched, count, profiles = self.run_mock_comparison(Path(temp), case, marker_leak=True)
+                self.assertEqual(code, 1)
+                self.assertEqual(launched, [case])
+                self.assertEqual(count, 3)
+                profiles.assert_not_called()
+                self.assertFalse((output / case / "timing_result.json").exists())
+
+    def test_saved_gated_timing_requires_unchanged_native_counters(self):
+        with tempfile.TemporaryDirectory() as temp:
+            code, output, _, _, _ = self.run_mock_comparison(Path(temp), "native")
+            self.assertEqual(code, 0)
+            path = output / "native/timing_result.json"
+            record = json.loads(path.read_text())
+            record["instrumentation"]["after"]["native_count"] = 1
+            path.write_text(json.dumps(record), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "measurements were enabled"):
+                runner.load_completed_timing_run(output, 8157, ("native",))
+
+    def test_profile_failure_preserves_completed_timing_and_cleans_service_once(self):
+        with tempfile.TemporaryDirectory() as temp:
+            code, output, launched, count, profiles = self.run_mock_comparison(Path(temp), "native", profile_error=True)
+            self.assertEqual(code, 1)
+            self.assertEqual(launched, ["native"])
+            self.assertEqual(count, 3)
+            profiles.assert_called_once()
+            records, _, _, _ = runner.load_completed_timing_run(output, 8157, ("native",))
+            self.assertEqual(records["native"]["requests"], 2)
+            self.assertFalse((output / "native/native_partial.json").exists())
+            self.assertIn("PROFILE_FAILED native", (output / "run_details.log").read_text(encoding="utf-8"))
 
     def test_independent_complete_runs_preserve_timing_and_selected_profile(self):
         for case in ("python", "native", "native_full"):
@@ -139,15 +205,16 @@ class NativeRunnerTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(launched, ["python", "native", "native_full"])
             self.assertEqual(count, 9)
-            self.assertEqual(list(profiles.call_args.args[1]), launched)
+            self.assertEqual([next(iter(call.args[1])) for call in profiles.call_args_list], launched)
             text = (output / "run_details.log").read_text(encoding="utf-8")
             self.assertIn("native_full vs native", text)
             self.assertIn("native_full vs python", text)
-            self.assertEqual({p.name for p in output.iterdir() if p.is_dir()}, set(launched))
+            self.assertEqual({p.name for p in output.iterdir() if p.is_dir()}, {*launched, "profile"})
             for case in launched:
                 row = json.loads((output / case / "timing_result.json").read_text())
                 self.assertEqual(row["case"], case)
-                config = json.loads(json.loads((output / case / "command.json").read_text())[-1])
+                command = json.loads((output / case / "command.json").read_text())
+                config = json.loads(command[command.index("--additional-config") + 1])
                 self.assertEqual(config["expert_offload_config"]["host_update_backend"], case)
 
     def test_independent_cases_append_to_same_output_without_replacing_previous_results(self):
@@ -191,7 +258,7 @@ class NativeRunnerTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(launched, ["python", "native"])
             self.assertEqual(requests, 6)
-            self.assertEqual(list(profiles.call_args.args[1]), launched)
+            self.assertEqual([next(iter(call.args[1])) for call in profiles.call_args_list], launched)
             text = (output / "run_details.log").read_text(encoding="utf-8")
             self.assertIn("decode mean change=0.000%", text)
             self.assertNotIn("SINGLE_CASE_TIMING_COMPLETE", text)

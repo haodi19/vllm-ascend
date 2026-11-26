@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Offline contracts for separate native profiling and full loading-stream gaps."""
+"""Offline contracts for gated native profiling and full loading-stream gaps."""
 
 import importlib
 import json
@@ -44,6 +44,139 @@ def fixture():
 
 
 class NativeProfileTests(unittest.TestCase):
+    def test_timing_gate_checks_both_python_and_native_status(self):
+        before = dict(
+            pid=123,
+            active=False,
+            mstx_active=False,
+            mstx_enabled=True,
+            mstx_marker_attempts=0,
+            inflight=0,
+            native=True,
+            native_count=0,
+            native_marker_errors=0,
+        )
+        for case in ("python", "native", "native_full"):
+            profile.check_timing_status(before, case)
+            profile.check_timing_status(dict(before), case, before)
+            for changed in (
+                dict(pid=124),
+                dict(active=True),
+                dict(inflight=1),
+                dict(mstx_active=True),
+                dict(mstx_marker_attempts=1),
+            ):
+                with self.subTest(case=case, changed=changed), self.assertRaises(RuntimeError):
+                    profile.check_timing_status(dict(before, **changed), case, before)
+        for changed in (
+            dict(native=False),
+            dict(native_count=None),
+            dict(native_count=1),
+            dict(native_marker_errors=1),
+        ):
+            with self.subTest(changed=changed), self.assertRaises(RuntimeError):
+                profile.check_timing_status(dict(before, **changed), "native", before)
+
+    def test_live_profile_never_relaunches_rewarms_or_stops_timed_service(self):
+        for fail_request in (False, True):
+            with self.subTest(fail_request=fail_request), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                args = SimpleNamespace(
+                    port=8156,
+                    timing_port=18156,
+                    startup_timeout=60,
+                    max_tokens=5,
+                    warmup_requests=5,
+                    request_timeout=60,
+                    profile_timeout=60,
+                    profile_requests=2,
+                    min_profile_free_gib=5,
+                    bubble_stream_name="auto",
+                )
+                command = ["python", "--additional-config", '{"expert_offload_config":{}}']
+                child = Mock(pid=123)
+                child.poll.return_value = None
+                status = dict(
+                    pid=456, active=False, mstx_active=False, mstx_enabled=True, mstx_marker_attempts=0, inflight=0
+                )
+                sample = dict(digest="same", usage=dict(completion_tokens=5))
+                controls = []
+
+                def request(_opener, _port, path, *args, controls=controls, status=status, **kwargs):
+                    controls.append(path)
+                    if path == "/v1/models":
+                        return dict(data=[dict(id="model")])
+                    if path == "/status":
+                        return status
+                    if path in ("/clock/before", "/clock/after"):
+                        return dict(samples=[])
+                    if path == "/stop":
+                        return dict(mstx_errors=0, errors=0, dropped=0, count=6)
+                    return {}
+
+                def completion(*args, controls=controls, fail_request=fail_request, sample=sample, **kwargs):
+                    self.assertEqual(controls[-1], "/start")
+                    self.assertIn("/start_profile", controls)
+                    if fail_request:
+                        raise TimeoutError("profile request failed")
+                    return sample
+
+                stop, ports = Mock(), Mock()
+                with (
+                    patch.object(profile.subprocess, "Popen") as launch,
+                    patch.object(profile, "request", side_effect=request),
+                    patch.object(profile, "streaming_completion", side_effect=completion) as requests,
+                    patch.object(profile, "ensure_profile_storage"),
+                    patch.object(profile, "check_host_memory") as memory,
+                    patch.object(profile, "after_service_memory") as reclaim,
+                    patch.object(profile, "log_memory"),
+                    patch.object(profile, "wait_profile"),
+                    patch.object(profile, "discover_roots", return_value=[root / "profile/python/capture"]),
+                    patch.object(profile, "align_capture", return_value=dict(status="calibration_validated")),
+                    patch.object(profile, "publish_aligned_capture", return_value=dict(status="exported")),
+                    patch.object(profile, "analyze_profile", return_value=(dict(host_gaps=[]), "")),
+                    patch.object(profile, "report_profiles") as summary,
+                ):
+                    if fail_request:
+                        with self.assertRaisesRegex(TimeoutError, "profile request failed"):
+                            profile.profile_cases(
+                                args,
+                                {"python": command},
+                                root,
+                                {},
+                                lambda _: None,
+                                ports,
+                                stop,
+                                [("same", sample["usage"])],
+                                live_service=child,
+                                timing_status=status,
+                            )
+                    else:
+                        result = profile.profile_cases(
+                            args,
+                            {"python": command},
+                            root,
+                            {},
+                            lambda _: None,
+                            ports,
+                            stop,
+                            [("same", sample["usage"])],
+                            live_service=child,
+                            timing_status=status,
+                        )
+                        self.assertEqual(set(result), {"python"})
+                        self.assertEqual(requests.call_count, args.profile_requests)
+                        self.assertTrue((root / "python/profile_report.json").is_file())
+                    launch.assert_not_called()
+                    stop.assert_not_called()
+                    ports.assert_not_called()
+                    memory.assert_not_called()
+                    reclaim.assert_not_called()
+                    summary.assert_not_called()  # outer runner reports after closing the service
+                self.assertEqual(
+                    controls[-2:], ["/clock/after", "/stop_profile"] if not fail_request else ["/stop", "/stop_profile"]
+                )
+
     def test_full_submission_must_be_exercised_not_just_registered(self):
         with tempfile.TemporaryDirectory() as directory:
             log = Path(directory) / "native_full.log"
@@ -165,6 +298,17 @@ class NativeProfileTests(unittest.TestCase):
         self.assertEqual(collector.transport, "acl")
         counters.start.assert_called_once()
         counters.stop.assert_called_once()
+        counters.status.return_value = dict(active=False, count=17, marker_errors=2, inflight=0, marker_attempts=85)
+        status = collector.status()
+        self.assertFalse(status["active"])
+        self.assertEqual(status["native_count"], 17)
+        self.assertEqual(status["native_marker_errors"], 2)
+        self.assertEqual(status["mstx_marker_attempts"], 85)
+        counters.status.return_value.update(active=True, inflight=1)
+        status = collector.status()
+        self.assertTrue(status["active"])
+        self.assertTrue(status["mstx_active"])
+        self.assertEqual(status["inflight"], 1)
 
     def test_profile_config_leaves_timing_command_and_workload_unchanged(self):
         config = dict(
@@ -182,6 +326,9 @@ class NativeProfileTests(unittest.TestCase):
         self.assertEqual(observed["callback_timing_port"], 18156)
         self.assertNotIn("--profiler-config", original)
         self.assertIn("--profiler-config", modified)
+        repeated = profile.profile_command(modified, Path("profile/new"), 18157)
+        self.assertEqual(repeated.count("--profiler-config"), 1)
+        self.assertEqual(json.loads(repeated[-1])["torch_profiler_dir"], str(Path("profile/new")))
 
     def test_host_gaps_and_transpose_occupancy_are_both_reported(self):
         with tempfile.TemporaryDirectory() as directory:

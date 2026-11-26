@@ -292,6 +292,21 @@ class CallbackTimings:
             loading_stream=self.loading_stream,
         )
 
+    def status(self):
+        return dict(
+            backend=self.backend,
+            pid=os.getpid(),
+            active=self.active,
+            policy="LRC only",
+            transport=getattr(self, "transport", "torch"),
+            load_backend=getattr(self, "load_backend", "python"),
+            mstx_enabled=self.mstx is not None,
+            mstx_active=self.active and self.mstx is not None,
+            mstx_marker_attempts=self.marker_attempts,
+            inflight=self.inflight,
+            loading_stream=self.loading_stream,
+        )
+
     def serve(self, port, expert_trace=None, clock_device=None):
         collector = self
         clock_probe = None
@@ -312,22 +327,7 @@ class CallbackTimings:
                 if self.path != "/status":
                     self.respond(404, {"error": "unknown endpoint"})
                     return
-                self.respond(
-                    200,
-                    dict(
-                        backend=collector.backend,
-                        pid=os.getpid(),
-                        active=collector.active,
-                        policy="LRC only",
-                        transport=getattr(collector, "transport", "torch"),
-                        load_backend=getattr(collector, "load_backend", "python"),
-                        mstx_enabled=collector.mstx is not None,
-                        mstx_active=collector.active and collector.mstx is not None,
-                        mstx_marker_attempts=collector.marker_attempts,
-                        inflight=collector.inflight,
-                        loading_stream=collector.loading_stream,
-                    ),
-                )
+                self.respond(200, collector.status())
 
             def do_POST(self):
                 nonlocal clock_probe

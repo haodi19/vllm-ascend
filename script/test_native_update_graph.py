@@ -9,6 +9,9 @@ import time
 import traceback
 from pathlib import Path
 
+PROFILE_FIRST_GENERATION = 4
+PROFILE_STOP_GENERATION = 7
+
 
 def run(library_path, native_profile=False):
     import _vllm_ascend_lrc as native
@@ -62,8 +65,6 @@ def run(library_path, native_profile=False):
             activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
             experimental_config=torch_npu.profiler._ExperimentalConfig(mstx=True),
         )
-        profiler.start()
-        ranges.start()
     policy = native.Policy(1, 4, 32, 0.9, 1.0, 0.5, 0.3, 0.01, True)
     task = native.native_update_task(
         policy,
@@ -130,8 +131,20 @@ def run(library_path, native_profile=False):
     compute.synchronize()
     if done.value != 1:
         raise RuntimeError("capture unexpectedly executed native update")
+    if ranges is not None and (ranges.status()["marker_attempts"] or ranges.status()["count"]):
+        raise RuntimeError("native profiling was active before the measurement window")
     completions_under_gil = 0
     for generation, eid in enumerate((3, 3, 0, 1, 2, 3, 0, 1), start=2):
+        if ranges is not None:
+            if generation == PROFILE_FIRST_GENERATION:
+                profiler.start()
+                ranges.start()
+            elif generation == PROFILE_STOP_GENERATION:
+                measured = ranges.stop()
+                profiler.stop()
+                if measured["count"] != PROFILE_STOP_GENERATION - PROFILE_FIRST_GENERATION or measured["marker_errors"]:
+                    raise RuntimeError(f"native MSTX counts/errors unexpected: {measured}")
+            before_ranges = ranges.status()
         ids_device.fill_(eid)
         torch.npu.synchronize()
         with torch.npu.stream(compute):
@@ -150,16 +163,20 @@ def run(library_path, native_profile=False):
             sys.setswitchinterval(previous_interval)
         compute.synchronize()
         validate(generation, eid)
+        if ranges is not None:
+            after_ranges = ranges.status()
+            expected_delta = int(PROFILE_FIRST_GENERATION <= generation < PROFILE_STOP_GENERATION)
+            if after_ranges["inflight"] or after_ranges["count"] - before_ranges["count"] != expected_delta:
+                raise RuntimeError("native graph profiling gate/count mismatch")
+            delta = after_ranges["marker_attempts"] - before_ranges["marker_attempts"]
+            if (delta > 0) != bool(expected_delta) or after_ranges["marker_errors"]:
+                raise RuntimeError("native graph MSTX leaked outside active measurement window")
     graph.reset()
     session.end_device_access(stream_synchronized=True)
     session.stop()
     session.close()
     if ranges is not None:
-        measured = ranges.stop()
-        profiler.stop()
-        if measured["count"] != 9 or measured["marker_errors"]:
-            raise RuntimeError(f"native MSTX counts/errors unexpected: {measured}")
-        print(f"PASS native C MSTX while GIL held: {measured}", flush=True)
+        print(f"PASS native C MSTX same-graph inactive/active/inactive windows while GIL held: {measured}", flush=True)
     if not completions_under_gil:
         raise RuntimeError("all tasks finished before GIL bracket; GIL independence test inconclusive")
     print(

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Separate profile services: native C MSTX, same-capture clock alignment and gaps."""
+"""Gated MoE profiling, same-capture clock alignment and loading-stream gaps."""
 
 import contextlib
 import io
@@ -17,7 +17,7 @@ from inspect_native_profile_nesting import audit_host_nesting
 from moe_host_memory import after_service_memory, check_host_memory, log_memory
 from moe_tpot import streaming_completion
 from native_moe_artifacts import case_directory
-from run_verified_cpp_tests import ensure_profile_storage, request, wait_profile
+from run_verified_cpp_tests import check_uninstrumented_window, ensure_profile_storage, request, wait_profile
 from verify_memcpy_gaps import inspect_offload_trace
 
 MIN_BUBBLE_US = 10.0
@@ -93,6 +93,9 @@ def profile_command(command, directory, timing_port):
     config = json.loads(words[index])
     config["expert_offload_config"].update(callback_timing_port=timing_port, callback_mstx_enabled=True)
     words[index] = json.dumps(config)
+    if "--profiler-config" in words:
+        index = words.index("--profiler-config")
+        del words[index : index + 2]
     words.extend(
         [
             "--profiler-config",
@@ -100,6 +103,25 @@ def profile_command(command, directory, timing_port):
         ]
     )
     return words
+
+
+def check_timing_status(status, case, before=None):
+    """Require zero emitted markers, including native C ranges, in timed work."""
+    check_uninstrumented_window(status, before)
+    if type(status.get("pid")) is not int or status["pid"] <= 0:
+        raise RuntimeError("Missing timing collector process identity")
+    if before is not None and status["pid"] != before["pid"]:
+        raise RuntimeError("Timing collector process changed within the measured window")
+    if case in ("native", "native_full"):
+        if (
+            status.get("native") is not True
+            or type(status.get("native_count")) is not int
+            or status["native_count"] < 0
+            or status.get("native_marker_errors") != 0
+        ):
+            raise RuntimeError("Native timing requires current C++ profiling status counters")
+        if before is not None and status["native_count"] != before["native_count"]:
+            raise RuntimeError("Native task measurements were enabled during formal timing")
 
 
 def analyze_profile(trace, case, expected_count, stream_name, report):
@@ -193,28 +215,57 @@ def report_prefetch_overlap(root, report):
     return status
 
 
-def profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, expected_outputs):
-    """No profiler/MSTX configuration is added to either timed service."""
+def profile_cases(
+    args,
+    commands,
+    root,
+    env,
+    report,
+    wait_port_free,
+    stop_process_group,
+    expected_outputs,
+    *,
+    live_service=None,
+    timing_status=None,
+):
+    """Reuse a timed service; launch only for explicit saved-result continuation."""
+    if live_service is not None and len(commands) != 1:
+        raise ValueError("A live service can profile only its own case")
     repo = Path(__file__).resolve().parents[1]
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     profiles = {}
     for case, original in commands.items():
         artifacts = case_directory(root, case)
         directory = root / "profile" / case
-        directory.mkdir(parents=True)
+        directory.mkdir(parents=True, exist_ok=live_service is not None)
         ensure_profile_storage(
             directory, stage=f"before {case} profile service", min_free_gib=args.min_profile_free_gib
         )
-        wait_port_free(args.port)
-        wait_port_free(args.timing_port)
-        check_host_memory(f"before profile/{case}", report)
+        if live_service is None:
+            wait_port_free(args.port)
+            wait_port_free(args.timing_port)
+            check_host_memory(f"before profile/{case}", report)
         command = profile_command(original, directory, args.timing_port)
-        log_path = artifacts / "profile.log"
-        report(f"PROFILE_START {case}; separate diagnostic service; log={log_path}")
+        log_path = artifacts / ("profile.log" if live_service is None else "inference.log")
+        if live_service is not None:
+            parent_report = report
+
+            def report(message, parent_report=parent_report, artifacts=artifacts):
+                parent_report(message)
+                with (artifacts / "profile.log").open("a", encoding="utf-8") as phase_log:
+                    phase_log.write(message + "\n")
+
+        mode = "saved-result continuation" if live_service is None else "same service; no reload or second warmup"
+        report(f"PROFILE_START {case}; {mode}; log={log_path}")
         (artifacts / "profile_command.json").write_text(json.dumps(command), encoding="utf-8")
-        with log_path.open("w", encoding="utf-8") as log:
-            child = subprocess.Popen(
-                command, cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+        log_context = log_path.open("w", encoding="utf-8") if live_service is None else contextlib.nullcontext()
+        with log_context as log:
+            child = (
+                live_service
+                if live_service is not None
+                else subprocess.Popen(
+                    command, cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True
+                )
             )
             try:
                 deadline = time.monotonic() + args.startup_timeout
@@ -227,6 +278,10 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                         status = request(opener, args.timing_port, "/status", timeout=2)
                         if not status.get("mstx_enabled"):
                             raise RuntimeError("MSTX control not enabled")
+                        if live_service is not None:
+                            if timing_status is None:
+                                raise RuntimeError("Missing same-service formal timing status")
+                            check_timing_status(status, case, timing_status)
                         break
                     except (OSError, ValueError):
                         if time.monotonic() >= deadline:
@@ -242,8 +297,9 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                     temperature=0,
                     ignore_eos=True,
                 )
-                for _ in range(args.warmup_requests):
-                    streaming_completion(opener, args.port, body, timeout=args.request_timeout)
+                if live_service is None:
+                    for _ in range(args.warmup_requests):
+                        streaming_completion(opener, args.port, body, timeout=args.request_timeout)
                 request(opener, args.timing_port, "/clock/prepare", {}, timeout=args.profile_timeout)
                 request(opener, args.port, "/start_profile", {}, timeout=args.profile_timeout)
                 try:
@@ -291,10 +347,12 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
                     report(f"HOST_MEMORY_DIAGNOSTIC_FAILED {type(exc).__name__}: {exc}")
                 raise
             finally:
-                stop_process_group(child)
-                after_service_memory(f"after profile/{case}", report, child.pid, drop_cache=case == "python")
-        wait_port_free(args.port, timeout=10)
-        wait_port_free(args.timing_port, timeout=10)
+                if live_service is None:
+                    stop_process_group(child)
+                    after_service_memory(f"after profile/{case}", report, child.pid, drop_cache=case == "python")
+        if live_service is None:
+            wait_port_free(args.port, timeout=10)
+            wait_port_free(args.timing_port, timeout=10)
         captures = discover_roots([directory])
         if len(captures) != 1:
             raise RuntimeError(f"Expected one capture for {case}, got {len(captures)}")
@@ -317,6 +375,12 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
         ]
         profiles[case] = dict(scan=scan, mapping=mapping, aligned_profile=published, bubble_stats=bubble_stats)
         (artifacts / "profile_report.json").write_text(json.dumps(profiles[case]), encoding="utf-8")
+    if live_service is None:
+        report_profiles(profiles, root, report)
+    return profiles
+
+
+def report_profiles(profiles, root, report):
     report(f"PROFILE_COMPLETE cases={','.join(profiles)}; each profile output matched the saved timing reference")
     report("PROFILE_MEASUREMENT: Host gap = next task entry - previous task return; includes zero-load tasks.")
     report(
@@ -325,4 +389,3 @@ def profile_cases(args, commands, root, env, report, wait_port_free, stop_proces
     )
     report_gap_table(profiles, report)
     report_prefetch_overlap(root, report)
-    return profiles

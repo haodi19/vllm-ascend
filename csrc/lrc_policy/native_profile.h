@@ -15,6 +15,10 @@
 // MSTX C ABI: no py::object creation, Python callback, or GIL on the worker.
 class NativeRanges {
  public:
+  struct Status {
+    bool active;
+    uint64_t count, errors, inflight, marker_attempts;
+  };
   NativeRanges() {
 #ifdef _WIN32
     throw std::runtime_error("native MSTX requires Linux");
@@ -59,11 +63,16 @@ class NativeRanges {
     drained_.notify_all();
   }
   uint64_t begin(const std::string& name) {
+    { std::lock_guard<std::mutex> lock(mutex_); ++marker_attempts_; }
     const auto id = start_(name.c_str(), nullptr);
     if (!id) { std::lock_guard<std::mutex> lock(mutex_); ++errors_; }
     return id;
   }
   void end(uint64_t id) { if (id) end_(id); }
+  Status status() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {active_, count_, errors_, inflight_, marker_attempts_};
+  }
  private:
   using Start = uint64_t (*)(const char*, void*);
   using End = void (*)(uint64_t);
@@ -74,6 +83,7 @@ class NativeRanges {
   std::condition_variable drained_;
   bool active_ = false;
   uint64_t count_ = 0, errors_ = 0, inflight_ = 0;
+  uint64_t marker_attempts_ = 0;
 };
 
 class NativeRange {
