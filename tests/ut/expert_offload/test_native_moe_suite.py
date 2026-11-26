@@ -4,6 +4,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -23,13 +24,15 @@ class NativeSuiteTests(unittest.TestCase):
         (self.root / "script").mkdir()
         (self.root / "bin").mkdir()
         shutil.copyfile(ROOT / "script/run_native_moe_suite.sh", self.root / "script/run_native_moe_suite.sh")
-        (self.root / "script/run_native_moe_compare.py").touch()
+        for path in (ROOT / "script").glob("*.py"):
+            shutil.copyfile(path, self.root / "script" / path.name)
         self.output = self.root / "results_01"
         fake = self.root / "bin/python"
         fake.write_text(
             """#!/usr/bin/env bash
 set -eu
 if [[ $1 == -c ]]; then echo PYTHON=fixture; exit 0; fi
+if [[ ${3:-} == */summarize_native_moe_results.py ]]; then exec "ACTUAL_PYTHON" "$@"; fi
 case_name=; tokens=; out=; npu=
 while (($#)); do
   case "$1" in
@@ -48,14 +51,18 @@ esac
 for name in "${cases[@]}"; do
   mkdir "$out/$name"
   mkdir -p "$out/profile/$name"
-  echo "saved $name $tokens" > "$out/$name/timing_result.json"
+  cat > "$out/$name/timing_result.json" <<EOF
+{"case":"$name","requests":1,"output_match":true,"stream_samples":[
+{"digest":"same","usage":{"completion_tokens":$tokens},"completion_tokens":$tokens,
+"content_chunks":3,"decode_us":0,"ttft_us":3000,"output_latency_us":3000,"tpot_us":0,"http_wall_us":3100}]}
+EOF
   echo "trace $name $tokens" > "$out/profile/$name/trace.json"
 done
 printf 'case=%s tokens=%s npu=%s\n' "$case_name" "$tokens" "$npu" >> calls.txt
 echo "FAKE_RESULT case=$case_name tokens=$tokens" >> "$out/summary.txt"
 echo "LIVE tokens=$tokens"
 if [[ -f fail_token$tokens ]]; then exit 3; fi
-""",
+""".replace("ACTUAL_PYTHON", Path(sys.executable).as_posix()),
             encoding="utf-8",
             newline="\n",
         )
@@ -84,7 +91,7 @@ if [[ -f fail_token$tokens ]]; then exit 3; fi
             text=True,
             encoding="utf-8",
             timeout=15,
-            env=dict(os.environ),
+            env=dict(os.environ, PYTHONIOENCODING="utf-8"),
         )
 
     def calls(self):
@@ -111,10 +118,12 @@ if [[ -f fail_token$tokens ]]; then exit 3; fi
                     self.output / f"token{tokens}/profile/{case}/trace.json",
                 )
                 saved.update({path: path.read_bytes() for path in paths})
-        summary = (self.output / "summary.txt").read_text()
+        summary = (self.output / "summary.txt").read_text(encoding="utf-8")
         for case in ("python", "native", "native_full"):
             for tokens in (5, 128):
-                self.assertIn(f"FAKE_RESULT case={case} tokens={tokens}", summary)
+                self.assertIn(f"| {case} |", summary)
+                self.assertIn(f"[{tokens}]", summary)
+        self.assertNotIn("FAKE_RESULT", summary)
         self.assertEqual(len(self.calls()), 6)
         self.assertIn("BATCH_EXIT=0", summary)
         before = {p: p.read_bytes() for p in self.output.rglob("*") if p.is_file()}
@@ -137,10 +146,10 @@ if [[ -f fail_token$tokens ]]; then exit 3; fi
         self.wait_background()
         self.assertEqual(self.invoke("--case", "python", "--tokens", "128").returncode, 0)
         self.wait_background()
-        summary = (self.output / "summary.txt").read_text()
-        self.assertIn("FAKE_RESULT case=python tokens=5", summary)
-        self.assertIn("FAKE_RESULT case=python tokens=128", summary)
-        self.assertIn("BATCH_EXIT=1; LAST_JOB_EXIT=0", summary)
+        summary = (self.output / "summary.txt").read_text(encoding="utf-8")
+        self.assertIn("[5]", summary)
+        self.assertIn("[128]", summary)
+        self.assertIn("BATCH_EXIT=1", summary)
 
     def test_all_cases_run_both_token_counts_serially_and_combine_results(self):
         self.output.mkdir()
@@ -149,8 +158,8 @@ if [[ -f fail_token$tokens ]]; then exit 3; fi
         self.assertEqual(self.calls(), ["case=all tokens=5 npu=7", "case=all tokens=128 npu=7"])
         summary = (self.output / "summary.txt").read_text(encoding="utf-8")
         self.assertIn("BATCH_EXIT=0", summary)
-        self.assertIn("FAKE_RESULT case=all tokens=5", summary)
-        self.assertIn("FAKE_RESULT case=all tokens=128", summary)
+        self.assertIn("[5]", summary)
+        self.assertIn("[128]", summary)
 
     def test_single_case_and_token_selection_do_not_run_other_cases(self):
         for case in ("python", "native", "native_full"):

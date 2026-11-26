@@ -74,9 +74,9 @@ bash script/run_native_moe_suite.sh --case native_full --npu 6 \
   --output-root /home/w00919836/results/native_three_way_02
 ```
 
-仅测一种输出长度时，在相应命令追加 `--tokens 5` 或 `--tokens 128`。单组入口允许补上同一总目录中尚未运行的组或 token 长度；重复组（包括失败后留下的目录）会在启动前被拒绝。完整 `all/both` 入口仍要求新总目录。同一总目录用 `.suite.lock` 防止并发写入，后台结束时释放锁；`run.log` 和各 token 的摘要追加保留，根摘要每次重新汇总全部已有结果。
+仅测一种输出长度时，在相应命令追加 `--tokens 5` 或 `--tokens 128`。单组入口允许补上同一总目录中尚未运行的组或 token 长度；重复组（包括失败后留下的目录）会在启动前被拒绝。完整 `all/both` 入口仍要求新总目录。同一总目录用 `.suite.lock` 防止并发写入，后台结束时释放锁。运行输出追加到 `run.log` / `run_details.log`；各组、各 token 和根目录的 `summary.txt` 从已保存结果重新生成，每项只列一次，不拼接历史控制台输出。
 
-默认服务端口为 8156、独立计时端口为 18156；占用时传入 `--port` 和 `--timing-port`。批量入口沿用 5 GiB 剩余空间检查，profile 导出最多等 600 秒。结果位于根目录的 `token5/`、`token128/`；`status.txt` 逐组逐轮记录退出码。`BATCH_EXIT` 保留历史失败，`LAST_JOB_EXIT` 表示刚结束的任务；没有测完三组时不能作为完整对照。第一种长度失败后仍尝试第二种长度。
+默认服务端口为 8156、独立计时端口为 18156；占用时传入 `--port` 和 `--timing-port`。批量入口沿用 5 GiB 剩余空间检查，profile 导出最多等 600 秒。结果位于根目录的 `token5/`、`token128/`；`status.txt` 逐组逐轮记录退出码。`BATCH_EXIT` 保留历史失败，`run.log` 中的 `LAST_JOB_EXIT` 表示刚结束的任务；摘要分别标记计时、profile 和重统计的完整性，没有测完三组时不能作为完整对照。第一种长度失败后仍尝试第二种长度。
 
 每个 token 目录内，三组日志、命令与数据分别归档，三组可视化集中放在 `profile/`。例如：
 
@@ -87,8 +87,9 @@ native_three_way_01/
 ├── status.txt
 ├── token5/
 │   ├── summary.txt                 # 三组计时、Host 间隔、空泡及两种重统计方案
+│   ├── run_details.log             # 逐请求JSON、前置检查与失败详情
 │   ├── build.log
-│   ├── python/                     # inference.log、command.json、timing_result.json
+│   ├── python/                     # 本组summary.txt、inference.log、command.json、timing_result.json
 │   ├── native/                     # 同上，另含 profile.log、profile_counters.json 等
 │   ├── native_full/                # 每组均保留独立 profile 报告及 bubble_details.log
 │   ├── profile/
@@ -103,7 +104,7 @@ native_three_way_01/
 
 原 `run_native_moe_compare.py` 入口保留，可按 `--case`、`--max-tokens` 和 `--output-dir` 前台独立执行。计时阶段关闭 profiler/MSTX；profile 使用同次时钟对齐并自动识别加载流。`native_full` 必须同时出现原生图任务完成、共享 scale 校验和 `FULL_SUBMIT executed=` 记录，防止只注册但未执行新路径的测试被接受。
 
-每次完成 profile 后，脚本默认把以下分析追加到同一个 `summary.txt`，Python/native 分开运行时也一样，无需额外开关：
+每次任务结束后，脚本默认重新生成 `summary.txt`，Python/native 分开运行时也一样，无需额外开关。摘要包括以下已完成的分析；失败或缺失阶段单独标记，不补零，也不删除已完成的计时数据：
 
 - Host 函数与分项耗时，以及原始预取→按需间隔。
 - 计算相对于预取 Host 结束的早/晚、不确定、无法识别样本数量、占比和间隔均值。
@@ -111,6 +112,14 @@ native_three_way_01/
 - 两方案的保留样本数、均值及相对原始均值变化，分别保留直接判定和保守判定。早、不确定、无法识别样本保留原值，不另加 IQR 或时长截断。
 
 逐样本结果保存为 `prefetch_overlap.json`，详细解析输出为 `prefetch_overlap_details.log`。计算边界不足时明确输出 `OVERLAP_FAILED` 或部分覆盖状态，已有计时、间隔和 profile 保留；条件坐标估算继续标明顺序检查未通过，不能当成精确测量或新的 Decode 收益。`--skip-profile` 不产生这两种方案的数据，会明确标记缺失。
+
+旧摘要混入重复输出或失败堆栈时，等后台任务结束后执行下面一条命令即可整理，不重跑实验、不解析大 trace、不查询 NPU：
+
+```bash
+python -u -B script/summarize_native_moe_results.py /home/w00919836/results/native_three_way_02
+```
+
+命令直接打印核心表格，并更新根目录、各 token 和各组的 `summary.txt`。旧版原始摘要自动归档到同目录 `run_details.log`，各组 JSON、profile 和原日志不删除。返回根目录 `summary.txt` 即可；若只返回一组，可用对应的 `token5/native/summary.txt` 等文件。整理仅重排已有统计，缺失的 profile 或重统计不会自动补采。
 
 已完成的旧结果可直接离线补算，无需重新加载模型或采集：
 

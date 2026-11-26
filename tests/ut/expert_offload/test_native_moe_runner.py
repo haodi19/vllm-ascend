@@ -114,7 +114,7 @@ class NativeRunnerTests(unittest.TestCase):
                 self.assertEqual(requests, 3)  # warmup + two timed requests
                 self.assertEqual(list(profiles.call_args.args[1]), [case])
                 self.assertFalse(profiles.call_args.args[0].skip_profile)
-                text = (output / "summary.txt").read_text(encoding="utf-8")
+                text = (output / "run_details.log").read_text(encoding="utf-8")
                 rows = [json.loads(line[7:]) for line in text.splitlines() if line.startswith("RESULT ")]
                 self.assertEqual([row["case"] for row in rows], [case])
                 self.assertEqual(rows[0]["requests"], 2)
@@ -140,7 +140,7 @@ class NativeRunnerTests(unittest.TestCase):
             self.assertEqual(launched, ["python", "native", "native_full"])
             self.assertEqual(count, 9)
             self.assertEqual(list(profiles.call_args.args[1]), launched)
-            text = (output / "summary.txt").read_text(encoding="utf-8")
+            text = (output / "run_details.log").read_text(encoding="utf-8")
             self.assertIn("native_full vs native", text)
             self.assertIn("native_full vs python", text)
             self.assertEqual({p.name for p in output.iterdir() if p.is_dir()}, set(launched))
@@ -192,7 +192,7 @@ class NativeRunnerTests(unittest.TestCase):
             self.assertEqual(launched, ["python", "native"])
             self.assertEqual(requests, 6)
             self.assertEqual(list(profiles.call_args.args[1]), launched)
-            text = (output / "summary.txt").read_text(encoding="utf-8")
+            text = (output / "run_details.log").read_text(encoding="utf-8")
             self.assertIn("decode mean change=0.000%", text)
             self.assertNotIn("SINGLE_CASE_TIMING_COMPLETE", text)
 
@@ -201,7 +201,7 @@ class NativeRunnerTests(unittest.TestCase):
             code, output, _, _, profiles = self.run_mock_comparison(Path(temporary), "python", varied_outputs=True)
             self.assertEqual(code, 1)
             profiles.assert_not_called()
-            text = (output / "summary.txt").read_text(encoding="utf-8")
+            text = (output / "run_details.log").read_text(encoding="utf-8")
             self.assertIn("outputs/usage differ between timed requests", text)
             self.assertNotIn("RESULT ", text)
             self.assertTrue((output / "python/python_partial.json").is_file())
@@ -280,7 +280,7 @@ class NativeRunnerTests(unittest.TestCase):
                 config = json.loads(command[command.index("--additional-config") + 1])
                 self.assertEqual(config["expert_offload_config"]["num_device_experts"], 24)
             self.assertEqual((source / "summary.txt").read_bytes(), original)
-            summary = (output / "summary.txt").read_text(encoding="utf-8")
+            summary = (output / "run_details.log").read_text(encoding="utf-8")
             self.assertIn("TIMING_SOURCE=", summary)
             self.assertIn("| native |", summary)
             for case, command in commands.items():
@@ -334,7 +334,7 @@ class NativeRunnerTests(unittest.TestCase):
                 args, commands = profiles.call_args.args[:2]
                 self.assertEqual(list(commands), [case])
                 self.assertEqual(args.max_tokens, 5)
-                summary = (output / "summary.txt").read_text(encoding="utf-8")
+                summary = (output / "run_details.log").read_text(encoding="utf-8")
                 rows = [json.loads(line[7:]) for line in summary.splitlines() if line.startswith("RESULT ")]
                 self.assertEqual([row["case"] for row in rows], [case])
                 self.assertIn(f"cases={case}", summary)
@@ -483,7 +483,7 @@ class NativeRunnerTests(unittest.TestCase):
                 self.assertEqual(runner.main(), 1)
             popen.assert_not_called()
             run.assert_not_called()
-            self.assertIn("Port 8156 is unavailable", (output / "summary.txt").read_text(encoding="utf-8"))
+            self.assertIn("Port 8156 is unavailable", (output / "run_details.log").read_text(encoding="utf-8"))
 
     def test_service_failure_keeps_partial_samples_and_engine_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -538,7 +538,7 @@ class NativeRunnerTests(unittest.TestCase):
                 self.assertEqual(runner.main(), 1)
             popen.assert_not_called()
             run.assert_not_called()
-            self.assertIn("No closing quotation", (output / "summary.txt").read_text(encoding="utf-8"))
+            self.assertIn("No closing quotation", (output / "run_details.log").read_text(encoding="utf-8"))
 
     def test_handshake_configure_preserves_soc_and_sets_build_type(self):
         for soc in ("ascend950pr_957c", "ascend950dt_9582"):

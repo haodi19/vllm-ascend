@@ -29,11 +29,12 @@ from moe_host_memory import (
     log_memory,
 )
 from moe_tpot import streaming_completion, summarize_streams
-from native_moe_artifacts import case_directory, saved_case_file
+from native_moe_artifacts import case_directory, saved_case_file, saved_timing_records
 from native_moe_build import build_fingerprint, build_lock, cached_library, installed_artifacts, remember_build
 from native_moe_profile import report_native_scale_memory, verify_full_submit
 from run_host_sync_stage2 import target_cmake_args
 from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB
+from summarize_native_moe_results import SUMMARY_HEADER, rebuild, write_summary
 
 ROOT = Path(__file__).resolve().parents[1]
 PORT_RELEASE_TIMEOUT = 10
@@ -230,15 +231,7 @@ def timing_row(case, timing, e2e_mean_ms):
 
 def load_completed_timing_run(directory, port, required_cases=("python", "native")):
     """Read completed cases; never treat partial samples as a baseline."""
-    records, commands = {}, {}
-    with (directory / "summary.txt").open(encoding="utf-8") as source:
-        for line in source:
-            if line.startswith("RESULT "):
-                row = json.loads(line[len("RESULT ") :])
-                case = row["case"]
-                if case in records:
-                    raise ValueError(f"Duplicate timing result for {case}")
-                records[case] = row
+    records, commands = saved_timing_records(directory), {}
     if not set(required_cases) <= set(records) or not set(records) <= {"python", "native", "native_full"}:
         raise ValueError(f"Profile continuation requires completed timing results for {','.join(required_cases)}")
     reference = None
@@ -442,7 +435,8 @@ def main():
     prepare_output(root, cases, append_single_case=len(cases) == 1 and not args.profile_only_from)
     env = dict(os.environ, ASCEND_RT_VISIBLE_DEVICES=str(args.npu))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    summary = root / "summary.txt"
+    write_summary(root, SUMMARY_HEADER + "\nRUNNING: 本次任务尚未完成，实时输出见 run_details.log。\n")
+    summary = root / "run_details.log"
 
     def report(message):
         print(message, flush=True)
@@ -478,6 +472,7 @@ def main():
         with opener.open(req, timeout=timeout) as response:
             return json.load(response)
 
+    exit_code, error = 1, "任务未正常结束"
     try:
         report(f"RUNTIME_DEVICE: physical_npu={args.npu}; logical_npu=0")
         report(
@@ -489,7 +484,9 @@ def main():
                 f"PROFILE_STORAGE: minimum_free_gib={args.min_profile_free_gib:g}; checked before each profile service"
             )
         if args.profile_only_from:
-            return continue_profile(args, root, env, report)
+            exit_code = continue_profile(args, root, env, report)
+            error = "" if exit_code == 0 else "profile 补采未完成"
+            return exit_code
         report(
             f"CASES={','.join(cases)}; MTE weight updates; timed requests have no profiler/MSTX. "
             "python=Python MTE; native=current shared-scale baseline; "
@@ -590,6 +587,7 @@ def main():
                             report(line)
                     result = dict(
                         case=case,
+                        physical_npu=args.npu,
                         requests=len(samples),
                         mean_ms=means[case],
                         stream_samples=samples,
@@ -644,10 +642,23 @@ def main():
             profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, reference)
         else:
             report("OVERLAP_UNAVAILABLE: --skip-profile selected; no compute-boundary or Host interval samples")
+        exit_code, error = 0, ""
     except Exception as exc:
-        report(f"FAILED {type(exc).__name__}: {exc}")
-        return 1
-    return 0
+        exit_code, error = 1, f"{type(exc).__name__}: {exc}"
+        report(f"FAILED {error}")
+    finally:
+        active_cases = selected_cases(args.profile_case) if args.profile_only_from else cases
+        for case in active_cases:
+            (case_directory(root, case) / "run_status.json").write_text(
+                json.dumps(dict(exit_code=exit_code, error=error, job_cases=active_cases)), encoding="utf-8"
+            )
+        try:
+            rebuild(root)
+            print(f"SUMMARY_FILE={root / 'summary.txt'}", flush=True)
+        except Exception as exc:
+            report(f"SUMMARY_FAILED {type(exc).__name__}: {exc}; saved results retained")
+            exit_code = 1
+    return exit_code
 
 
 if __name__ == "__main__":

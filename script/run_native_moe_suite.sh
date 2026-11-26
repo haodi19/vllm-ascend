@@ -85,20 +85,11 @@ finish() {
   if [[ -f "$output_root/status.txt" ]] && grep -Eq 'exit=[1-9][0-9]*' "$output_root/status.txt"; then
     batch_code=1
   fi
-  {
-    printf 'BATCH_EXIT=%s; LAST_JOB_EXIT=%s; case=%s; physical_npu=%s; tokens=%s\n' \
-      "$batch_code" "$code" "$case_name" "$npu" "${tokens[*]}"
-    printf 'SCOPE=accumulated runs; untested groups are not a completed three-way comparison.\n'
-    [[ ! -f "$output_root/status.txt" ]] || cat "$output_root/status.txt"
-    for token_count in 5 128; do
-      printf '\n===== max_tokens=%s =====\n' "$token_count"
-      if [[ -f "$output_root/token${token_count}/summary.txt" ]]; then
-        cat "$output_root/token${token_count}/summary.txt"
-      else
-        printf 'No summary; this token count has no completed report. See run.log.\n'
-      fi
-    done
-  } >"$output_root/summary.txt"
+  if ! python -u -B "$repo/script/summarize_native_moe_results.py" "$output_root"; then
+    printf 'SUMMARY_FAILED; saved artifacts and run.log retained\n'
+    code=1
+    batch_code=1
+  fi
   printf 'BATCH_EXIT=%s; LAST_JOB_EXIT=%s; SUMMARY=%s/summary.txt\n' "$batch_code" "$code" "$output_root"
   rmdir "$output_root/.suite.lock"
   exit "$code"

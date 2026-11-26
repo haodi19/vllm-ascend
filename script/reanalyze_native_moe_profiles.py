@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 from export_moe_aligned_profile import aligned_trace_path
-from native_moe_artifacts import case_directory, saved_case_file
+from native_moe_artifacts import case_directory, saved_case_file, saved_timing_records
 from native_moe_profile import analyze_profile, report_gap_table
 from verify_memcpy_gaps import MAX_DISTRIBUTION_VALUES, read_copy_tracks
 
@@ -65,21 +65,25 @@ def list_streams(runs, report):
 
 
 def saved_case(root, case):
-    records = []
+    record = saved_timing_records(root, (case,)).get(case)
     physical_npus = set()
-    with (root / "summary.txt").open(encoding="utf-8") as source:
+    for name in ("run_details.log", "summary.txt"):
+        path = root / name
+        if not path.exists():
+            continue
+        source = path.read_text(encoding="utf-8", errors="replace").splitlines()
         for line in source:
-            if line.startswith("RESULT "):
-                row = json.loads(line[7:])
-                if row.get("case") == case:
-                    records.append(row)
             if line.startswith(("PROFILE_ONLY:", "RUNTIME_DEVICE:")):
                 match = re.search(r"physical_npu=(\d+)", line)
                 if match:
                     physical_npus.add(int(match[1]))
-    if len(records) != 1 or not records[0].get("output_match"):
+    # A profile-only continuation may run on a different NPU from its timing
+    # reference. Its local runtime log takes precedence over copied metadata.
+    if not physical_npus and record and record.get("physical_npu") is not None:
+        physical_npus.add(record["physical_npu"])
+    if not record or not record.get("output_match"):
         raise ValueError(f"{case}: missing or ambiguous saved timing reference")
-    reference = records[0].get("stream_samples", [])
+    reference = record.get("stream_samples", [])
     samples = json.loads(saved_case_file(root, case, "profile_samples.json").read_text(encoding="utf-8"))
     counters = json.loads(saved_case_file(root, case, "profile_counters.json").read_text(encoding="utf-8"))
     if not reference or not samples:
