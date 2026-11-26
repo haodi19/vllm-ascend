@@ -16,7 +16,7 @@ from verify_memcpy_gaps import MAX_DISTRIBUTION_VALUES, read_copy_tracks
 def saved_traces(runs):
     seen = set()
     for root in runs:
-        for case in ("python", "native", "native_full"):
+        for case in ("python", "native", "native_full", "native_pipeline"):
             directory = root / "profile" / case
             if not directory.is_dir():
                 continue

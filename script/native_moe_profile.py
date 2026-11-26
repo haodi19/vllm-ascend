@@ -112,7 +112,7 @@ def check_timing_status(status, case, before=None):
         raise RuntimeError("Missing timing collector process identity")
     if before is not None and status["pid"] != before["pid"]:
         raise RuntimeError("Timing collector process changed within the measured window")
-    if case in ("native", "native_full"):
+    if case in ("native", "native_full", "native_pipeline"):
         if (
             status.get("native") is not True
             or type(status.get("native_count")) is not int
@@ -323,18 +323,23 @@ def profile_cases(
                 wait_profile(directory, args.profile_timeout)
                 if counters["mstx_errors"] or counters["errors"] or counters["dropped"] or not counters["count"]:
                     raise RuntimeError(f"Incomplete Host ranges: {counters}")
+                if case == "native_pipeline" and (
+                    counters.get("pipeline") is not True or counters.get("pipeline_jobs") != counters["count"]
+                ):
+                    raise RuntimeError("Pipeline planning/DMA counts differ; refusing incomplete profile")
                 if any((s["digest"], s["usage"]) != expected_outputs[0] for s in samples):
                     raise RuntimeError("Profile output differs from timed requests")
                 if case in (
                     "native",
                     "native_full",
+                    "native_pipeline",
                 ) and "first native graph task completed without Python" not in log_path.read_text(
                     encoding="utf-8", errors="replace"
                 ):
                     raise RuntimeError("Native profile did not execute native graph tasks")
-                if case in ("native", "native_full"):
+                if case in ("native", "native_full", "native_pipeline"):
                     report_native_scale_memory(log_path, report)
-                    if case == "native_full":
+                    if case in ("native_full", "native_pipeline"):
                         verify_full_submit(log_path)
             except Exception as error:
                 try:
@@ -383,6 +388,11 @@ def profile_cases(
 def report_profiles(profiles, root, report):
     report(f"PROFILE_COMPLETE cases={','.join(profiles)}; each profile output matched the saved timing reference")
     report("PROFILE_MEASUREMENT: Host gap = next task entry - previous task return; includes zero-load tasks.")
+    if "native_pipeline" in profiles:
+        report(
+            "PIPELINE_SCOPE: Host=planning+enqueue; DMA stages on separate thread, no Host synchronize. "
+            "Bubbles use full capture; callback-window direction matching is unavailable for asynchronous DMA."
+        )
     report(
         "Loading bubbles: same-capture runtime loading stream (or explicit legacy name), "
         "all tasks including Transpose, 10<=gap<5000us."

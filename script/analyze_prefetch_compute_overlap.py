@@ -55,7 +55,11 @@ def bind_streams(data, *, retain_unmapped=False):
         for ordinal, ((publish, wait), host) in enumerate(zip(pairs, data["groups"][kind])):
             publish_overrun = publish["start"] - host["start"]
             wait_shortfall = host["end"] - wait["end"]
-            valid = publish_overrun <= ORDER_US and wait_shortfall <= ORDER_US
+            pipeline = host["context"].get("pipeline") == "1"
+            # Pipeline enqueue must BEGIN before device completion. Its return
+            # and Host marker tail can follow completion; they are not fences.
+            completion_shortfall = host["enqueue"]["start"] - wait["end"] if pipeline else wait_shortfall
+            valid = publish_overrun <= ORDER_US and completion_shortfall <= ORDER_US
             publish["host_coverage_valid"] = valid
             check = dict(
                 kind=kind,
@@ -66,7 +70,11 @@ def bind_streams(data, *, retain_unmapped=False):
                 valid=valid,
                 publish_start_minus_host_start_us=publish_overrun,
                 host_end_minus_wait_end_us=wait_shortfall,
-                sync_end_minus_wait_end_us=host["sync"]["end"] - wait["end"],
+                sync_end_minus_wait_end_us=host["sync"]["end"] - wait["end"] if host["sync"] else None,
+                order_basis="publish-before-host and enqueue-start-before-device-ready"
+                if pipeline
+                else "synchronous-host-return",
+                enqueue_start_minus_wait_end_us=completion_shortfall if pipeline else None,
                 host_duration_us=host["duration"],
                 wait_duration_us=wait["duration"],
                 publish_ids=publish.get("ids", {}),
@@ -292,11 +300,12 @@ def host_stage_durations(hosts, stages):
         durations = {"host_callback": host["duration"]}
         for stage in ("update_weights", "load_submit", "copy_submit", "synchronize"):
             entries = parts.get(stage, [])
+            async_submit = host["context"].get("pipeline") == "1" and stage in ("load_submit", "copy_submit")
             valid = (
                 len(entries) == 1
-                and entries[0]["tid"] == host["tid"]
+                and (async_submit or entries[0]["tid"] == host["tid"])
                 and all(entries[0]["meta"].get(k) == host["context"].get(k) for k in ("kind", "layer", "rows"))
-                and host["start"] <= entries[0]["start"] <= entries[0]["end"] <= host["end"]
+                and (async_submit or host["start"] <= entries[0]["start"] <= entries[0]["end"] <= host["end"])
             )
             durations[stage] = entries[0]["end"] - entries[0]["start"] if valid else None
         result[call] = durations
@@ -328,7 +337,9 @@ def analyze(
     if Path(mapping["aligned_trace"]).resolve() != path.resolve():
         raise ValueError("alignment metadata refers to a different trace")
     origin = Decimal(mapping["trace_origin_us"]) if exact_relative else None
-    data = read_trace(path, time_origin=origin) if exact_relative else read_trace(path)
+    pipeline = bool(profile_report and profile_report.get("pipeline"))
+    read_options = dict(allow_pipeline=True) if pipeline else {}
+    data = read_trace(path, time_origin=origin, **read_options) if exact_relative else read_trace(path, **read_options)
     if profile_report is not None and profile_report.get("count") != data["host_count"]:
         raise ValueError("saved counters and trace Host counts differ")
     # Invalid Host identities/nesting still reject the capture. Cross-clock

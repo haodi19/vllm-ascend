@@ -602,7 +602,7 @@ class ExpertOffloadManager:
                 dtype = torch.uint8
                 target_layout = apply_mxfp4_weight_scale_layout(dev_tensor[0].view(torch.uint8))
                 per_expert_shape = tuple(target_layout.shape)
-                if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full"):
+                if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full", "native_pipeline"):
                     native_template = target_layout
             else:
                 per_expert_shape = (dev_tensor[0].numel(),)
@@ -827,7 +827,7 @@ class ExpertOffloadManager:
             "hot_preload=%.1fs prefill_pool=%.1fs gate=%.1fs | total=%.1fs",
             t2 - t1, t3 - t2, t4 - t3, t5 - t4, t_hot - t5, t6 - t_hot,
             t7 - t6, t7 - t0)
-        if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full"):
+        if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full", "native_pipeline"):
             from vllm_ascend.expert_offload.native_update import NativeUpdateRuntime
             self._native_update = NativeUpdateRuntime(self, _expert_weight)
         if self.offload_config.callback_timing_port:
@@ -1450,7 +1450,7 @@ class ExpertOffloadManager:
             src_t = getattr(pool_layer, src)
             dtype = dtype_override if dtype_override is not None else src_t.dtype
             shape = (ntotal,) + tuple(src_t.shape[1:])
-            if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full"):
+            if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full", "native_pipeline"):
                 from vllm_ascend.expert_offload.native_update import dense_span
                 elements = dense_span(src_t.shape[1:], src_t.stride()[1:])
                 # Match the decode slot's dense layout, with tightly packed
@@ -1942,6 +1942,12 @@ class ExpertOffloadManager:
             else:
                 # Profile run or pool not ready — bail out gracefully
                 return 0
+
+        native = getattr(self, "_native_update", None)
+        if native is not None and native.pipeline is not None and _EXTRA_CTX.capturing:
+            from vllm_ascend.expert_offload.native_pipeline import update_and_prefetch
+            update_and_prefetch(native, layer_idx, topk_ids, topk_weights, hidden_states)
+            return 0
 
         prune_debug = None
         if (self.offload_config.experts_pruning_enabled
@@ -2460,7 +2466,7 @@ class ExpertOffloadManager:
             "across %d EP ranks", len(shared_sources), self.ep_size)
 
     def _quant_copy_views(self, source, destination):
-        if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full"):
+        if getattr(self.offload_config, "host_update_backend", "python") in ("native", "native_full", "native_pipeline"):
             from vllm_ascend.expert_offload.native_update import scale_copy_views
             # Native config permits only local CPU -> base-format NPU scales.
             # Preserve Tensor semantics if another quantization needs a cast.
@@ -3666,6 +3672,10 @@ class ExpertOffloadManager:
         of the tuple _stage_predicted_topk returns, and they are unpacked
         inside _dispatch_prefetch.
         """
+        native = getattr(self, "_native_update", None)
+        if native is not None and native.pipeline is not None and _EXTRA_CTX.capturing:
+            # The captured demand path already predicted/published before its wait.
+            return
         if not self.offload_config.expert_prefetch_enabled:
             return
         if self._skip_prefill:

@@ -13,6 +13,32 @@ from unittest.mock import patch
 
 
 class VerifyMemcpyGapsTests(unittest.TestCase):
+    def test_pipeline_uses_full_device_window_without_host_window_attribution(self):
+        rows = self.metadata() + [self.copy(20, 5), self.copy(100, 5)]
+        rows.append(
+            dict(
+                ph="X",
+                pid="host",
+                tid="planner",
+                ts=1,
+                dur=3,
+                name="moe_offload/host_callback|call=1|kind=reactive|layer=0|rows=1|pipeline=1",
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trace_view.json"
+            path.write_text(json.dumps(rows))
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertTrue(self.module.inspect_offload_trace(path, "Stream 56", 10, 5000))
+            text = output.getvalue()
+            stats = [
+                json.loads(line.split(" ", 1)[1]) for line in text.splitlines() if line.startswith("TARGET_GAPS_US ")
+            ]
+            self.assertEqual([row["scope"] for row in stats], ["full_capture"])
+            self.assertNotIn("TARGET_DIRECTION_GAPS_US", text)
+            self.assertEqual(stats[0]["kept"]["mean"], 75.0)
+
     @classmethod
     def setUpClass(cls):
         root = Path(__file__).resolve().parents[3]

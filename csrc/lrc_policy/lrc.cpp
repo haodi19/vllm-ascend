@@ -362,9 +362,11 @@ class Policy {
 };
 
 #include "native_update.h"
+#include "native_pipeline.h"
 
 PYBIND11_MODULE(_vllm_ascend_lrc, m) {
   bind_native_update(m);
+  bind_native_pipeline(m);
   m.attr("api_version") = 3;
   py::class_<LoadSubmitMigration>(m, "LoadSubmitMigration")
       .def(py::init<py::object, py::object, py::object>())

@@ -1017,7 +1017,7 @@ class ExpertOffloadConfig:
         # Opt-in single-card graph handoff. Default preserves ACL callbacks.
         "host_sync_backend": "callback",
         # Experimental GIL-free MTE graph callbacks; default preserves Python.
-        "host_update_backend": "python",  # python / native / native_full
+        "host_update_backend": "python",  # python / native / native_full / native_pipeline
         # MTE load submission; ordinary is the validated late-wait experiment baseline.
         # ordinary selects torch_npu.npu.Stream; completion waits remain mandatory.
         "host_sync_load_stream": "ordinary",  # ordinary / sync_launch; MTE only

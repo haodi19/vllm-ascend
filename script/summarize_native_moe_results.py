@@ -220,15 +220,23 @@ def render_overlap(results, report):
 
 def render(root, data, cases=CASES):
     timings, profiles, overlaps, states = data
+    if cases == CASES:
+        pipeline_run = "native_pipeline" in timings or (root / "native_pipeline").exists()
+        cases = tuple(c for c in CASES if c != "native_full" or c in timings) if pipeline_run else CASES[:3]
     lines = [
         SUMMARY_HEADER,
         f"RUN={root}",
-        "python=Python MTE；native=原生 Host 更新；native_full=完整原生提交优化。",
+        "python=Python MTE；native=原生 Host 更新；native_full=完整原生提交；native_pipeline=提前预测+独立 DMA 队列。",
         "仅汇总已保存结果，不重跑、不读大 trace。缺失/失败阶段不补零；已完成计时与失败的 profile 分开标注。",
         table(["组", "正式计时", "Host/加载流采集", "两种重统计", "状态说明"], [s for s in states if s[0] in cases]),
         "\n正式请求：profiler/MSTX 关闭；Decode=首个至最后内容，TPOT=Decode/(实际输出token−1)。"
         "单位ms，TPOT为ms/token。",
     ]
+    if "native_pipeline" in cases:
+        lines.append(
+            "native_pipeline：Host 回调仅含规划+入队，DMA 提交另线程统计；空泡仅使用全采集窗口，"
+            "异步 DMA 不按 Host 回调窗口判定方向。Host 缩短不等同于 Decode 收益。"
+        )
     rows = []
     for case in cases:
         row = timings.get(case)

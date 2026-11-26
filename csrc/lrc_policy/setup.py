@@ -14,7 +14,7 @@ setup(
         Pybind11Extension(
             "_vllm_ascend_lrc",
             ["lrc.cpp"],
-            depends=["load_submit.h", "native_update.h", "native_task.h", "native_profile.h"],
+            depends=["load_submit.h", "native_update.h", "native_task.h", "native_profile.h", "native_pipeline.h"],
             libraries=["dl"] if sys.platform.startswith("linux") else [],
             cxx_std=17,
             extra_compile_args=["/O2", "/fp:strict"] if os.name == "nt" else ["-O3", "-ffp-contract=off", "-pthread"],

@@ -422,6 +422,13 @@ class MteHostDispatcher:
             self.wait_states_h = torch.empty((self.SLOT_CAPACITY, 4), dtype=torch.int64, pin_memory=True)
         torch.npu.synchronize()
         self.state_base = self.states.data_ptr()
+        native = getattr(manager, "_native_update", None)
+        self.pipeline = getattr(native, "pipeline", None)
+        self.pipeline_indices = {}
+        if self.pipeline is not None:
+            self.pipeline_ready = torch.zeros_like(self.states)
+            self.pipeline_completed = torch.zeros((self.SLOT_CAPACITY, 4), dtype=torch.int64, pin_memory=True)
+            torch.npu.synchronize()
         if getattr(manager, "_native_update", None) is not None and not hasattr(hs.Session, "install_native_task"):
             raise RuntimeError("rebuild csrc/host_sync for native updates")
         self.session = hs.Session(slots=self.SLOT_CAPACITY, backend="acl", device_id=torch.npu.current_device())
@@ -429,6 +436,7 @@ class MteHostDispatcher:
         if info["protocol_version"] != 1 or info["slot_stride"] != 1024 or info["done_offset"] != 512:
             raise RuntimeError("Unsupported MTE control-memory layout")
         self.stride, self.done_offset = info["slot_stride"], info["done_offset"]
+        self.signal_host_address = info["host_address"]
         for slot in range(self.SLOT_CAPACITY):
             self.session.register_task(slot, lambda slot=slot: self._run(slot))
         self.allocated_scan = configure_mte_worker(self.session, manager.offload_config)
@@ -687,7 +695,7 @@ class MteHostDispatcher:
         lines.append("[MOE-MTE DIAGNOSTIC END]")
         print("\n".join(lines), file=sys.stderr, flush=True)
 
-    def _publish_task(self, stream, callback, args):
+    def _publish_task(self, stream, callback, args, dependency=-1):
         if getattr(self, "join_capture_failed", False):
             raise RuntimeError("cannot publish after failed MTE join capture")
         if self.closed or self.next_slot >= self.SLOT_CAPACITY:
@@ -696,7 +704,19 @@ class MteHostDispatcher:
         self.entries[slot] = (callback, args)
         native = getattr(getattr(self, "manager", None), "_native_update", None)
         if native is not None:
-            self.session.install_native_task(slot, native.task(args))
+            task = native.task(args)
+            if self.pipeline is not None:
+                task, index = native.native.native_pipeline_task(
+                    task,
+                    self.pipeline,
+                    self.signal_host_address + slot * self.stride,
+                    self.pipeline_ready[slot].data_ptr(),
+                    self.pipeline_completed[slot].data_ptr(),
+                    args[2].log2phy.data_ptr(),
+                    dependency,
+                )
+                self.pipeline_indices[slot] = index
+            self.session.install_native_task(slot, task)
         if self.allocated_scan:
             # Publish the initialized entry's range before any device request.
             # Older captured graphs keep their slots inside the growing prefix.
@@ -711,6 +731,25 @@ class MteHostDispatcher:
         state = self.state_base + slot * self.STATE_BYTES
         self.publish(pointer, request, state)
         return slot, pointer, request, state
+
+    def _completion_address(self, slot, request):
+        if self.pipeline is not None:
+            return self.pipeline_ready[slot].data_ptr()
+        return request + self.done_offset
+
+    def publish_pipeline_demand(self, stream, args):
+        if self.pipeline is None:
+            raise RuntimeError("pipeline demand requires native_pipeline")
+        return self._publish_task(stream, None, args)
+
+    def wait_pipeline_demand(self, token):
+        slot, pointer, request, state = token
+        # npu_stream drains Torch's Host submission queue. Prediction/D2H/event
+        # nodes added since publish must reach the graph BEFORE this ACL wait.
+        current = int(self.torch.npu.current_stream().npu_stream)
+        if current != pointer:
+            raise RuntimeError("pipeline demand wait must use its original compute stream")
+        self.wait(pointer, self._completion_address(slot, request), state)
 
     def launch(self, stream, callback, args):
         slot, pointer, request, state = self._publish_task(stream, callback, args)
@@ -739,7 +778,7 @@ class MteHostDispatcher:
                 )
             torch_npu.npu._launch_host_func(stream, self._report_wait_completion, slot)
         else:
-            self.wait(pointer, request + self.done_offset, state)
+            self.wait(pointer, self._completion_address(slot, request), state)
 
     @contextmanager
     def prefetch_join_capture(self):
@@ -784,12 +823,12 @@ class MteHostDispatcher:
             flush=True,
         )
 
-    def publish_for_join(self, stream, callback, args):
+    def publish_for_join(self, stream, callback, args, dependency=-1):
         if self.join_capture_failed or self.join_capture is None:
             raise RuntimeError("split MTE publish requires an active full capture")
         if stream != self.manager._prefetch_stream:
             raise RuntimeError("split MTE publish requires the prefetch stream")
-        slot, pointer, request, state = self._publish_task(stream, callback, args)
+        slot, pointer, request, state = self._publish_task(stream, callback, args, dependency)
         token = object()
         self.deferred_waits[token] = (self.join_capture, slot, pointer, request, state)
         self.join_published_slots.append(slot)
@@ -807,17 +846,17 @@ class MteHostDispatcher:
         _, slot, pointer, request, state = record
         if stream != self.manager._prefetch_stream or int(stream.npu_stream) != pointer:
             raise RuntimeError("MTE join wait must use its original prefetch stream")
-        self.wait(pointer, request + self.done_offset, state)
+        self.wait(pointer, self._completion_address(slot, request), state)
         del self.deferred_waits[token]
         self.joined_slots.append(slot)
         return slot
 
-    def defer_prefetch(self, stream, callback, args, layer_idx, destination, source):
+    def defer_prefetch(self, stream, callback, args, layer_idx, destination, source, dependency=-1):
         # The manager shares prefetch staging buffers. Never allow a second
         # producer to overwrite them before the first target's join.
         if self.deferred_prefetch or self.deferred_waits:
             raise RuntimeError("MTE prefetch staging buffers still have an unjoined producer")
-        token = self.publish_for_join(stream, callback, args)
+        token = self.publish_for_join(stream, callback, args, dependency)
         self.deferred_prefetch[layer_idx] = (token, destination, source, None, stream)
         self._log_wait_placement("publish", layer=layer_idx, slot=self.deferred_waits[token][1])
         if getattr(self.manager.offload_config, "host_sync_diagnose_prefetch_wait_before_gate", False):
@@ -848,7 +887,8 @@ class MteHostDispatcher:
         with self.torch.npu.stream(prefetch_stream):
             prefetch_stream.wait_event(gate)
             slot = self.wait_for_join(prefetch_stream, token) if early_slot is None else early_slot
-            destination.copy_(source, non_blocking=True)
+            if self.pipeline is None:
+                destination.copy_(source, non_blocking=True)
             done = prefetch_stream.record_event()
             self.join_events.append(done)
         del self.deferred_prefetch[layer_idx]
@@ -928,6 +968,8 @@ class MteHostDispatcher:
         diagnosed = False
         while not self.stopping.wait(1):
             try:
+                if self.pipeline is not None:
+                    self.pipeline.check_progress(self.STALL_SECONDS)
                 now = time.monotonic()
                 for slot in range(1, self.next_slot):
                     state = self.session.snapshot(slot)
@@ -955,6 +997,8 @@ class MteHostDispatcher:
         self.torch.npu.synchronize()
         self.stopping.set()
         self.watchdog.join()
+        if self.pipeline is not None:
+            self.pipeline.close()
         self.session.end_device_access(stream_synchronized=True)
         self.session.stop()
         self.session.close()

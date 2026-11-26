@@ -29,6 +29,8 @@ def capture(root, case, *, bad_tail=False, saved_reference=True):
 
     def host(kind, layer, call, start, end):
         suffix = f"|backend=cpp|kind={kind}|layer={layer}|rows=3|call={call}"
+        if case == "native_pipeline":
+            suffix += "|pipeline=1"
         for stage, a, b in (
             ("host_callback", start, end),
             ("update_weights", start + 0.1, end - 0.05),
@@ -36,7 +38,13 @@ def capture(root, case, *, bad_tail=False, saved_reference=True):
             ("copy_submit", start + 0.3, start + 0.5),
             ("synchronize", start + 1, end - 0.1),
         ):
-            add("moe_offload/" + stage + suffix, a, b, "worker", "host")
+            tid = "worker"
+            if case == "native_pipeline":
+                if stage == "synchronize":
+                    stage = "pipeline_enqueue"
+                elif stage in ("load_submit", "copy_submit"):
+                    tid = "dma"
+            add("moe_offload/" + stage + suffix, a, b, tid, "host")
 
     def handshake(tid, pub, wait, end):
         add("host_sync_publish_1", pub, pub + 1, tid)
@@ -85,8 +93,10 @@ def capture(root, case, *, bad_tail=False, saved_reference=True):
     )
     (root / f"{case}_profile_samples.json").write_text(json.dumps([sample]), encoding="utf-8")
     counters = dict(count=5, mstx_errors=0, errors=0, dropped=0, mstx_enabled=True)
-    if case in ("native", "native_full"):
+    if case in ("native", "native_full", "native_pipeline"):
         counters.update(native=True, groups=[])
+        if case == "native_pipeline":
+            counters.update(pipeline=True, pipeline_jobs=5)
     else:
         counters.update(
             load_backend="python",
@@ -101,6 +111,36 @@ def capture(root, case, *, bad_tail=False, saved_reference=True):
 
 
 class NativePrefetchOverlapTests(unittest.TestCase):
+    def test_pipeline_has_enqueue_boundary_and_separate_dma_thread(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = capture(Path(temp), "native", saved_reference=False)
+            payload = json.loads(path.read_text(), parse_float=Decimal)
+            for event in payload["traceEvents"]:
+                name = event.get("name", "")
+                if not name.startswith("moe_offload/"):
+                    continue
+                event["name"] += "|pipeline=1"
+                if "/synchronize|" in name:
+                    event["name"] = event["name"].replace("/synchronize|", "/pipeline_enqueue|")
+                if "/load_submit|" in name or "/copy_submit|" in name:
+                    event["tid"] = "dma"
+            text = json.dumps(payload, default=str)
+            text = re.sub(r'"(ts|dur)": "([0-9.]+)"', r'"\1": \2', text)
+            path.write_text(text)
+            self.assertTrue(read_trace(path, time_origin=Decimal("1795507048074000.043"))["issues"])
+            result = runner.analyze(
+                path,
+                profile_report=dict(count=5, pipeline=True),
+                update_backend="native",
+                exact_relative=True,
+                retain_unmapped=True,
+            )
+            self.assertEqual(result["host_timings"]["all"]["load_submit"]["count"], 5)
+            self.assertEqual(result["host_timings"]["all"]["synchronize"]["count"], 0)
+            self.assertEqual(result["classification"]["unmapped"]["count"], 0)
+            self.assertEqual(len(result["mte_order_checks"]), 5)
+            self.assertTrue(all(row["sync_end_minus_wait_end_us"] is None for row in result["mte_order_checks"]))
+
     def test_profile_pipeline_automatically_reports_both_methods_for_single_and_combined_runs(self):
         for cases in (
             ("python",),

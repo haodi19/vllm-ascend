@@ -45,7 +45,12 @@ def comparison_rows(left, right):
 def render_host_times(results, report):
     report("HOST_FUNCTION_TIMES：全部Host任务（含首尾及零加载），不受早/晚分类筛选；阶段嵌套，不能相加。")
     report("每格为有效n/应有n；原始均值μs；3×IQR后n/均值μs。缺失标记不当作0，明细与原始统计保留在JSON。")
-    cases = tuple(c for c in ("python", "native", "native_full") if c in results)
+    cases = tuple(c for c in ("python", "native", "native_full", "native_pipeline") if c in results)
+    if "native_pipeline" in cases:
+        report(
+            "native_pipeline 的 host_callback/update_weights 仅含规划与入队；"
+            "load_submit/copy_submit 在独立 DMA 线程，synchronize 不再执行。不能把 Host 缩短直接当作性能收益。"
+        )
     rows = []
     for kind, label in (("all", "全部"), ("prefetch", "预取"), ("reactive", "按需")):
         for stage in ("host_callback", "update_weights", "load_submit", "copy_submit", "synchronize"):
@@ -228,7 +233,13 @@ def render(results, report):
             restats,
         )
     )
-    for left, right in (("python", "native"), ("python", "native_full"), ("native", "native_full")):
+    for left, right in (
+        ("python", "native"),
+        ("python", "native_full"),
+        ("native", "native_full"),
+        ("native", "native_pipeline"),
+        ("python", "native_pipeline"),
+    ):
         if left in results and right in results:
             report(f"PAIR_COMPARISON {right} vs {left}")
             render_pair(results, report, left, right)
@@ -305,7 +316,7 @@ def reanalyze(runs, output, report):
                 raise ValueError("Python/native saved output references differ")
             reference = expected
             counters = json.loads(saved_case_file(root, case, "profile_counters.json").read_text(encoding="utf-8"))
-            if bool(counters.get("native")) != (case in ("native", "native_full")):
+            if bool(counters.get("native")) != (case in ("native", "native_full", "native_pipeline")):
                 raise ValueError(f"{case}: saved counters do not identify the expected update backend")
             report(f"START {case}: physical_npu={device}; trace={trace}")
             details.write(f"CASE={case}\n")

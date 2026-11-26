@@ -129,6 +129,22 @@ def validate_native_components(library, args, step):
         ],
         timeout=180,
     )
+    if args.case in ("pipeline", "native_pipeline"):
+        step(
+            "pipeline API check",
+            [
+                sys.executable,
+                "-c",
+                "import _vllm_ascend_lrc as l; assert hasattr(l,'native_pipeline_task'); "
+                "assert hasattr(l,'NativePipeline')",
+            ],
+        )
+        step("pipeline CPU queue regression", [sys.executable, "-B", "tests/ut/expert_offload/test_native_pipeline.py"])
+        step(
+            "NPU early-prediction pipeline correctness and GIL independence",
+            [sys.executable, "-B", "script/test_native_pipeline_graph.py", "--library", str(library)],
+            timeout=180,
+        )
 
 
 def prepare_native_components(args, env, step, report):
@@ -202,6 +218,8 @@ def report_failed_step(log_path, start_offset, report):
 
 
 def selected_cases(case):
+    if case == "pipeline":
+        return ("python", "native", "native_pipeline")
     if case == "all":
         return ("python", "native", "native_full")
     return ("python", "native") if case == "both" else (case,)
@@ -240,7 +258,12 @@ def timing_row(case, timing, e2e_mean_ms):
 def load_completed_timing_run(directory, port, required_cases=("python", "native")):
     """Read completed cases; never treat partial samples as a baseline."""
     records, commands = saved_timing_records(directory), {}
-    if not set(required_cases) <= set(records) or not set(records) <= {"python", "native", "native_full"}:
+    if not set(required_cases) <= set(records) or not set(records) <= {
+        "python",
+        "native",
+        "native_full",
+        "native_pipeline",
+    }:
         raise ValueError(f"Profile continuation requires completed timing results for {','.join(required_cases)}")
     reference = None
     for case in required_cases:
@@ -375,9 +398,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--case",
-        choices=("all", "both", "python", "native", "native_full"),
+        choices=("all", "both", "pipeline", "python", "native", "native_full", "native_pipeline"),
         default="all",
-        help="Run Python MTE, native baseline and native_full (default); both preserves the original two cases",
+        help="all: Python/native/native_full; pipeline: Python/native/native_pipeline; both: Python/native",
     )
     parser.add_argument("--npu", type=int, required=True)
     parser.add_argument("--port", type=int, default=8156)
@@ -399,7 +422,7 @@ def main():
     )
     parser.add_argument(
         "--profile-case",
-        choices=("all", "both", "python", "native", "native_full"),
+        choices=("all", "both", "pipeline", "python", "native", "native_full", "native_pipeline"),
         default="both",
         help="With --profile-only-from, collect just one case or both sequentially (default)",
     )
@@ -498,7 +521,8 @@ def main():
         report(
             f"CASES={','.join(cases)}; one service per case; profiler/MSTX inactive during timed requests. "
             "python=Python MTE; native=current shared-scale baseline; "
-            "native_full=also C++ eager/prefill batch submission. All keep strict completion."
+            "native_full=also C++ eager/prefill batch submission; "
+            "native_pipeline=early prediction + separate DMA queue + device completion. All keep strict completion."
         )
         report(
             "PRIMARY=decode_ms (first to last content); TPOT=decode/(actual output tokens-1); "
@@ -594,13 +618,14 @@ def main():
                     if case in (
                         "native",
                         "native_full",
+                        "native_pipeline",
                     ) and "first native graph task completed without Python" not in log_path.read_text(
                         encoding="utf-8", errors="replace"
                     ):
                         raise RuntimeError("no confirmed native graph execution; refusing fallback-only comparison")
-                    if case in ("native", "native_full"):
+                    if case in ("native", "native_full", "native_pipeline"):
                         report_native_scale_memory(log_path, report)
-                        if case == "native_full":
+                        if case in ("native_full", "native_pipeline"):
                             verify_full_submit(log_path)
                     if any(output != outputs[0] for output in outputs):
                         raise RuntimeError(f"{case} outputs/usage differ between timed requests")
@@ -669,7 +694,13 @@ def main():
         for case in cases:
             report(timing_row(case, timings[case], means[case]))
         if len(cases) > 1:
-            for baseline, candidate in (("python", "native"), ("python", "native_full"), ("native", "native_full")):
+            for baseline, candidate in (
+                ("python", "native"),
+                ("python", "native_full"),
+                ("native", "native_full"),
+                ("native", "native_pipeline"),
+                ("python", "native_pipeline"),
+            ):
                 if baseline not in timings or candidate not in timings:
                     continue
                 before = timings[baseline]["decode_ms"]["raw"]["mean"]

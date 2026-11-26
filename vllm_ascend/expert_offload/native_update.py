@@ -13,8 +13,8 @@ NPU_BASE_SCALE_FORMATS = frozenset((0, 2))  # ACL_FORMAT_NCHW / ACL_FORMAT_ND, n
 
 def validate_native_update_config(config):
     mode = config.get("host_update_backend", "python")
-    if mode not in ("python", "native", "native_full"):
-        raise ValueError("host_update_backend must be python, native or native_full")
+    if mode not in ("python", "native", "native_full", "native_pipeline"):
+        raise ValueError("host_update_backend must be python, native, native_full or native_pipeline")
     if mode == "python":
         return
     required = {
@@ -24,6 +24,8 @@ def validate_native_update_config(config):
         "h2d_backend": "torch",
         "host_sync_load_stream": "ordinary",
     }
+    if mode == "native_pipeline" and config.get("expert_predictor", "fate") != "fate":
+        raise ValueError("native_pipeline requires FATE prediction")
     for name, value in required.items():
         if config.get(name, value if name in ("h2d_backend", "host_sync_load_stream") else None) != value:
             raise ValueError(f"native updates require {name}={value}")
@@ -165,7 +167,8 @@ class NativeUpdateRuntime:
         self.expert_weight = expert_weight
         self.owners = []
         self.tables = []
-        self.full_submit = manager.offload_config.host_update_backend == "native_full"
+        self.full_submit = manager.offload_config.host_update_backend in ("native_full", "native_pipeline")
+        self.pipeline = None
         self.descriptors = []
         self.prefill_tables = []
         self.prefill_targets = []
@@ -186,12 +189,17 @@ class NativeUpdateRuntime:
         # on graph replay. Eager warmups still synchronize their Torch copies.
         manager.load_stream.synchronize()
         self.stream = int(manager.load_stream.npu_stream)
+        if manager.offload_config.host_update_backend == "native_pipeline":
+            if not hasattr(self.native, "NativePipeline"):
+                raise RuntimeError("rebuild lrc_policy for native_pipeline")
+            self.pipeline = self.native.NativePipeline(manager.offload_config.host_sync_library, False)
         for layer_idx, layer in enumerate(manager.moe_layers):
             self.tables.append(self._prepare_layer(layer_idx, layer, expert_weight))
         if self.full_submit:
             for layer_idx in range(len(self.tables)):
                 self.prefill_tables.append(self._prepare_prefill_layer(layer_idx))
-            print("[MOE-NATIVE] FULL_SUBMIT ready; eager/prefill=registered-ACL; graph=existing-native", flush=True)
+            graph_mode = "early-prediction-queued-DMA" if self.pipeline is not None else "existing-native"
+            print(f"[MOE-NATIVE] FULL_SUBMIT ready; eager/prefill=registered-ACL; graph={graph_mode}", flush=True)
         print(
             f"[MOE-NATIVE] prepared layers={len(self.tables)} scale_buffer_bytes={self.packed_bytes} "
             f"scale_reused_bytes={self.reused_bytes} scale_replaced_bytes={self.replaced_bytes} "

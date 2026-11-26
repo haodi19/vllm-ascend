@@ -745,6 +745,7 @@ class MoeHostSyncTests(unittest.TestCase):
 
     def dispatcher(self):
         obj = self.module.MteHostDispatcher.__new__(self.module.MteHostDispatcher)
+        obj.pipeline = None
         obj.closed, obj.next_slot = False, 1
         obj.entries = [None] * 4
         obj.entry_streams = [None] * 4
@@ -762,6 +763,23 @@ class MoeHostSyncTests(unittest.TestCase):
         obj.allocated_scan = False
         obj.session = Mock()
         return obj
+
+    def test_pipeline_wait_drains_torch_submission_before_acl_wait(self):
+        obj = self.dispatcher()
+        order = []
+
+        class Stream:
+            @property
+            def npu_stream(self):
+                order.append("drain_prediction_and_staging")
+                return 55
+
+        obj.torch = SimpleNamespace(npu=SimpleNamespace(current_stream=lambda: Stream()))
+        obj.pipeline = object()
+        obj.pipeline_ready = {1: SimpleNamespace(data_ptr=lambda: 777)}
+        obj.wait = lambda *args: order.append(("wait", args))
+        obj.wait_pipeline_demand((1, 55, 11024, 20032))
+        self.assertEqual(order, ["drain_prediction_and_staging", ("wait", (55, 777, 20032))])
 
     def test_report_wait_control_changes_prefetch_wait_only(self):
         obj = self.dispatcher()

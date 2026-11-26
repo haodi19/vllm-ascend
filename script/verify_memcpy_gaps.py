@@ -253,6 +253,7 @@ def read_offload_header(path, *, loading_streams=None):
                         call=_nonnegative_int(meta.get("call")),
                         layer=_nonnegative_int(meta.get("layer")),
                         kind=meta.get("kind") if meta.get("kind") in ("prefetch", "reactive") else "unknown",
+                        pipeline=meta.get("pipeline") == "1",
                     )
                 )
             elif "npu_fx_compiler_inference" in name.lower():
@@ -410,6 +411,25 @@ def inspect_offload_trace(path, stream_name, threshold, long_threshold, pid=None
             **activity_window_gaps(tasks, lower_us=threshold, long_us=long_threshold),
         ),
     )
+    if any(row.get("pipeline") for row in callbacks):
+        # Asynchronous submission is not contained in the planning callback.
+        # Its time window cannot identify a device DMA batch or its direction.
+        emit(
+            "SELECTED_OFFLOAD_TRACK",
+            dict(
+                pid=key[0],
+                tid=key[1],
+                name=names[key],
+                tasks=len(tasks),
+                loaded_batches=None,
+                asynchronous_pipeline=True,
+            ),
+        )
+        emit(
+            "CALLBACK_SCOPE_UNAVAILABLE",
+            dict(reason="pipeline planning window is not a DMA completion window; full_capture retained"),
+        )
+        return True
     try:
         callbacks, host_pid = select_host_callbacks(callbacks, host_pid)
     except ValueError as exc:

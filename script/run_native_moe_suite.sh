@@ -22,7 +22,7 @@ while (($#)); do
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
 done
-case "$case_name" in all|both|python|native|native_full) ;; *) echo "Invalid case: $case_name" >&2; exit 2 ;; esac
+case "$case_name" in all|both|pipeline|python|native|native_full|native_pipeline) ;; *) echo "Invalid case: $case_name" >&2; exit 2 ;; esac
 for token_count in "${tokens[@]}"; do
   case "$token_count" in 5|128) ;; *) echo "--tokens must be 5 or 128" >&2; exit 2 ;; esac
 done
@@ -42,7 +42,7 @@ command -v python >/dev/null || { echo "Activate the project env.sh first" >&2; 
 if (( ! worker )); then
   mkdir -p "$(dirname "$output_root")"
   case "$case_name" in
-    all|both) mkdir "$output_root" ;;  # Complete suites still require a fresh root.
+    all|both|pipeline) mkdir "$output_root" ;;  # Complete suites still require a fresh root.
     *) mkdir -p "$output_root" ;;     # Independent cases share the same root.
   esac
   output_root=$(cd "$output_root" && pwd -P)

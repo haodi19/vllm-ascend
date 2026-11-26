@@ -378,7 +378,7 @@ def install_callback_timing(manager, port):
     """Explicit diagnostic mode; original execution is untouched when disabled."""
     if hasattr(manager, "_callback_timing"):
         raise RuntimeError("Callback timing installed twice on this manager")
-    if getattr(manager.offload_config, "host_update_backend", "python") in ("native", "native_full"):
+    if getattr(manager.offload_config, "host_update_backend", "python") in ("native", "native_full", "native_pipeline"):
         # Only the control HTTP thread executes Python; native replay does not.
         from vllm_ascend.expert_offload.native_profile import install_native_profile
 

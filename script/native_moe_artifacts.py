@@ -3,7 +3,7 @@
 
 import json
 
-CASES = ("python", "native", "native_full")
+CASES = ("python", "native", "native_full", "native_pipeline")
 
 
 def saved_timing_records(root, cases=CASES):

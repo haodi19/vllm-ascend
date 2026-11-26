@@ -7,6 +7,61 @@
 
 ## 实现与兼容范围
 
+2026-11-26 增加 `native_pipeline`，在 native 的共享最终 scale 布局和 C++ 任务基础上，
+参考同事的提前预测、规划与 DMA 提交分离思路：
+
+- 当前层按需请求 publish 后，立即计算下一层预测专家并暂存、发布预取请求，再等待当前层权重。
+  预测使用原有 MoE 输入和 FATE/哈希路由逻辑，没有改专家数、缓存容量、预测数量或 MTP。
+- 原 C++ worker 负责规划，另一条 C++ worker 负责 DMA 提交。各捕获位置拥有独立的路由和映射暂存缓冲，
+  预取任务必须在对应同代按需任务提交后才能提交；零加载任务也经过相同队列。
+- 每批不再调用 Host stream synchronize。加载流先搬权重/scale、再搬映射，最后用完成算子写入
+  NPU 上的代际标记；原严格 wait 等待这个标记，保证完成前不能消费权重。
+  Host 的“已入队”标记与设备的“可消费”标记分开，不能混用。
+- eager/prefill 使用 `native_full` 的已注册批量提交；上述提前预测和异步流水仅用于捕获的 decode 图。
+  原 `python`、`native`、`native_full` 路径和 `--case all` 的原三组选择保留。
+
+实现参考 [同事的调度代码](https://github.com/yxk-fdu/vllm-ascend/tree/361c929b6b5e7034a7dbddce9a269b0ede082945)。
+这里保留现有 MTE publish/wait，新增加载流完成算子，没有直接替换为同事的 ACL value wait/write。
+它减少串行等待并提供重叠机会；不能仅凭代码宣称已经消除所有空泡。
+
+新三组入口为 `--case pipeline`：Python MTE → 现有 native → native_pipeline。
+每组仍在同一服务内先完成 5 次预热、20 次无 profiler/MSTX 计时，再采 profile，
+默认依次运行 token5 和 token128。先运行小张量检查：同一图反复切换专家，验证
+权重/scale、映射、消费位置快照、完成代际和持有 GIL 时的独立推进；失败不启动模型。
+本地 CPU 回归不能代替目标 NPU 验收，目前没有本版本的服务器性能结果。
+
+在容器内运行：
+
+```bash
+source /data/libvirt/images/l00992607/moeoffload/env.sh
+cd /data/libvirt/images/l00992607/moeoffload/vllm-ascend
+git pull --ff-only origin dev/moeoffload-worker-poll
+bash script/run_native_moe_suite.sh --case pipeline --npu 6 \
+  --output-root "$PWD/bench_results/native_pipeline_01"
+```
+
+脚本自行转入后台；查看 `native_pipeline_01/run.log`，完成后返回
+`native_pipeline_01/summary.txt`。三组各自目录位于 `token5/` 和 `token128/` 下，
+可视化仍集中在各 token 目录的 `profile/` 下，自动对齐并识别加载流。
+分开执行时用同一新目录，每条结束后再执行下一条；默认每条都运行 token5、token128：
+
+```bash
+bash script/run_native_moe_suite.sh --case python --npu 6 --output-root "$PWD/bench_results/native_pipeline_02"
+bash script/run_native_moe_suite.sh --case native --npu 6 --output-root "$PWD/bench_results/native_pipeline_02"
+bash script/run_native_moe_suite.sh --case native_pipeline --npu 6 --output-root "$PWD/bench_results/native_pipeline_02"
+```
+
+仅测一种长度可在对应命令后加 `--tokens 5` 或 `--tokens 128`。编号已存在时使用下一未占用编号。
+
+统计中 `native_pipeline` 的 `host_callback/update_weights` 只包含规划与入队；
+`load_submit/copy_submit` 在另一条 C++ 线程，按相同 call ID 统计，`synchronize` 不存在，不能补零。
+原始 Host 间隔、计算早晚比例及两种重统计继续输出，但此时“预取 Host 结束”是规划入队结束，
+不是 DMA 完成。完成顺序检查使用 publish 与入队开始的必要约束，不再错误要求 Host 返回一定早于设备放行。
+这些重统计仍是基于对齐边界的条件分析，不是新测 Decode/TPOT 收益。
+加载流空泡保留全窗口的 10–5000 μs 口径；异步 DMA 已离开 Host 规划窗口，
+因此不再用该窗口归因预取→按需方向，摘要会明确说明不可用。以实际 Decode/TPOT 和全窗口空泡验证收益。
+全窗口仍按加载流全部设备任务计算占用，包括新增的完成算子和监控 D2H；空泡缩短不能单独证明权重带宽提高。
+
 当前实现用于单卡 MTE、C++ LRC、普通加载流和消费者处严格等待的 decode 图重放。`host_update_backend` 默认仍为 `python`；选择 `native` 后，专家规划、ACL 搬运提交、同步与映射更新由原生线程执行，执行期间不调用 Python，也不获取 GIL。初始化和图注册仍由 Python 完成。
 
 2026-11-25 增加 `native_full`，补齐运行时 eager/prefill 的 C++ 批量搬运提交，保留当前 `native` 作独立基线。三组含义如下：

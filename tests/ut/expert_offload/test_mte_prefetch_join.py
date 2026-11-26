@@ -52,6 +52,7 @@ class PrefetchJoinTests(unittest.TestCase):
 
         self.npu = SimpleNamespace(stream=stream_context, current_stream=lambda: self.current, Event=object)
         self.obj = self.module.MteHostDispatcher.__new__(self.module.MteHostDispatcher)
+        self.obj.pipeline = None
         self.obj.manager = SimpleNamespace(_prefetch_stream=self.prefetch, offload_config=SimpleNamespace())
         for name, value in {
             "closed": False,
@@ -121,6 +122,16 @@ class PrefetchJoinTests(unittest.TestCase):
         self.assertEqual(consumer_wait, ("main", "wait", done))
         self.assertEqual(self.obj.join_events, [gate[2], done])
         self.assertEqual(self.obj.join_published_slots, self.obj.joined_slots)
+
+    def test_pipeline_consumer_waits_on_device_ready_without_second_mapping_copy(self):
+        self.obj.pipeline = object()
+        self.obj.pipeline_ready = {1: SimpleNamespace(data_ptr=lambda: 777)}
+        with self.obj.prefetch_join_capture():
+            self.obj.defer_prefetch(self.prefetch, Mock(), "args", 1, self.destination, self.source)
+            done = self.obj.finish_prefetch_at_join(self.main, 1)
+            self.main.wait_event(done)
+        self.destination.copy_.assert_not_called()
+        self.obj.wait.assert_called_once_with(22, 777, 20032)
 
     def test_wrong_stream_duplicate_and_foreign_tokens_cannot_enqueue_wait(self):
         with self.obj.prefetch_join_capture():

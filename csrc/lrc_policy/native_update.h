@@ -15,6 +15,8 @@
 class NativeTransfers {
  public:
   static constexpr int kHostToDevice = 1;
+  static constexpr int kDeviceToHost = 2;
+  static constexpr size_t kCompletionBytes = 32;
   static constexpr int32_t kCopyTimeoutMs = 30000;
   using Addresses = std::vector<std::vector<uintptr_t>>;
   Addresses sources, destinations;
@@ -95,6 +97,18 @@ class NativeTransfers {
       throw std::runtime_error("full native overwrite requires one slot per expert");
     enqueue(identity_loads);
   }
+  void copy_mapping(uintptr_t destination, const void* source, size_t bytes) {
+    if (cpu) std::memcpy(reinterpret_cast<void*>(destination), source, bytes);
+    else check(copy_(reinterpret_cast<void*>(destination), bytes, source, bytes, kHostToDevice, stream), "pipeline mapping H2D");
+  }
+  void copy_completion(uintptr_t host, uintptr_t device) {
+    if (cpu) {
+      auto generation = reinterpret_cast<std::atomic<uint64_t>*>(device)->load(std::memory_order_acquire);
+      reinterpret_cast<std::atomic<uint64_t>*>(host)->store(generation, std::memory_order_release);
+    }
+    else check(copy_(reinterpret_cast<void*>(host), kCompletionBytes, reinterpret_cast<void*>(device),
+                     kCompletionBytes, kDeviceToHost, stream), "pipeline completion D2H");
+  }
   void submit(const std::vector<std::pair<Id, Id>>& loads,
               NativeRanges* ranges = nullptr, const std::string& context = "") {
     // Keep the native graph baseline's validation order and measured ranges.
@@ -162,6 +176,10 @@ class NativeUpdate {
   std::unique_ptr<NativeArray> scores;
   Id layer, cap;
   bool prefetch;
+  struct Plan {
+    std::vector<std::pair<Id, Id>> loads;
+    std::vector<Id> victims, missing;
+  };
 
   NativeUpdate(std::shared_ptr<Policy> p, std::shared_ptr<NativeTransfers> t,
                Id layer_idx, py::array id_array, py::object score_array,
@@ -198,6 +216,13 @@ class NativeUpdate {
         "|call=" + std::to_string(measurement.call) : "";
     NativeRange host_range(measurement.get(), "host_callback", context);
     NativeRange update_range(measurement.get(), "update_weights", context);
+    std::lock_guard<std::recursive_mutex> guard(policy->mutex);
+    auto work = plan();
+    transfer->submit(work.loads, measurement.get(), context);
+    commit(work);
+  }
+
+  Plan plan() {
     std::lock_guard<std::recursive_mutex> guard(policy->mutex);
     const Id n = mapping.shape[0];
     std::vector<Id> resident, original(n);
@@ -245,10 +270,12 @@ class NativeUpdate {
     if (victims.size() != missing.size()) throw std::runtime_error("native expert cache has insufficient slots");
     std::vector<std::pair<Id, Id>> loads;
     for (size_t i = 0; i < missing.size(); ++i) loads.emplace_back(original[victims[i]], missing[i]);
-    transfer->submit(loads, measurement.get(), context);
-    for (size_t i = 0; i < missing.size(); ++i) {
-      mapping.write(victims[i], -1);
-      mapping.write(missing[i], loads[i].first);
+    return {std::move(loads), std::move(victims), std::move(missing)};
+  }
+  void commit(const Plan& work) {
+    for (size_t i = 0; i < work.missing.size(); ++i) {
+      mapping.write(work.victims[i], -1);
+      mapping.write(work.missing[i], work.loads[i].first);
     }
   }
 };

@@ -65,10 +65,11 @@ def host_key(event):
     return (str(event.get("pid")), str(event.get("tid")), *(context.get(key) for key in CONTEXT_FIELDS))
 
 
-def read_trace(path, *, time_origin=None):
+def read_trace(path, *, time_origin=None, allow_pipeline=False):
     """Keep only protocol tasks and Host boundaries; validate the complete JSON."""
     processes, threads = {}, {}
     candidates, hosts, syncs = [], collections.defaultdict(list), collections.defaultdict(list)
+    enqueues = collections.defaultdict(list)
     phases = collections.Counter()
     retained = 0
     for index, event in enumerate(events(path, parse_float=Decimal if time_origin is not None else float)):
@@ -85,13 +86,18 @@ def read_trace(path, *, time_origin=None):
                     raise ValueError(f"conflicting metadata: {key}")
                 target[key] = value
         stage = name.split("|", 1)[0]
-        if stage in ("moe_offload/host_callback", "moe_offload/synchronize"):
+        if stage in ("moe_offload/host_callback", "moe_offload/synchronize") or (
+            allow_pipeline and stage == "moe_offload/pipeline_enqueue"
+        ):
             phases[f"{stage}:{event.get('ph')}"] += 1
             if event.get("ph") != "X":
                 continue
             rec = record(event, index, time_origin=time_origin)
             rec["context"] = fields(event)
-            (hosts if stage.endswith("host_callback") else syncs)[host_key(event)].append(rec)
+            target = (
+                hosts if stage.endswith("host_callback") else enqueues if stage.endswith("pipeline_enqueue") else syncs
+            )
+            target[host_key(event)].append(rec)
             retained += 1
         elif HANDSHAKE.fullmatch(name) and event.get("ph") == "X":
             candidates.append(record(event, index, time_origin=time_origin))
@@ -115,6 +121,21 @@ def read_trace(path, *, time_origin=None):
             invalid_kinds.update(("prefetch", "reactive"))
             continue
         corresponding = syncs.get(key, [])
+        if allow_pipeline and len(entries) == 1 and entries[0]["context"].get("pipeline") == "1":
+            host = entries[0]
+            queued = enqueues.get(key, [])
+            if (
+                corresponding
+                or len(queued) != 1
+                or not (host["start"] <= queued[0]["start"] <= queued[0]["end"] <= host["end"])
+            ):
+                issues["invalid_pipeline_enqueue_range"] += 1
+                invalid_kinds.add(kind)
+                continue
+            host["sync"] = None
+            host["enqueue"] = queued[0]
+            groups[kind].append(host)
+            continue
         if len(entries) != 1 or len(corresponding) != 1:
             issues["duplicate_host_or_missing_duplicate_sync"] += len(entries)
             invalid_kinds.add(kind)

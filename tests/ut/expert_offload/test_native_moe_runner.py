@@ -21,6 +21,16 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
+    def test_pipeline_suite_preserves_baseline_and_uses_one_service_per_case(self):
+        with tempfile.TemporaryDirectory() as temp:
+            code, output, launched, count, profiles = self.run_mock_comparison(Path(temp), "pipeline")
+            self.assertEqual(code, 0)
+            self.assertEqual(launched, ["python", "native", "native_pipeline"])
+            self.assertEqual(count, 9)
+            self.assertEqual(profiles.call_count, 3)
+            self.assertTrue((output / "native_pipeline/timing_result.json").is_file())
+        self.assertEqual(runner.selected_cases("all"), ("python", "native", "native_full"))
+
     def run_mock_comparison(
         self, directory, case="both", *, varied_outputs=False, marker_leak=False, profile_error=False
     ):
@@ -65,7 +75,7 @@ class NativeRunnerTests(unittest.TestCase):
                 services.append(child)
                 config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
                 launched.append(config["host_update_backend"])
-                if config["host_update_backend"] in ("native", "native_full"):
+                if config["host_update_backend"] in ("native", "native_full", "native_pipeline"):
                     kwargs["stdout"].write("[MOE-NATIVE] first native graph task completed without Python\n")
                     kwargs["stdout"].write(
                         "[MOE-NATIVE] SCALE_MEMORY "

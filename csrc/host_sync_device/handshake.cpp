@@ -112,6 +112,27 @@ extern "C" void host_sync_wait_strict_launch(void* stream, void* completion, voi
   host_sync_wait<<<1, nullptr, stream>>>(completion, state, 0);
 }
 
+// Pipeline completion is queued AFTER expert fields and mapping on the loading
+// stream. Host enqueue/admission acknowledgement never releases the consumer.
+extern "C" __global__ __aicore__ void host_sync_pipeline_complete(GM_ADDR completion, uint64_t generation) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  TPipe pipe;
+  TBuf<TPosition::VECCALC> scratch;
+  pipe.InitBuffer(scratch, kBufferBytes);
+  auto local = scratch.Get<uint8_t>();
+  auto words = local.ReinterpretCast<uint64_t>();
+  GlobalTensor<uint8_t> done;
+  done.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(completion));
+  done.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+  words.SetValue(0, generation);
+  for (uint32_t i = 1; i < 4; ++i) words.SetValue(i, 0);
+  Write(done, local, kBufferBytes);
+}
+
+extern "C" void host_sync_pipeline_complete_launch(void* stream, void* completion, uint64_t generation) {
+  host_sync_pipeline_complete<<<1, nullptr, stream>>>(completion, generation);
+}
+
 // Stage 5 consumer: check the handshake before consuming newly copied data.
 // Output is [first_weight + mapping + route, last_weight, mapping, route].
 extern "C" __global__ __aicore__ void host_sync_consume(GM_ADDR weights, GM_ADDR mapping, GM_ADDR route, GM_ADDR state,
