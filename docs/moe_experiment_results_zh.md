@@ -30,7 +30,7 @@
 
 ## 目录
 
-- [技术分享：让 NPU 少等专家](moe_offload_optimization_zh.md)
+- [单卡 MoE 卸载优化说明](moe_offload_optimization_zh.md)
 
 1. [LRC 策略 C++ 迁移对照](#lrc-20261014) — 2026-10-14；周总结整理于 2026-10-19
 2. [MTE 普通加载流与 SyncLaunchStream 对照](#load-stream-20261030) — 2026-10-30
@@ -46,9 +46,9 @@
 
 <a id="work-summary-gil-20261127"></a>
 
-## 技术分享
+## 优化说明
 
-面向技术交流的介绍见 [让 NPU 少等专家：单卡 MoE 卸载的 Host 与搬运优化](moe_offload_optimization_zh.md)。本文以下保留实验底稿，供核查配置与测量数据。
+优化内容与验证数据见 [单卡 MoE 卸载优化说明](moe_offload_optimization_zh.md)。本文以下保留实验底稿，供核查配置与测量数据。
 
 <a id="lrc-20261014"></a>
 
