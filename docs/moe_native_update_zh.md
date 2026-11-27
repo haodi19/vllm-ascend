@@ -51,7 +51,7 @@ bash script/run_native_moe_suite.sh --case native --npu 6 --output-root "$PWD/be
 bash script/run_native_moe_suite.sh --case native_pipeline --npu 6 --output-root "$PWD/bench_results/native_pipeline_02"
 ```
 
-仅测一种长度可在对应命令后加 `--tokens 5` 或 `--tokens 128`。编号已存在时使用下一未占用编号。
+仅测一种长度可在对应命令后加 `--tokens 5` 或 `--tokens 128`；两种长度可以先后运行在同一总目录。重测已有长度的完整对照时，使用下一未占用编号。
 
 统计中 `native_pipeline` 的 `host_callback/update_weights` 只包含规划与入队；
 `load_submit/copy_submit` 在另一条 C++ 线程，按相同 call ID 统计，`synchronize` 不存在，不能补零。
@@ -101,7 +101,7 @@ scale 注册允许 ND（2）与 NCHW（0）这两种基础格式编号不同，�
 
 需要分开运行时，分别传 `--case python`、`--case native`、`--case native_full`，三条命令可以使用同一结果目录，逐组追加。每条命令均独立完成该组计时和 profile；`--case both` 保留原 Python/native 两组入口。单组计时验证该组请求一致性，汇总保留各组测量来源，不能把分开启动称为同次配对测量。单组计时完成后如需补采，可用 `--profile-only-from` 配合对应的 `--profile-case` 和新输出目录；三组补采传 `--profile-case all`。
 
-完整测试使用 `script/run_native_moe_suite.sh`：后台依次运行 token 5、128，每轮均比较三组，每组 5 次预热、20 次正式请求并独立采 profile。它继承当前终端环境；在容器内执行，下面的 `--npu 6` 为物理卡号，结果目录已存在时改为下一个编号：
+完整测试使用 `script/run_native_moe_suite.sh`：后台依次运行 token 5、128，每轮均比较三组，每组 5 次预热、20 次正式请求并独立采 profile。它继承当前终端环境；在容器内执行，下面的 `--npu 6` 为物理卡号，所选 token 子目录已存在时改为下一个编号：
 
 ```bash
 source /data/w00919836/moeoffload/env.sh
@@ -131,7 +131,7 @@ bash script/run_native_moe_suite.sh --case native_full --npu 6 \
   --output-root /home/w00919836/results/native_three_way_02
 ```
 
-仅测一种输出长度时，在相应命令追加 `--tokens 5` 或 `--tokens 128`。单组入口允许补上同一总目录中尚未运行的组或 token 长度；重复组（包括失败后留下的目录）会在启动前被拒绝。完整 `all/both` 入口仍要求新总目录。同一总目录用 `.suite.lock` 防止并发写入，后台结束时释放锁。运行输出追加到 `run.log` / `run_details.log`；各组、各 token 和根目录的 `summary.txt` 从已保存结果重新生成，每项只列一次，不拼接历史控制台输出。
+仅测一种输出长度时，在相应命令追加 `--tokens 5` 或 `--tokens 128`。单组入口允许补上同一总目录中尚未运行的组或 token 长度；重复组（包括失败后留下的目录）会在启动前被拒绝。完整 `all/both/pipeline` 入口允许复用总目录，但所选 token 子目录必须尚不存在，因此可以先测 token5，再向同一总目录补测 token128。同一总目录用 `.suite.lock` 防止并发写入，后台结束时释放锁。运行输出追加到 `run.log` / `run_details.log`；各组、各 token 和根目录的 `summary.txt` 从已保存结果重新生成，每项只列一次，不拼接历史控制台输出。
 
 默认服务端口为 8156、独立计时端口为 18156；占用时传入 `--port` 和 `--timing-port`。批量入口沿用 5 GiB 剩余空间检查，profile 导出最多等 600 秒。结果位于根目录的 `token5/`、`token128/`；`status.txt` 逐组逐轮记录退出码。`BATCH_EXIT` 保留历史失败，`run.log` 中的 `LAST_JOB_EXIT` 表示刚结束的任务；摘要分别标记计时、profile 和重统计的完整性，没有测完三组时不能作为完整对照。第一种长度失败后仍尝试第二种长度。
 

@@ -46,6 +46,7 @@ done
 case "$case_name" in
   all) mkdir "$out"; cases=(python native native_full) ;;
   both) mkdir "$out"; cases=(python native) ;;
+  pipeline) mkdir "$out"; cases=(python native native_pipeline) ;;
   *) mkdir -p "$out"; cases=("$case_name") ;;
 esac
 for name in "${cases[@]}"; do
@@ -139,6 +140,53 @@ if [[ -f fail_token$tokens ]]; then exit 3; fi
         self.assertIn("locked", result.stderr)
         self.assertEqual((self.output / "run.log").read_text(), "running")
         self.assertFalse((self.root / "calls.txt").exists())
+
+    def test_combined_cases_can_add_token128_after_token5_without_overwriting(self):
+        for case in ("all", "both", "pipeline"):
+            with self.subTest(case=case):
+                self.output = self.root / f"{case}_01"
+                result = self.invoke("--case", case, "--tokens", "5")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.wait_background()
+                saved = {p: p.read_bytes() for p in (self.output / "token5").rglob("*") if p.is_file()}
+
+                result = self.invoke("--case", case, "--tokens", "128")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.wait_background()
+                self.assertEqual(saved, {p: p.read_bytes() for p in (self.output / "token5").rglob("*") if p.is_file()})
+                summary = (self.output / "summary.txt").read_text(encoding="utf-8")
+                self.assertIn("[5]", summary)
+                self.assertIn("[128]", summary)
+                self.assertIn("BATCH_EXIT=0", summary)
+                if case == "pipeline":
+                    self.assertIn("| native_pipeline |", summary)
+                    self.assertTrue((self.output / "token128/profile/native_pipeline/trace.json").exists())
+
+                before = {p: p.read_bytes() for p in self.output.rglob("*") if p.is_file()}
+                duplicate = self.invoke("--case", case, "--tokens", "128")
+                self.assertNotEqual(duplicate.returncode, 0)
+                self.assertIn("Token directory already exists", duplicate.stderr)
+                self.assertEqual(before, {p: p.read_bytes() for p in self.output.rglob("*") if p.is_file()})
+        self.assertEqual(
+            self.calls(),
+            [f"case={case} tokens={tokens} npu=6" for case in ("all", "both", "pipeline") for tokens in (5, 128)],
+        )
+
+    def test_combined_run_rejects_existing_token_before_starting_any_token(self):
+        for case in ("all", "both", "pipeline"):
+            with self.subTest(case=case):
+                self.output = self.root / f"{case}_01"
+                existing = self.output / "token128"
+                existing.mkdir(parents=True)
+                (existing / "run_details.log").write_text("retained failed run")
+                result = self.invoke("--case", case)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Token directory already exists", result.stderr)
+                self.assertFalse((self.output / "token5").exists())
+                self.assertFalse((self.output / ".suite.lock").exists())
+                self.assertFalse((self.output / "run.log").exists())
+                self.assertFalse((self.root / "calls.txt").exists())
+                self.assertEqual((existing / "run_details.log").read_text(), "retained failed run")
 
     def test_later_token_job_preserves_earlier_summary_and_failure_status(self):
         (self.root / "fail_token5").touch()

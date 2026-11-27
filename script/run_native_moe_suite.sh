@@ -40,11 +40,7 @@ runner="$repo/script/run_native_moe_compare.py"
 command -v python >/dev/null || { echo "Activate the project env.sh first" >&2; exit 2; }
 
 if (( ! worker )); then
-  mkdir -p "$(dirname "$output_root")"
-  case "$case_name" in
-    all|both|pipeline) mkdir "$output_root" ;;  # Complete suites still require a fresh root.
-    *) mkdir -p "$output_root" ;;     # Independent cases share the same root.
-  esac
+  mkdir -p "$output_root"
   output_root=$(cd "$output_root" && pwd -P)
   mkdir "$output_root/.suite.lock" 2>/dev/null || {
     echo "This output root is locked by another suite: $output_root/.suite.lock" >&2
@@ -54,6 +50,18 @@ if (( ! worker )); then
   # Check both token directories before starting any work. Failed cases are
   # retained too; rerunning a case requires a new experiment root.
   for token_count in "${tokens[@]}"; do
+    case "$case_name" in
+      all|both|pipeline)
+        # Combined comparisons require a fresh token directory, not a fresh
+        # root: --tokens 128 may follow --tokens 5 in the same experiment.
+        token_dir="$output_root/token${token_count}"
+        if [[ -e $token_dir || -L $token_dir ]]; then
+          echo "Token directory already exists; no files overwritten: $token_dir" >&2
+          exit 2
+        fi
+        continue
+        ;;
+    esac
     for previous in "$output_root/token${token_count}/$case_name" \
       "$output_root/token${token_count}/profile/$case_name" \
       "$output_root/token${token_count}/${case_name}_command.json"; do
