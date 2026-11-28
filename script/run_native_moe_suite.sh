@@ -117,7 +117,7 @@ for token_count in "${tokens[@]}"; do
   if python -u -B "$runner" --case "$case_name" --npu "$npu" \
     --port "$port" --timing-port "$timing_port" --host-cpus "$host_cpus" --max-tokens "$token_count" \
     --warmup-requests 5 --requests 20 --startup-timeout 1800 \
-    --request-timeout 600 --profile-timeout 600 --min-profile-free-gib 5 \
+    --request-timeout 600 --profile-timeout 600 \
     --bubble-stream-name auto --output-dir "$output_root/token${token_count}"; then
     code=0
   else

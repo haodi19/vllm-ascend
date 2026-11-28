@@ -133,7 +133,7 @@ bash script/run_native_moe_suite.sh --case native_full --npu 6 \
 
 仅测一种输出长度时，在相应命令追加 `--tokens 5` 或 `--tokens 128`。单组入口允许补上同一总目录中尚未运行的组或 token 长度；重复组（包括失败后留下的目录）会在启动前被拒绝。完整 `all/both/pipeline` 入口允许复用总目录，但所选 token 子目录必须尚不存在，因此可以先测 token5，再向同一总目录补测 token128。同一总目录用 `.suite.lock` 防止并发写入，后台结束时释放锁。运行输出追加到 `run.log` / `run_details.log`；各组、各 token 和根目录的 `summary.txt` 从已保存结果重新生成，每项只列一次，不拼接历史控制台输出。
 
-默认服务端口为 8156、独立计时端口为 18156；占用时传入 `--port` 和 `--timing-port`。批量入口沿用 5 GiB 剩余空间检查，profile 导出最多等 600 秒。结果位于根目录的 `token5/`、`token128/`；`status.txt` 逐组逐轮记录退出码。`BATCH_EXIT` 保留历史失败，`run.log` 中的 `LAST_JOB_EXIT` 表示刚结束的任务；摘要分别标记计时、profile 和重统计的完整性，没有测完三组时不能作为完整对照。第一种长度失败后仍尝试第二种长度。
+默认服务端口为 8156、独立计时端口为 18156；占用时传入 `--port` 和 `--timing-port`。native 测试入口已取消剩余磁盘空间和 inode 数量预检，完整测试、单组测试及 profile 补采均不按剩余容量提前停止；旧命令中的 `--min-profile-free-gib` 兼容接收但不再生效。实际文件写入错误仍会正常报错。profile 导出最多等 600 秒。结果位于根目录的 `token5/`、`token128/`；`status.txt` 逐组逐轮记录退出码。`BATCH_EXIT` 保留历史失败，`run.log` 中的 `LAST_JOB_EXIT` 表示刚结束的任务；摘要分别标记计时、profile 和重统计的完整性，没有测完三组时不能作为完整对照。第一种长度失败后仍尝试第二种长度。
 
 每个 token 目录内，三组日志、命令与数据分别归档，三组可视化集中放在 `profile/`。例如：
 

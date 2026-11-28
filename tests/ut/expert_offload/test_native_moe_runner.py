@@ -179,7 +179,7 @@ class NativeRunnerTests(unittest.TestCase):
             patch.object(runner, "after_service_memory"),
             patch.object(runner, "log_memory"),
             patch.object(runner, "control_request", side_effect=statuses),
-            patch.object(runner, "ensure_profile_storage"),
+            patch("shutil.disk_usage", side_effect=AssertionError("storage precheck must not run")),
             patch.object(runner, "profile_cases", side_effect=capture) as profiles,
             patch.object(runner, "report_profiles"),
             contextlib.redirect_stdout(io.StringIO()),
@@ -388,9 +388,7 @@ class NativeRunnerTests(unittest.TestCase):
             args, commands = profiles.call_args.args[:2]
             self.assertEqual(args.max_tokens, 128)
             self.assertEqual(args.min_profile_free_gib, 5)
-            storage.assert_called_once_with(
-                output.resolve(), stage="before profile continuation; no model started", min_free_gib=5
-            )
+            storage.assert_not_called()
             self.assertEqual(set(commands), {"python", "native"})
             for command in commands.values():
                 self.assertEqual(command[command.index("--port") + 1], "8158")
@@ -474,7 +472,7 @@ class NativeRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(FileNotFoundError, "handshake library"):
                 runner.load_completed_timing_run(directory, 8156)
 
-    def test_profile_continuation_checks_disk_before_starting_services(self):
+    def test_profile_continuation_has_no_storage_precheck(self):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             self.saved_timing_fixture(directory)
@@ -490,12 +488,11 @@ class NativeRunnerTests(unittest.TestCase):
                 min_profile_free_gib=20,
             )
             with (
-                patch("run_verified_cpp_tests.ensure_profile_storage", side_effect=RuntimeError("disk full")),
+                patch("shutil.disk_usage", side_effect=AssertionError("storage precheck must not run")),
                 patch("native_moe_profile.profile_cases") as profiles,
-                self.assertRaisesRegex(RuntimeError, "disk full"),
             ):
-                runner.continue_profile(args, output, {}, lambda _: None)
-            profiles.assert_not_called()
+                self.assertEqual(runner.continue_profile(args, output, {}, lambda _: None), 0)
+            profiles.assert_called_once()
 
     def test_handshake_rebuild_uses_fresh_directory_and_retains_old_objects(self):
         with tempfile.TemporaryDirectory() as directory:

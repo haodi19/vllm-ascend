@@ -17,7 +17,7 @@ from inspect_native_profile_nesting import audit_host_nesting
 from moe_host_memory import after_service_memory, check_host_memory, log_memory
 from moe_tpot import streaming_completion
 from native_moe_artifacts import case_directory
-from run_verified_cpp_tests import check_uninstrumented_window, ensure_profile_storage, request, wait_profile
+from run_verified_cpp_tests import check_uninstrumented_window, request, wait_profile
 from verify_memcpy_gaps import inspect_offload_trace
 
 MIN_BUBBLE_US = 10.0
@@ -238,9 +238,6 @@ def profile_cases(
         artifacts = case_directory(root, case)
         directory = root / "profile" / case
         directory.mkdir(parents=True, exist_ok=live_service is not None)
-        ensure_profile_storage(
-            directory, stage=f"before {case} profile service", min_free_gib=args.min_profile_free_gib
-        )
         if live_service is None:
             wait_port_free(args.port)
             wait_port_free(args.timing_port)

@@ -41,7 +41,6 @@ from native_moe_profile import (
     verify_full_submit,
 )
 from run_host_sync_stage2 import target_cmake_args
-from run_verified_cpp_tests import MIN_PROFILE_FREE_GIB, ensure_profile_storage
 from run_verified_cpp_tests import request as control_request
 from summarize_native_moe_results import SUMMARY_HEADER, rebuild, write_summary
 
@@ -322,7 +321,6 @@ def load_completed_timing_run(directory, port, required_cases=("python", "native
 
 def continue_profile(args, root, env, report):
     from native_moe_profile import profile_cases
-    from run_verified_cpp_tests import ensure_profile_storage
 
     source = args.profile_only_from.resolve(strict=True)
     cases = selected_cases(args.profile_case)
@@ -342,9 +340,6 @@ def continue_profile(args, root, env, report):
     for case in commands:
         samples = records[case]["stream_samples"]
         report(timing_row(case, summarize_streams(samples), statistics.mean(s["http_wall_us"] / 1000 for s in samples)))
-    ensure_profile_storage(
-        root, stage="before profile continuation; no model started", min_free_gib=args.min_profile_free_gib
-    )
     profile_cases(args, commands, root, env, report, wait_port_free, stop_process_group, reference)
     return 0
 
@@ -454,12 +449,8 @@ def main():
     )
     parser.add_argument("--timing-port", type=int, default=18156)
     parser.add_argument("--profile-timeout", type=int, default=180)
-    parser.add_argument(
-        "--min-profile-free-gib",
-        type=float,
-        default=MIN_PROFILE_FREE_GIB,
-        help="Minimum free GiB before each profile service (default: 20); not a profile size limit",
-    )
+    # Accept older saved commands, but never enforce a free-space threshold.
+    parser.add_argument("--min-profile-free-gib", type=float, help=argparse.SUPPRESS)
     parser.add_argument(
         "--bubble-stream-name",
         default="auto",
@@ -485,8 +476,6 @@ def main():
         parser.error("--profile-case python/native requires --profile-only-from")
     if args.profile_only_from and args.case != "all":
         parser.error("--case selects a fresh complete run; use --profile-case with --profile-only-from")
-    if not 0 < args.min_profile_free_gib < float("inf"):
-        parser.error("--min-profile-free-gib must be positive and finite")
     if args.profile_only_from and (args.skip_profile or args.skip_build or args.library):
         parser.error("--profile-only-from uses saved commands/libraries; do not combine with skip/library switches")
     if sys.platform != "linux" or args.npu < 0 or min(args.max_tokens, args.requests, args.warmup_requests) < 1:
@@ -546,9 +535,7 @@ def main():
             "once; no RAM threshold; outside all measurement windows"
         )
         if not args.skip_profile:
-            report(
-                f"PROFILE_STORAGE: minimum_free_gib={args.min_profile_free_gib:g}; checked before each profile service"
-            )
+            report("PROFILE_STORAGE: free-space/inode precheck disabled")
         if args.profile_only_from:
             exit_code = continue_profile(args, root, env, report)
             error = "" if exit_code == 0 else "profile 补采未完成"
@@ -593,9 +580,6 @@ def main():
             if not args.skip_profile:
                 directory = root / "profile" / case
                 directory.mkdir(parents=True)
-                ensure_profile_storage(
-                    directory, stage=f"before service {case}", min_free_gib=args.min_profile_free_gib
-                )
                 command = profile_command(command, directory, args.timing_port)
                 commands[case] = command
             # This exact argv preserves the original model and MTP settings.

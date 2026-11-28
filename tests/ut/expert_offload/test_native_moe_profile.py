@@ -126,7 +126,7 @@ class NativeProfileTests(unittest.TestCase):
                     patch.object(profile.subprocess, "Popen") as launch,
                     patch.object(profile, "request", side_effect=request),
                     patch.object(profile, "streaming_completion", side_effect=completion) as requests,
-                    patch.object(profile, "ensure_profile_storage"),
+                    patch("shutil.disk_usage", side_effect=AssertionError("storage precheck must not run")),
                     patch.object(profile, "check_host_memory") as memory,
                     patch.object(profile, "after_service_memory") as reclaim,
                     patch.object(profile, "log_memory"),
@@ -257,7 +257,7 @@ class NativeProfileTests(unittest.TestCase):
         stop = Mock()
         with (
             tempfile.TemporaryDirectory() as directory,
-            patch.object(profile, "ensure_profile_storage") as storage,
+            patch("shutil.disk_usage", side_effect=AssertionError("storage precheck must not run")) as storage,
             patch.object(profile, "check_host_memory") as memory_before,
             patch.object(profile, "log_memory"),
             patch.object(profile, "after_service_memory") as memory_after,
@@ -274,9 +274,7 @@ class NativeProfileTests(unittest.TestCase):
         self.assertEqual(memory_after.call_args.args[2], child.pid)
         self.assertTrue(memory_after.call_args.kwargs["drop_cache"])
         align.assert_not_called()
-        storage.assert_called_once_with(
-            Path(directory) / "profile/python", stage="before python profile service", min_free_gib=5
-        )
+        storage.assert_not_called()
 
     def test_native_control_uses_native_counters_and_leaves_callbacks_unwrapped(self):
         timing = runpy.run_path(str(ROOT / "vllm_ascend/expert_offload/callback_timing.py"))

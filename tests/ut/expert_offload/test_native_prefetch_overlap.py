@@ -221,7 +221,7 @@ class NativePrefetchOverlapTests(unittest.TestCase):
                     patch.object(profile.subprocess, "Popen", side_effect=launch),
                     patch.object(profile, "request", side_effect=request),
                     patch.object(profile, "streaming_completion", return_value=sample),
-                    patch.object(profile, "ensure_profile_storage"),
+                    patch("shutil.disk_usage", side_effect=AssertionError("storage precheck must not run")),
                     patch.object(profile, "check_host_memory"),
                     patch.object(profile, "after_service_memory"),
                     patch.object(profile, "report_native_scale_memory"),
