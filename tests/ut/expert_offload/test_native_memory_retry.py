@@ -74,6 +74,13 @@ node 0 1
             self.saved_attempt(tokens, success, f"{tokens}-{'success' if success else 'failed'}")
             return 0 if success else 1
 
+        def drop():
+            failed_tokens = attempts[-1]
+            self.assertFalse((self.root / f"token{failed_tokens}").exists())
+            if failed_tokens == 128:
+                self.assertEqual((self.root / "token5/profile/trace.json").read_text(), "5-success")
+            return failed_tokens == 128  # A failed cache drop must not prevent retrying token5.
+
         with (
             patch.object(
                 retry,
@@ -88,11 +95,13 @@ node 0 1
                 ],
             ),
             patch.object(retry, "run_attempt", side_effect=run),
+            patch.object(retry, "drop_page_cache_after_failure", side_effect=drop) as drop_cache,
             patch.object(retry, "rebuild"),
             contextlib.redirect_stdout(io.StringIO()),
         ):
             self.assertEqual(retry.retry_loop(self.args, stop), 0)
         self.assertEqual(attempts, [5, 5, 128, 128])
+        self.assertEqual(drop_cache.call_count, 2)
         state = json.loads((self.root / "retry_state.json").read_text())
         self.assertEqual(state["completed"], [5, 128])
         self.assertEqual(state["attempts"], {"5": 2, "128": 2})
@@ -137,9 +146,11 @@ node 0 1
             patch.object(retry, "read_available_node", return_value=self.node),
             patch.object(retry, "run_attempt", side_effect=run),
             patch.object(retry, "clear_failed_token") as clear,
+            patch.object(retry, "drop_page_cache_after_failure") as drop_cache,
         ):
             self.assertEqual(retry.retry_loop(self.args, stop), 130)
         clear.assert_not_called()
+        drop_cache.assert_not_called()
         self.assertTrue((self.root / "token5/profile/trace.json").is_file())
 
     def test_unverified_cleanup_never_deletes_or_retries(self):
@@ -148,10 +159,26 @@ node 0 1
             patch.object(retry, "read_available_node", return_value=self.node),
             patch.object(retry, "run_attempt", side_effect=retry.ProcessCleanupError("still running")),
             patch.object(retry, "clear_failed_token") as clear,
+            patch.object(retry, "drop_page_cache_after_failure") as drop_cache,
             self.assertRaises(retry.ProcessCleanupError),
         ):
             retry.retry_loop(self.args, threading.Event())
         clear.assert_not_called()
+        drop_cache.assert_not_called()
+
+    def test_cache_drop_writes_only_one(self):
+        target = self.root / "drop_caches"
+        with patch.object(retry, "DROP_CACHES_PATH", target), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertTrue(retry.drop_page_cache_after_failure())
+        self.assertEqual(target.read_bytes(), b"1\n")
+        self.assertIn("DROP_CACHES_PASS", output.getvalue())
+
+    def test_cache_drop_permission_failure_is_reported_without_stopping_retry(self):
+        target = Mock()
+        target.write_bytes.side_effect = PermissionError("read-only proc sysctl")
+        with patch.object(retry, "DROP_CACHES_PATH", target), contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(retry.drop_page_cache_after_failure())
+        self.assertIn("DROP_CACHES_FAILED", output.getvalue())
 
     def test_command_preserves_workload_and_limits_cpu_memory_to_selected_node(self):
         command = retry.attempt_command(self.args, 128, self.node)

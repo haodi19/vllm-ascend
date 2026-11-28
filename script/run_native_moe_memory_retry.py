@@ -30,6 +30,7 @@ TOKEN_COUNTS = (5, 128)
 OWNER_FILE = ".memory_retry_owner.json"
 PR_SET_CHILD_SUBREAPER = 36
 FAILURE_TAIL_BYTES = 16384
+DROP_CACHES_PATH = Path("/proc/sys/vm/drop_caches")
 
 
 class ProcessCleanupError(Exception):
@@ -126,6 +127,17 @@ def save_failure_tail(root, tokens, reason):
                 source.seek(max(0, source.tell() - FAILURE_TAIL_BYTES))
                 lines.extend([f"FILE={path.name}", source.read().decode("utf-8", errors="replace")])
     (root / "last_failure.log").write_text("\n".join(lines), encoding="utf-8")
+
+
+def drop_page_cache_after_failure():
+    """Equivalent to echo 1 > /proc/sys/vm/drop_caches, after owned cleanup."""
+    try:
+        DROP_CACHES_PATH.write_bytes(b"1\n")
+    except OSError as exc:
+        report(f"DROP_CACHES_FAILED {exc}; continue memory checks and retries")
+        return False
+    report("DROP_CACHES_PASS echo 1 > /proc/sys/vm/drop_caches")
+    return True
 
 
 def process_identity(pid):
@@ -318,6 +330,7 @@ def retry_loop(args, stop):
                 with contextlib.suppress(OSError):
                     save_failure_tail(root, tokens, str(exc))
                 clear_failed_token(root, args.owner, tokens)
+                drop_page_cache_after_failure()
                 rebuild(root)
                 stop.wait(POLL_SECONDS)
                 continue

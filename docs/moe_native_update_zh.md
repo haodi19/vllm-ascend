@@ -233,7 +233,7 @@ tail -f ./bench_results/native_pipeline_retry_01/run.log
 
 脚本自动转入后台，每 30 秒读取 `numactl -H`。在当前进程允许的节点中，选择空闲内存严格大于 `100000 MB`、且有两个可用物理核的节点；多个节点满足时优先选空闲内存最多的。测试的内存与 CPU 范围绑定到该节点，Host 规划线程和 DMA 提交线程分别绑到其中两个物理核。启动循环时不必再套 `numactl`；如果终端已限制 CPU/内存节点，脚本会遵守这些限制。该门槛用于决定何时尝试，不能保证驱动的大块锁页分配一定成功。
 
-默认运行 `native_pipeline`，先 token5，成功后再 token128，沿用 5 次预热、20 次正式请求和同服务 profile 采集。失败后先结束并回收本次启动的服务及子进程，再删除本次失败的 `token5/` 或 `token128/`，等待下一次检查；token128 失败不会删除或重跑已成功的 token5。两种长度都成功后自动退出。无需重复执行启动命令。
+默认运行 `native_pipeline`，先 token5，成功后再 token128，沿用 5 次预热、20 次正式请求和同服务 profile 采集。失败后先结束并回收本次启动的服务及子进程，再删除本次失败的 `token5/` 或 `token128/`，执行一次等价于 `echo 1 > /proc/sys/vm/drop_caches` 的写入，然后等待下一次检查。日志记录 `DROP_CACHES_PASS`；若无写入权限则记录 `DROP_CACHES_FAILED` 并继续检测重试。等待内存期间不反复清缓存。token128 失败不会删除或重跑已成功的 token5。两种长度都成功后自动退出。无需重复执行启动命令。
 
 输出目录必须是尚未使用的新目录，已有时换 `_02` 等编号。结果布局保持 `token5/native_pipeline/`、`token128/native_pipeline/` 和各 token 的 `profile/native_pipeline/`；最终返回根目录 `summary.txt`。实时进度在 `run.log`，最近一次失败的简短日志在 `last_failure.log`。手动停止使用启动时打印的 `kill -TERM PID`；停止后保留现场，不继续重试。
 
