@@ -221,6 +221,22 @@ tail -f ./bench_results/native_pipeline_bind_01/run.log
 
 启动时验证两个线程的实际亲和性，失败会在正式请求前停止；`HOST_AFFINITY_VERIFIED` 表示核对成功。NPU 前置检查也会用选中的核验证原有字节拷贝、mapping、严格完成和图重放。若单独比较绑核收益，应使用相同 `native_pipeline` 配置，在新结果目录中运行 `--host-cpus none` 作对照。
 
+### 等待空闲内存并自动重试
+
+容器内激活原 `env.sh` 后，在项目目录执行一次：
+
+```bash
+python -u -B script/run_native_moe_memory_retry.py --npu 6 \
+  --output-root ./bench_results/native_pipeline_retry_01
+tail -f ./bench_results/native_pipeline_retry_01/run.log
+```
+
+脚本自动转入后台，每 30 秒读取 `numactl -H`。在当前进程允许的节点中，选择空闲内存严格大于 `100000 MB`、且有两个可用物理核的节点；多个节点满足时优先选空闲内存最多的。测试的内存与 CPU 范围绑定到该节点，Host 规划线程和 DMA 提交线程分别绑到其中两个物理核。启动循环时不必再套 `numactl`；如果终端已限制 CPU/内存节点，脚本会遵守这些限制。该门槛用于决定何时尝试，不能保证驱动的大块锁页分配一定成功。
+
+默认运行 `native_pipeline`，先 token5，成功后再 token128，沿用 5 次预热、20 次正式请求和同服务 profile 采集。失败后先结束并回收本次启动的服务及子进程，再删除本次失败的 `token5/` 或 `token128/`，等待下一次检查；token128 失败不会删除或重跑已成功的 token5。两种长度都成功后自动退出。无需重复执行启动命令。
+
+输出目录必须是尚未使用的新目录，已有时换 `_02` 等编号。结果布局保持 `token5/native_pipeline/`、`token128/native_pipeline/` 和各 token 的 `profile/native_pipeline/`；最终返回根目录 `summary.txt`。实时进度在 `run.log`，最近一次失败的简短日志在 `last_failure.log`。手动停止使用启动时打印的 `kill -TERM PID`；停止后保留现场，不继续重试。
+
 <a id="验证状态"></a>
 
 本地 CPU 测试覆盖加载分片顺序、原缓冲地址复用、prefill/eager 非零槽位、布局不匹配拒绝、替换后旧缓冲释放和原生任务执行。NPU 检查已集成到原测试入口；需要在目标服务器上运行后才能确认新版本的模型输出与性能。既有实验数据仍对应当时版本，不回填为本次改动的效果。
