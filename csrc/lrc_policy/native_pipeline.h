@@ -4,6 +4,10 @@
 #include <condition_variable>
 #include <deque>
 #include <thread>
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 // The original Session thread plans requests. This second thread ONLY submits
 // prepared DMA jobs. Neither thread waits for device transfer completion.
@@ -32,7 +36,14 @@ class NativePipeline {
     std::shared_ptr<NativeMeasurement> measurement;
     std::string context;
   };
-  explicit NativePipeline(const std::string& library, bool cpu_test) : cpu_(cpu_test) {
+  explicit NativePipeline(const std::string& library, bool cpu_test, int worker_cpu = -1)
+      : cpu_(cpu_test), worker_cpu_(worker_cpu) {
+    if (worker_cpu < -1) throw std::invalid_argument("DMA CPU must be -1 or a non-negative CPU ID");
+#ifdef __linux__
+    if (worker_cpu >= CPU_SETSIZE) throw std::invalid_argument("DMA CPU exceeds CPU_SETSIZE");
+#else
+    if (worker_cpu != -1) throw std::invalid_argument("DMA affinity requires Linux");
+#endif
     if (!cpu_) {
 #ifdef _WIN32
       throw std::runtime_error("native pipeline requires Linux/ACL");
@@ -49,6 +60,16 @@ class NativePipeline {
 #endif
     }
     worker_ = std::thread([this] { loop(); });
+    // Affinity/context failures must reach the caller before any graph can run.
+    std::unique_lock<std::mutex> guard(mutex_);
+    wake_.wait(guard, [this] { return started_ || !error_.empty(); });
+    if (!error_.empty()) {
+      auto error = error_;
+      guard.unlock();
+      worker_.join();
+      unload();
+      throw std::runtime_error(error);
+    }
   }
   ~NativePipeline() { close(); unload(); }
   size_t add(PipelineTask* task) {
@@ -95,11 +116,21 @@ class NativePipeline {
   uint64_t submitted_count() {
     std::lock_guard<std::mutex> guard(mutex_); check(); return jobs_;
   }
+  py::dict worker_info() {
+    std::lock_guard<std::mutex> guard(mutex_);
+    check();
+    py::dict result;
+    result["worker_cpu"] = worker_cpu_;
+    result["worker_affinity"] = worker_affinity_;
+    return result;
+  }
   static uint64_t read(uintptr_t address) {
     return reinterpret_cast<std::atomic<uint64_t>*>(address)->load(std::memory_order_acquire);
   }
  private:
-  bool cpu_, closed_ = false, paused_ = false;
+  bool cpu_, closed_ = false, paused_ = false, started_ = false;
+  int worker_cpu_;
+  std::vector<int> worker_affinity_;
   void* acl_ = nullptr;
   void* kernel_ = nullptr;
   void* context_ = nullptr;
@@ -132,7 +163,30 @@ class NativePipeline {
   }
   void loop() {
     try {
+#ifdef __linux__
+      cpu_set_t allowed;
+      int code = pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed);
+      if (code) throw std::runtime_error(std::string("read DMA affinity: ") + std::strerror(code));
+      if (worker_cpu_ >= 0) {
+        if (!CPU_ISSET(worker_cpu_, &allowed)) throw std::runtime_error("DMA CPU is outside inherited allowed set");
+        cpu_set_t selected;
+        CPU_ZERO(&selected);
+        CPU_SET(worker_cpu_, &selected);
+        code = pthread_setaffinity_np(pthread_self(), sizeof(selected), &selected);
+        if (code) throw std::runtime_error(std::string("bind DMA affinity: ") + std::strerror(code));
+        code = pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed);
+        if (code || CPU_COUNT(&allowed) != 1 || !CPU_ISSET(worker_cpu_, &allowed))
+          throw std::runtime_error("DMA affinity verification failed");
+      }
+      for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+        if (CPU_ISSET(cpu, &allowed)) worker_affinity_.push_back(cpu);
+#endif
       if (!cpu_ && set_(context_)) throw std::runtime_error("pipeline DMA ACL context failed");
+      {
+        std::lock_guard<std::mutex> guard(mutex_);
+        started_ = true;
+        wake_.notify_all();
+      }
       for (;;) {
         Job job;
         {
@@ -168,7 +222,7 @@ class NativePipeline {
     } catch (const std::exception& e) {
       std::lock_guard<std::mutex> guard(mutex_);
       error_ = e.what(); closed_ = true; queue_.clear(); wake_.notify_all();
-      if (!cpu_) {
+      if (!cpu_ && started_) {
         std::fprintf(stderr, "[MOE-PIPELINE FATAL] %s; consumers remain blocked\n", e.what());
         std::abort();
       }
@@ -215,10 +269,11 @@ inline PipelineTask::~PipelineTask() {
 
 inline void bind_native_pipeline(py::module_& m) {
   py::class_<NativePipeline, std::shared_ptr<NativePipeline>>(m, "NativePipeline")
-      .def(py::init<const std::string&, bool>())
+      .def(py::init<const std::string&, bool, int>(), py::arg("library"), py::arg("cpu_test"), py::arg("worker_cpu") = -1)
       .def("close", &NativePipeline::close, py::call_guard<py::gil_scoped_release>())
       .def("check_progress", &NativePipeline::check_progress)
       .def("submitted_count", &NativePipeline::submitted_count)
+      .def("worker_info", &NativePipeline::worker_info)
       .def("pause_for_test", &NativePipeline::pause_for_test);
   m.def("native_pipeline_task", [](py::object update, std::shared_ptr<NativePipeline> engine,
       uintptr_t request, uintptr_t ready, uintptr_t completed, uintptr_t mapping, int dependency) {

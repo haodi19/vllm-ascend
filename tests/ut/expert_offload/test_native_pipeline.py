@@ -3,6 +3,7 @@
 
 import ctypes
 import importlib.util
+import os
 import sys
 import time
 import unittest
@@ -31,6 +32,34 @@ class PipelineCPU(unittest.TestCase):
         self.engine.pause_for_test(False)
         self.engine.close()
         self.owners.clear()
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux thread affinity")
+    def test_bound_submitter_moves_bytes_without_changing_caller_affinity(self):
+        allowed = os.sched_getaffinity(0)
+        cpu = max(allowed)
+        self.engine.close()
+        self.engine = native.NativePipeline("", True, cpu)
+        self.assertEqual(self.engine.worker_info()["worker_affinity"], [cpu])
+        self.assertEqual(os.sched_getaffinity(0), allowed)
+        item = self.channel(0)
+        self.submit(item)
+        self.wait(item)
+        self.assertEqual(os.sched_getaffinity(0), allowed)
+
+    def test_invalid_cpu_rejected_before_worker_starts(self):
+        with self.assertRaises(ValueError):
+            native.NativePipeline("", True, -2)
+        if sys.platform != "linux":
+            with self.assertRaisesRegex(ValueError, "requires Linux"):
+                native.NativePipeline("", True, 0)
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux thread affinity")
+    def test_disallowed_cpu_is_reported_at_construction_without_abort(self):
+        excluded = next((c for c in range(1024) if c not in os.sched_getaffinity(0)), None)
+        if excluded is None:
+            self.skipTest("all supported CPUs allowed")
+        with self.assertRaisesRegex(RuntimeError, "outside inherited allowed set"):
+            native.NativePipeline("", True, excluded)
 
     def channel(self, layer, prefetch=False, dependency=-1):
         source = np.arange(128, dtype=np.uint8).reshape(4, 32)

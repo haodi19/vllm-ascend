@@ -33,13 +33,14 @@ class NativeSuiteTests(unittest.TestCase):
 set -eu
 if [[ $1 == -c ]]; then echo PYTHON=fixture; exit 0; fi
 if [[ ${3:-} == */summarize_native_moe_results.py ]]; then exec "ACTUAL_PYTHON" "$@"; fi
-case_name=; tokens=; out=; npu=
+case_name=; tokens=; out=; npu=; host_cpus=none
 while (($#)); do
   case "$1" in
     --case) case_name=$2; shift 2 ;;
     --max-tokens) tokens=$2; shift 2 ;;
     --output-dir) out=$2; shift 2 ;;
     --npu) npu=$2; shift 2 ;;
+    --host-cpus) host_cpus=$2; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -60,6 +61,7 @@ EOF
   echo "trace $name $tokens" > "$out/profile/$name/trace.json"
 done
 printf 'case=%s tokens=%s npu=%s\n' "$case_name" "$tokens" "$npu" >> calls.txt
+printf '%s\n' "$host_cpus" >> affinity.txt
 echo "FAKE_RESULT case=$case_name tokens=$tokens" >> "$out/summary.txt"
 echo "LIVE tokens=$tokens"
 if [[ -f fail_token$tokens ]]; then exit 3; fi
@@ -97,6 +99,12 @@ if [[ -f fail_token$tokens ]]; then exit 3; fi
 
     def calls(self):
         return (self.root / "calls.txt").read_text(encoding="utf-8").splitlines()
+
+    def test_binding_forwarded_through_background_worker_for_both_lengths(self):
+        result = self.invoke("--case", "native_pipeline", "--host-cpus", "62,63")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.wait_background()
+        self.assertEqual((self.root / "affinity.txt").read_text().splitlines(), ["62,63", "62,63"])
 
     def wait_background(self):
         deadline = time.monotonic() + 10

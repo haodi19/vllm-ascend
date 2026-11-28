@@ -892,6 +892,16 @@ class MoeHostSyncTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.module.validate_host_sync_config({key: "invalid"})
 
+    def test_worker_binding_does_not_change_polling_policy(self):
+        session = Mock()
+        self.module.configure_mte_worker(session, SimpleNamespace(host_sync_worker_cpu=7))
+        session.configure_worker_cpu.assert_called_once_with(7)
+        session.configure_polling.assert_not_called()
+        session.configure_idle_probe.assert_not_called()
+        session.configure_scan_prefix.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "Rebuild"):
+            self.module.configure_mte_worker(object(), SimpleNamespace(host_sync_worker_cpu=7))
+
     def test_prefix_failure_prevents_device_publication(self):
         obj = self.dispatcher()
         obj.allocated_scan = True

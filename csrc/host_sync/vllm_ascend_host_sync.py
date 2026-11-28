@@ -50,6 +50,10 @@ class Session:
             raise ValueError("worker CPU must be an integer")
         self._native.configure_worker_cpu(cpu)
 
+    def worker_info(self):
+        """Read the worker's verified affinity after start; no polling timers."""
+        return self._native.worker_info()
+
     def configure_scan_slots(self, slots):
         """Before start: producer promises to publish only to these fixed slots."""
         slots = list(slots)

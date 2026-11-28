@@ -344,6 +344,7 @@ def configure_mte_worker(session, config):
     scan = getattr(config, "host_sync_scan_mode", "all")
     probe = getattr(config, "host_sync_idle_probe", "locked")
     idle = getattr(config, "host_sync_idle_mode", "yield")
+    worker_cpu = getattr(config, "host_sync_worker_cpu", -1)
     required = []
     if scan == "allocated":
         required.extend(("configure_scan_prefix", "expand_scan_prefix"))
@@ -351,6 +352,10 @@ def configure_mte_worker(session, config):
         required.append("configure_idle_probe")
     if idle != "yield":
         required.append("configure_polling")
+    if worker_cpu >= 0:
+        required.extend(("configure_worker_cpu", "worker_info"))
+    elif getattr(config, "host_sync_dma_cpu", -1) >= 0:
+        required.append("worker_info")
     if any(not callable(getattr(session, name, None)) for name in required):
         raise RuntimeError("Rebuild csrc/host_sync in this checkout for selected MTE worker policies")
     if scan == "allocated":
@@ -359,6 +364,8 @@ def configure_mte_worker(session, config):
         session.configure_idle_probe(probe)
     if idle != "yield":
         session.configure_polling(idle, False)
+    if worker_cpu >= 0:
+        session.configure_worker_cpu(worker_cpu)
     return scan == "allocated"
 
 
@@ -441,6 +448,21 @@ class MteHostDispatcher:
             self.session.register_task(slot, lambda slot=slot: self._run(slot))
         self.allocated_scan = configure_mte_worker(self.session, manager.offload_config)
         self.session.start()
+        if (
+            getattr(manager.offload_config, "host_sync_worker_cpu", -1) >= 0
+            or getattr(manager.offload_config, "host_sync_dma_cpu", -1) >= 0
+        ):
+            print(
+                "[MOE-NATIVE] HOST_AFFINITY "
+                + json.dumps(
+                    {
+                        "planner": self.session.worker_info(),
+                        "dma": self.pipeline.worker_info() if self.pipeline is not None else None,
+                        "idle_mode": getattr(manager.offload_config, "host_sync_idle_mode", "yield"),
+                    }
+                ),
+                flush=True,
+            )
         self.alias = self.session.begin_device_access()
         print(
             f"[MOE-MTE WORKER] scan={getattr(manager.offload_config, 'host_sync_scan_mode', 'all')} "

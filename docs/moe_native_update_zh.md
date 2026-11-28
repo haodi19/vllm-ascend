@@ -203,6 +203,24 @@ python -u -B script/reanalyze_native_prefetch_overlap.py \
 
 缺少该记录或重复副本不为零时，脚本停止验收。`scale_buffer_bytes` 旧字段保留用于兼容，当前只计额外派生表示；不能据此推算进程 RSS 或 pinned allocator 的缓存占用。
 
+### Host 线程绑核
+
+在原测试命令追加 `--host-cpus auto`，给 MTE 规划线程和 `native_pipeline` 的 DMA 提交线程分别绑定一个物理核。其他 MTE 组只绑定已有的规划线程；不增加线程。默认 `--host-cpus none` 保持原来的调度方式，轮询仍为 `allocated/atomic/yield`，NUMA 内存策略、加载流程和计时方法不变。
+
+自动选择只使用当前进程允许的 CPU，优先选同一 NUMA 节点的两个不同物理核，避开同核的两个超线程。它按拓扑选核，不检测其他进程占用，也不保证是离 NPU 最近的核。已知合适的 CPU 编号时，可用 `--host-cpus 62,63`，依次指定规划线程和提交线程；编号必须在允许集合内且属于不同物理核。绑核不独占 CPU，也不改变其他线程的亲和性。
+
+沿用当前容器的 `env.sh` 和工作目录，后台运行绑核后的 `native_pipeline`，默认依次测 token 5 和 128：
+
+```bash
+bash script/run_native_moe_suite.sh --case native_pipeline --npu 6 \
+  --host-cpus auto --output-root ./bench_results/native_pipeline_bind_01
+tail -f ./bench_results/native_pipeline_bind_01/run.log
+```
+
+只测一种长度时追加 `--tokens 5` 或 `--tokens 128`。结果仍分别保存在 `token5/native_pipeline/`、`token128/native_pipeline/`，可视化在各 token 的 `profile/native_pipeline/`。根目录 `summary.txt` 包含实测绑定的 CPU 列表和原有性能数据。扩展源码变化后会自动重编译一次，之后继续复用缓存。
+
+启动时验证两个线程的实际亲和性，失败会在正式请求前停止；`HOST_AFFINITY_VERIFIED` 表示核对成功。NPU 前置检查也会用选中的核验证原有字节拷贝、mapping、严格完成和图重放。若单独比较绑核收益，应使用相同 `native_pipeline` 配置，在新结果目录中运行 `--host-cpus none` 作对照。
+
 <a id="验证状态"></a>
 
 本地 CPU 测试覆盖加载分片顺序、原缓冲地址复用、prefill/eager 非零槽位、布局不匹配拒绝、替换后旧缓冲释放和原生任务执行。NPU 检查已集成到原测试入口；需要在目标服务器上运行后才能确认新版本的模型输出与性能。既有实验数据仍对应当时版本，不回填为本次改动的效果。

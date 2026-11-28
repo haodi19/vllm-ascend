@@ -23,6 +23,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from moe_host_affinity import read_host_affinity, resolve_host_cpus
 from moe_host_memory import (
     after_service_memory,
     check_host_memory,
@@ -103,6 +104,16 @@ def fresh_handshake_build(parent):
 def validate_native_components(library, args, step):
     if not library.is_file():
         raise FileNotFoundError(library)
+    if getattr(args, "host_cpus", "none") != "none":
+        step(
+            "Host thread affinity API check",
+            [
+                sys.executable,
+                "-c",
+                "import _vllm_ascend_host_sync as h; assert hasattr(h._Session,'worker_info'); "
+                "import _vllm_ascend_lrc as l; assert hasattr(l.NativePipeline,'worker_info')",
+            ],
+        )
     # These checks still run when reusing binaries, before starting the model.
     step(
         "native API check",
@@ -142,7 +153,15 @@ def validate_native_components(library, args, step):
         step("pipeline CPU queue regression", [sys.executable, "-B", "tests/ut/expert_offload/test_native_pipeline.py"])
         step(
             "NPU early-prediction pipeline correctness and GIL independence",
-            [sys.executable, "-B", "script/test_native_pipeline_graph.py", "--library", str(library)],
+            [
+                sys.executable,
+                "-B",
+                "script/test_native_pipeline_graph.py",
+                "--library",
+                str(library),
+                "--host-cpus",
+                getattr(args, "host_cpus", "none"),
+            ],
             timeout=180,
         )
 
@@ -358,7 +377,7 @@ def stop_process_group(proc):
     proc.wait(timeout=10)
 
 
-def service_command(source, case, library, port):
+def service_command(source, case, library, port, host_cpus=None):
     match = re.search(r"(?m)^vllm\s+serve\s+", source)
     if match is None:
         raise ValueError("test script must contain vllm serve")
@@ -375,6 +394,8 @@ def service_command(source, case, library, port):
         host_sync_scan_mode="allocated",
         host_sync_idle_probe="atomic",
         host_sync_idle_mode="yield",
+        host_sync_worker_cpu=host_cpus[0] if host_cpus is not None else -1,
+        host_sync_dma_cpu=host_cpus[1] if host_cpus is not None and case == "native_pipeline" else -1,
         host_sync_library=str(library),
         cache_policy_backend="cpp",
         cache_policy_enabled=True,
@@ -403,6 +424,11 @@ def main():
         help="all: Python/native/native_full; pipeline: Python/native/native_pipeline; both: Python/native",
     )
     parser.add_argument("--npu", type=int, required=True)
+    parser.add_argument(
+        "--host-cpus",
+        default="none",
+        help="none (original affinity), auto, or PLANNER_CPU,DMA_CPU; no polling/NUMA changes",
+    )
     parser.add_argument("--port", type=int, default=8156)
     parser.add_argument("--test-script", type=Path, default=ROOT / "script/test_graph2.sh")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -446,6 +472,15 @@ def main():
         help="Persistent parent for fresh numbered handshake builds, independent of results",
     )
     args = parser.parse_args()
+    if args.profile_only_from and args.host_cpus != "none":
+        parser.error("Profile continuation preserves saved CPU bindings; do not pass --host-cpus")
+    try:
+        host_cpus = resolve_host_cpus(args.host_cpus)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if host_cpus is not None:
+        # Resolve auto once, shared by preflight and every measured service.
+        args.host_cpus = ",".join(map(str, host_cpus))
     if args.profile_case != "both" and not args.profile_only_from:
         parser.error("--profile-case python/native requires --profile-only-from")
     if args.profile_only_from and args.case != "all":
@@ -537,14 +572,15 @@ def main():
         # Parse selected commands before compiling or touching the NPU. A syntax
         # error in the local launch script must not waste the hardware checks.
         source = args.test_script.read_text(encoding="utf-8")
-        commands = {case: service_command(source, case, library, args.port) for case in cases}
+        commands = {case: service_command(source, case, library, args.port, host_cpus) for case in cases}
+        report(f"HOST_CPUS={args.host_cpus}; planner applies to all MTE cases; DMA applies to native_pipeline only")
         report(f"PASS launch command parsing: {args.test_script}")
         wait_port_free(args.port)
         if not args.skip_profile:
             wait_port_free(args.timing_port)
         report(f"PASS initial port check: {args.port}")
         library = prepare_native_components(args, env, step, report)
-        commands = {case: service_command(source, case, library, args.port) for case in cases}
+        commands = {case: service_command(source, case, library, args.port, host_cpus) for case in cases}
         reference = None
         means = {}
         timings = {}
@@ -586,6 +622,9 @@ def main():
                             if time.monotonic() >= deadline:
                                 raise TimeoutError(f"{case} startup timeout")
                             time.sleep(2)
+                    host_affinity = read_host_affinity(log_path, case, host_cpus)
+                    if host_affinity is not None:
+                        report(f"HOST_AFFINITY_VERIFIED {case}: {json.dumps(host_affinity)}")
                     outputs, samples = [], []
                     body = dict(
                         model=models["data"][0]["id"],
@@ -641,6 +680,7 @@ def main():
                     result = dict(
                         case=case,
                         physical_npu=args.npu,
+                        host_affinity=host_affinity,
                         requests=len(samples),
                         mean_ms=means[case],
                         stream_samples=samples,

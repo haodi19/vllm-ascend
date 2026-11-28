@@ -30,6 +30,22 @@ except ImportError:
 
 
 class LayoutAndConfig(unittest.TestCase):
+    def test_binding_config_rejects_silent_misconfiguration(self):
+        for fields in (
+            {"host_sync_worker_cpu": True},
+            {"host_sync_worker_cpu": -2},
+            {"host_sync_worker_cpu": 0},
+            {"host_sync_dma_cpu": 1},
+            {
+                "host_update_backend": "native_pipeline",
+                "host_sync_backend": "mte",
+                "host_sync_worker_cpu": 1,
+                "host_sync_dma_cpu": 1,
+            },
+        ):
+            with self.subTest(fields=fields), self.assertRaises(ValueError):
+                config.validate_native_update_config(fields)
+
     def test_default_unchanged(self):
         config.validate_native_update_config({})
         config.validate_native_update_config({"host_update_backend": "python", "moe_offload_debug": True})

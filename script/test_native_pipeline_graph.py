@@ -11,8 +11,10 @@ import sys
 import time
 from pathlib import Path
 
+from moe_host_affinity import resolve_host_cpus
 
-def run(library_path):
+
+def run(library_path, host_cpus="none"):
     import _vllm_ascend_lrc as native
     import torch
     import torch_npu  # noqa: F401
@@ -30,8 +32,11 @@ def run(library_path):
     completed = torch.zeros((2, 4), dtype=torch.int64, pin_memory=True)
     routes = torch.tensor([[2]], dtype=torch.int64, device="npu")
     policy = native.Policy(2, 4, 32, 0.9, 1.0, 0.5, 0.3, 0.01, True)
-    engine = native.NativePipeline(str(library_path.resolve()), False)
+    cpus = resolve_host_cpus(host_cpus)
+    engine = native.NativePipeline(str(library_path.resolve()), False, cpus[1] if cpus else -1)
     session = hs.Session(slots=2, backend="acl", device_id=0)
+    if cpus:
+        session.configure_worker_cpu(cpus[0])
     info = session.info()
     channels, owners = [], []
     for index in range(2):
@@ -85,6 +90,10 @@ def run(library_path):
         owners.extend((old, task, table))
     torch.npu.synchronize()
     session.start()
+    if cpus:
+        assert session.worker_info()["worker_affinity"] == [cpus[0]]
+        assert engine.worker_info()["worker_affinity"] == [cpus[1]]
+        print(f"PIPELINE_AFFINITY=PASS; planner={cpus[0]}; DMA={cpus[1]}", flush=True)
     alias = session.begin_device_access()
     observations = []
 
@@ -171,4 +180,6 @@ def run(library_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", type=Path, required=True)
-    run(parser.parse_args().library)
+    parser.add_argument("--host-cpus", default="none")
+    args = parser.parse_args()
+    run(args.library, args.host_cpus)

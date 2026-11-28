@@ -61,6 +61,7 @@ class WorkerPollingTests(unittest.TestCase):
             session.start()
             with self.assertRaises(RuntimeError):
                 session.configure_worker_cpu(-1)
+            self.assertEqual(session.worker_info()["worker_affinity"], [cpu])
             session.submit_for_test(0, 1)
             session.wait(0, 1)
             session.stop()

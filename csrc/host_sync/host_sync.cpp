@@ -64,6 +64,16 @@ class Session {
     }
   }
 
+  py::dict worker_info() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    require_open();
+    if (!ready_) throw std::runtime_error("start the worker before reading affinity");
+    py::dict result;
+    result["worker_cpu"] = worker_cpu_;
+    result["worker_affinity"] = worker_affinity_;
+    return result;
+  }
+
   py::dict polling_stats() {
     std::lock_guard<std::mutex> lock(mutex_);
     require_open();
@@ -651,6 +661,7 @@ PYBIND11_MODULE(_vllm_ascend_host_sync, module) {
       .def("configure_scan_slots", &host_sync::Session::configure_scan_slots)
       .def("configure_idle_probe", &host_sync::Session::configure_idle_probe)
       .def("configure_worker_cpu", &host_sync::Session::configure_worker_cpu)
+      .def("worker_info", &host_sync::Session::worker_info)
       .def("configure_scan_prefix", &host_sync::Session::configure_scan_prefix)
       .def("expand_scan_prefix", &host_sync::Session::expand_scan_prefix)
       .def("configure_polling", &host_sync::Session::configure_polling,

@@ -13,6 +13,17 @@ NPU_BASE_SCALE_FORMATS = frozenset((0, 2))  # ACL_FORMAT_NCHW / ACL_FORMAT_ND, n
 
 def validate_native_update_config(config):
     mode = config.get("host_update_backend", "python")
+    worker_cpu = config.get("host_sync_worker_cpu", -1)
+    dma_cpu = config.get("host_sync_dma_cpu", -1)
+    for cpu in (worker_cpu, dma_cpu):
+        if type(cpu) is not int or cpu < -1:
+            raise ValueError("Host CPU IDs must be integers >= -1")
+    if worker_cpu >= 0 and config.get("host_sync_backend") != "mte":
+        raise ValueError("host_sync_worker_cpu requires MTE")
+    if dma_cpu >= 0 and mode != "native_pipeline":
+        raise ValueError("host_sync_dma_cpu requires native_pipeline")
+    if dma_cpu >= 0 and dma_cpu == worker_cpu:
+        raise ValueError("planner and DMA submitter require different CPUs")
     if mode not in ("python", "native", "native_full", "native_pipeline"):
         raise ValueError("host_update_backend must be python, native, native_full or native_pipeline")
     if mode == "python":
@@ -192,7 +203,13 @@ class NativeUpdateRuntime:
         if manager.offload_config.host_update_backend == "native_pipeline":
             if not hasattr(self.native, "NativePipeline"):
                 raise RuntimeError("rebuild lrc_policy for native_pipeline")
-            self.pipeline = self.native.NativePipeline(manager.offload_config.host_sync_library, False)
+            dma_cpu = getattr(manager.offload_config, "host_sync_dma_cpu", -1)
+            if dma_cpu >= 0:
+                if not hasattr(self.native.NativePipeline, "worker_info"):
+                    raise RuntimeError("rebuild lrc_policy for pipeline DMA affinity")
+                self.pipeline = self.native.NativePipeline(manager.offload_config.host_sync_library, False, dma_cpu)
+            else:
+                self.pipeline = self.native.NativePipeline(manager.offload_config.host_sync_library, False)
         for layer_idx, layer in enumerate(manager.moe_layers):
             self.tables.append(self._prepare_layer(layer_idx, layer, expert_weight))
         if self.full_submit:

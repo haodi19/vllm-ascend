@@ -243,6 +243,8 @@ def render(root, data, cases=CASES):
         if row is None:
             continue
         samples = row["stream_samples"]
+        if row.get("host_affinity"):
+            lines.append(f"HOST_AFFINITY {case}: {json.dumps(row['host_affinity'], ensure_ascii=False)}")
         stats = summarize_streams(samples)
         if stats["one_content_chunk"]:
             lines.append(f"{case}：{stats['one_content_chunk']} 个请求仅一个内容块，TPOT不能反映内部逐token节奏。")

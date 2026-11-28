@@ -21,6 +21,31 @@ spec.loader.exec_module(runner)
 
 
 class NativeRunnerTests(unittest.TestCase):
+    def test_bound_workers_verified_and_included_in_results_and_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            code, output, _, _, _ = self.run_mock_comparison(Path(temp), "pipeline", host_cpus=(62, 63))
+            self.assertEqual(code, 0)
+            for case in ("python", "native", "native_pipeline"):
+                row = json.loads((output / case / "timing_result.json").read_text())
+                self.assertEqual(row["host_affinity"]["planner"]["worker_affinity"], [62])
+                if case == "native_pipeline":
+                    self.assertEqual(row["host_affinity"]["dma"]["worker_affinity"], [63])
+                self.assertIn("HOST_AFFINITY", (output / case / "summary.txt").read_text(encoding="utf-8"))
+
+    def test_affinity_only_changes_selected_worker_cpus_and_keeps_polling(self):
+        source = (ROOT / "script/test_graph2.sh").read_text(encoding="utf-8")
+        for case in ("python", "native", "native_pipeline"):
+            original = runner.service_command(source, case, Path("test.so"), 8156)
+            bound = runner.service_command(source, case, Path("test.so"), 8156, (62, 63))
+            index = original.index("--additional-config") + 1
+            self.assertEqual(original[:index] + original[index + 1 :], bound[:index] + bound[index + 1 :])
+            config = json.loads(bound[index])
+            offload = config["expert_offload_config"]
+            self.assertEqual(offload["host_sync_worker_cpu"], 62)
+            self.assertEqual(offload["host_sync_dma_cpu"], 63 if case == "native_pipeline" else -1)
+            offload.update(host_sync_worker_cpu=-1, host_sync_dma_cpu=-1)
+            self.assertEqual(config, json.loads(original[index]))
+
     def test_pipeline_suite_preserves_baseline_and_uses_one_service_per_case(self):
         with tempfile.TemporaryDirectory() as temp:
             code, output, launched, count, profiles = self.run_mock_comparison(Path(temp), "pipeline")
@@ -32,7 +57,7 @@ class NativeRunnerTests(unittest.TestCase):
         self.assertEqual(runner.selected_cases("all"), ("python", "native", "native_full"))
 
     def run_mock_comparison(
-        self, directory, case="both", *, varied_outputs=False, marker_leak=False, profile_error=False
+        self, directory, case="both", *, varied_outputs=False, marker_leak=False, profile_error=False, host_cpus=None
     ):
         """Exercise the complete runner without processes, Torch or NPU."""
         library = directory / "libhost_sync_device.so"
@@ -54,6 +79,8 @@ class NativeRunnerTests(unittest.TestCase):
             "--output-dir",
             str(output),
         ]
+        if host_cpus:
+            argv += ["--host-cpus", "auto"]
         sample = dict(
             digest="same",
             usage=dict(completion_tokens=5),
@@ -75,6 +102,18 @@ class NativeRunnerTests(unittest.TestCase):
                 services.append(child)
                 config = json.loads(command[command.index("--additional-config") + 1])["expert_offload_config"]
                 launched.append(config["host_update_backend"])
+                if host_cpus:
+                    affinity = dict(
+                        planner=dict(
+                            worker_cpu=config["host_sync_worker_cpu"], worker_affinity=[config["host_sync_worker_cpu"]]
+                        ),
+                        dma=dict(worker_cpu=config["host_sync_dma_cpu"], worker_affinity=[config["host_sync_dma_cpu"]])
+                        if config["host_update_backend"] == "native_pipeline"
+                        else None,
+                        idle_mode=config["host_sync_idle_mode"],
+                    )
+                    kwargs["stdout"].write("[MOE-NATIVE] HOST_AFFINITY " + json.dumps(affinity) + "\n")
+                    kwargs["stdout"].flush()
                 if config["host_update_backend"] in ("native", "native_full", "native_pipeline"):
                     kwargs["stdout"].write("[MOE-NATIVE] first native graph task completed without Python\n")
                     kwargs["stdout"].write(
@@ -130,6 +169,7 @@ class NativeRunnerTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", argv),
             patch.object(sys, "platform", "linux"),
+            patch.object(runner, "resolve_host_cpus", return_value=host_cpus),
             patch.object(runner.urllib.request, "build_opener", return_value=opener),
             patch.object(runner.subprocess, "Popen", side_effect=start),
             patch.object(runner, "streaming_completion", side_effect=streamed) as requests,

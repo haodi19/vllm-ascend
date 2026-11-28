@@ -1025,6 +1025,10 @@ class ExpertOffloadConfig:
         "host_sync_scan_mode": "all",  # all / allocated (monotonic task prefix)
         "host_sync_idle_probe": "locked",  # locked / atomic (idle precheck)
         "host_sync_idle_mode": "yield",  # yield / spin
+        # Optional thread affinity, Linux logical CPU IDs; -1 inherits affinity.
+        # Bind only the MTE planner and (native_pipeline only) DMA submitter.
+        "host_sync_worker_cpu": -1,
+        "host_sync_dma_cpu": -1,
         "host_sync_diagnose_load": False,
         "host_sync_diagnose_native_wait": False,  # diagnostic ACL/torch wait split; not performance
         "host_sync_diagnose_load_vector_cores": 0,  # diagnostic only; 0 unchanged, 1..56 load-stream cap

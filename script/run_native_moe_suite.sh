@@ -7,6 +7,7 @@ case_name=all
 npu=6
 port=8156
 timing_port=18156
+host_cpus=none
 output_root=
 worker=0
 tokens=(5 128)
@@ -16,6 +17,7 @@ while (($#)); do
     --npu) npu=${2:?Missing NPU}; shift 2 ;;
     --port) port=${2:?Missing port}; shift 2 ;;
     --timing-port) timing_port=${2:?Missing timing port}; shift 2 ;;
+    --host-cpus) host_cpus=${2:?Missing Host CPUs}; shift 2 ;;
     --output-root) output_root=${2:?Missing output root}; shift 2 ;;
     --tokens) tokens=("${2:?Missing token count}"); shift 2 ;;
     --worker) worker=1; shift ;;
@@ -23,6 +25,9 @@ while (($#)); do
   esac
 done
 case "$case_name" in all|both|pipeline|python|native|native_full|native_pipeline) ;; *) echo "Invalid case: $case_name" >&2; exit 2 ;; esac
+[[ $host_cpus == none || $host_cpus == auto || $host_cpus =~ ^[0-9]+,[0-9]+$ ]] || {
+  echo "--host-cpus must be none, auto, or PLANNER_CPU,DMA_CPU" >&2; exit 2;
+}
 for token_count in "${tokens[@]}"; do
   case "$token_count" in 5|128) ;; *) echo "--tokens must be 5 or 128" >&2; exit 2 ;; esac
 done
@@ -72,7 +77,7 @@ if (( ! worker )); then
     done
   done
   worker_args=(--worker --case "$case_name" --npu "$npu" --port "$port"
-    --timing-port "$timing_port" --output-root "$output_root")
+    --timing-port "$timing_port" --output-root "$output_root" --host-cpus "$host_cpus")
   if (( ${#tokens[@]} == 1 )); then worker_args+=(--tokens "${tokens[0]}"); fi
   nohup bash "$script_path" "${worker_args[@]}" >>"$output_root/run.log" 2>&1 </dev/null &
   bg_pid=$!
@@ -110,7 +115,7 @@ overall=0
 for token_count in "${tokens[@]}"; do
   printf '\nSTART max_tokens=%s; case=%s\n' "$token_count" "$case_name"
   if python -u -B "$runner" --case "$case_name" --npu "$npu" \
-    --port "$port" --timing-port "$timing_port" --max-tokens "$token_count" \
+    --port "$port" --timing-port "$timing_port" --host-cpus "$host_cpus" --max-tokens "$token_count" \
     --warmup-requests 5 --requests 20 --startup-timeout 1800 \
     --request-timeout 600 --profile-timeout 600 --min-profile-free-gib 5 \
     --bubble-stream-name auto --output-dir "$output_root/token${token_count}"; then
